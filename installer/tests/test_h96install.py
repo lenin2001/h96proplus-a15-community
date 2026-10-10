@@ -117,6 +117,13 @@ class FakeBox:
 
     def __init__(self, board, disk_bytes=DISK, cid=CID, table=None):
         self.root = tempfile.mkdtemp(prefix="h96fake-")
+        try:
+            self._build(board, disk_bytes, cid, table)
+        except BaseException:
+            self.cleanup()
+            raise
+
+    def _build(self, board, disk_bytes, cid, table):
         r = self.root
         for d in ("dev", "sys/block", "sys/dev/block", "tmp", "sd", "bin"):
             os.makedirs(os.path.join(r, d), exist_ok=True)
@@ -206,25 +213,25 @@ def protected_digest(box, board, disk_bytes):
     return hs.hexdigest()
 
 
+@unittest.skipIf(os.name != "posix", "the simulated rescue box needs a POSIX shell and symlinks (run on Linux/WSL)")
 class Base(unittest.TestCase):
     def setUp(self):
+        # cleanups are registered at once, so nothing is left behind even if setUp fails
         self.tmp = tempfile.mkdtemp(prefix="h96test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.bdir = os.path.join(self.tmp, "boards")
         os.makedirs(self.bdir)
         self.board = scaled_board()
         with open(os.path.join(self.bdir, BOARD_ID + ".json"), "w") as f:
             json.dump(self.board, f)
         os.environ["H96INSTALL_BOARDS"] = self.bdir
+        self.addCleanup(os.environ.pop, "H96INSTALL_BOARDS", None)
         self.box = FakeBox(self.board)
+        self.addCleanup(self.box.cleanup)
         self.r = self.box.remote()
         self.art = os.path.join(self.tmp, "artifacts")
         os.makedirs(self.art)
         self.profile_path = os.path.join(self.tmp, "my-box.profile.json")
-
-    def tearDown(self):
-        os.environ.pop("H96INSTALL_BOARDS", None)
-        self.box.cleanup()
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def artifact(self, name, data, target):
         with open(os.path.join(self.art, name), "wb") as f:
