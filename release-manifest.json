@@ -90,6 +90,6 @@
     "sources": "external/mesa3d (Mesa 24.3.0-devel) and external/libdrm (2.4.124) of android-15.0.0_r36, unmodified",
     "toolchain": "Android NDK r27c (27.2.12479018), API 34",
     "binaries_included": false,
-    "verification": "2026-10-10 on the build host: the recipe built all libraries; libglapi and libc++_shared are byte-identical to the maintainer's, the others export the same symbols (the maintainer's copies carry a build-tree RUNPATH and SONAMEs set by hand). The final recipe step (meson install, RUNPATH check) is re-run after publication; see the git log."
+    "verification": "2026-10-10 on the build host, final recipe: all six libraries built; every one exports exactly the same dynamic symbols as the maintainer's copy, none carries a RUNPATH, libc++_shared is byte-identical. The other libraries differ in bytes because the maintainer's copies were taken from the build tree (build-host RUNPATH) and had SONAMEs set by hand. Not yet run on the device."
   }
 }
