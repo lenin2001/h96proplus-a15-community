@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Значения настроек по умолчанию для h96proplus.
+
+  ⚠️ Действуют ТОЛЬКО при первом создании базы настроек, то есть на
+  чистом /data. У нас это выполняется всегда: раздел p4 карты
+  форматируется заново на каждой заливке (make-android-sd.sh).
+  Механизм «экран не блокируется» продублирован в framework-res
+  (config_disableLockscreenByDefault) — тот от состояния /data не зависит.
+-->
+<resources>
+
+    <!-- ⛔ ЭКРАН НЕ ГАСНЕТ НИКОГДА. 2147483647 мс ≈ 24,8 суток.
+
+         ⚠️ НЕ СТАВИТЬ -1, хотя именно так делает Amlogic (yukawa)!
+         Проверено по исходникам:
+
+           PowerManagerService.java:3256 getScreenOffTimeoutLocked()
+               long timeout = mScreenOffTimeoutSetting;   // = -1
+               …
+               return Math.max(timeout, mMinimumScreenOffTimeoutConfig);
+
+         mMinimumScreenOffTimeoutConfig = config_minimumScreenOffTimeout
+         = 10000 (config.xml:2925). Math.max(-1, 10000) = 10000, то есть
+         «-1» даёт не «никогда», а ЭКРАН ГАСНЕТ ЧЕРЕЗ 10 СЕКУНД.
+         У yukawa это не заметно, потому что его спасает stay-on ниже.
+
+         Значение 2147483647 через все ограничители проходит целым:
+           • ограничение админом устройства — DPC нет
+             (isMaximumScreenOffTimeoutFromDeviceAdminEnforcedLocked = false);
+           • sleepTimeout — DEFAULT_SLEEP_TIMEOUT = -1, отрицательный не режет;
+           • attentiveTimeout — config_attentiveTimeout = -1, тоже не режет;
+           • Math.max с 10000 оставляет наше значение.
+         Читается через getIntForUser, поэтому это ровно Integer.MAX_VALUE.
+    -->
+    <integer name="def_screen_off_timeout">2147483647</integer>
+
+    <!-- Второй, независимый предохранитель: «не гасить экран при питании
+         от сети». Приставка питается только от сети.
+
+         Работает даже без батареи и без health-HAL: BatteryService считает
+         устройство запитанным, когда статус батареи неизвестен. Проверено
+         на живой приставке 22.08 — dumpsys battery показывает
+         «AC powered: false, present: false, status: 1 (UNKNOWN)»,
+         а dumpsys power при этом даёт mIsPowered=true, mStayOn=true. -->
+    <bool name="def_stay_on_while_plugged_in">true</bool>
+
+    <!-- Наследие: заполняет Settings.System.LOCKSCREEN_DISABLED.
+         В Android 16 службой блокировки не читается (см. комментарий в
+         overlay/…/core/res/…/config.xml), оставлено как безвредный
+         третий рубеж и для совместимости со сторонними приложениями. -->
+    <bool name="def_lockscreen_disabled">true</bool>
+
+    <!-- Анимации отключены НА КОРНЮ (25.08.2026). При программной отрисовке
+         каждая анимация — десятки полноэкранных кадров на процессоре; в
+         перезагрузочной петле это был главный пожиратель ЦП. Оверлей
+         надёжнее команды settings put из apply-max-performance.sh: действует
+         с ПЕРВОЙ загрузки и не зависит от состояния /data. Имена сверены с
+         SettingsProvider/res/values/defaults.xml:37-38 — вторая настройка
+         называется def_window_TRANSITION_scale, не transition_animation.
+         Третий масштаб (animator_duration_scale) дефолта в SettingsProvider
+         не имеет — им занимается apply-max-performance.sh. -->
+    <fraction name="def_window_animation_scale">0%</fraction>
+    <fraction name="def_window_transition_scale">0%</fraction>
+
+</resources>

@@ -1,0 +1,165 @@
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index 53689bd..6c1c766 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <v4l2_codec2/components/DecodeInterface.h>
+ 
++#include <algorithm>
++
+ #include <C2PlatformSupport.h>
+ #include <SimpleC2Interface.h>
+ #include <android/hardware/graphics/common/1.0/types.h>
+@@ -132,6 +134,19 @@ DecodeInterface::DecodeInterface(const std::string& name,
+         }
+     }
+ 
++    // h96: не заявляем 10-битные профили. Вывод у нас NV12/SDR, а 10-бит
++    // на GXM требует непрерывных FBC-аллокаций, которые тихо не собираются
++    // (26.08: SmartTube выбрал vp9.2 1440p60 HDR — декодер молча не выдал
++    // ни кадра, плеер вечно BUFFERING; ср. hevc-4k-10bit в docs/hevc-testing).
++    // Без этих профилей ExoPlayer сам выбирает vp9 profile 0 или AVC.
++    profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
++                                  [](uint32_t p) {
++                                      return p == C2Config::PROFILE_VP9_2 ||
++                                             p == C2Config::PROFILE_VP9_3 ||
++                                             p == C2Config::PROFILE_HEVC_MAIN_10;
++                                  }),
++                   profiles.end());
++
+     // In case of no supported profile or uninitialized device maxSize is set to default
+     if (maxSize == ui::Size(1, 1)) maxSize = ui::Size(4096, 4096);
+ 
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+index d0d862d..a5d9380 100644
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -9,6 +9,7 @@
+ #include <v4l2_codec2/v4l2/V4L2Decoder.h>
+ 
+ #include <stdint.h>
++#include <string.h>
+ 
+ #include <algorithm>
+ #include <vector>
+@@ -19,6 +20,7 @@
+ #include <log/log.h>
+ #include <utils/Trace.h>
+ 
++#include <C2Buffer.h>
+ #include <v4l2_codec2/common/Common.h>
+ #include <v4l2_codec2/common/Fourcc.h>
+ #include <v4l2_codec2/common/H264NalParser.h>
+@@ -206,7 +208,15 @@ bool V4L2Decoder::setupInputFormat(const uint32_t inputPixelFormat, const size_t
+     }
+     ALOG_ASSERT(format->fmt.pix_mp.pixelformat == inputPixelFormat);
+ 
+-    if (mInputQueue->allocateBuffers(kNumInputBuffers, V4L2_MEMORY_DMABUF) == 0) {
++    /* h96: вход переведён с DMABUF на MMAP+копирование. Клиентские линейные
++     * блоки C2 приходят из system dma-heap (набор страниц), а meson-vdec
++     * (vb2-dma-contig + esparser) принимает только физически непрерывные
++     * буферы: импорт падал в ядре с «contiguous chunk is too small
++     * 1048576/2097152», VIDIOC_QBUF возвращал ошибку и декодер уходил в
++     * Error. MMAP-буферы выделяет сам драйвер из CMA (512 МиБ), а битстрим
++     * копируется CPU — для 2-5 МБ/с это незаметно. Ровно так же работал
++     * весь наш bring-up декодера (ffmpeg v4l2m2m использует MMAP). */
++    if (mInputQueue->allocateBuffers(kNumInputBuffers, V4L2_MEMORY_MMAP) == 0) {
+         ALOGE("Failed to allocate input buffer.");
+         return false;
+     }
+@@ -459,36 +469,9 @@ void V4L2Decoder::pumpDecodeRequest() {
+             return;
+         }
+ 
+-        auto dma_buf_id = getDmabufId(mDecodeRequests.front().buffer->dmabuf.handle()->data[0]);
+-        if (!dma_buf_id) {
+-            ALOGE("Failed to get dmabuf id");
+-            onError();
+-            return;
+-        }
+-
+-        std::optional<V4L2WritableBufferRef> inputBuffer;
+-        size_t targetIndex = 0;
+-
+-        // If there's an existing input buffer for this dma buffer, use it.
+-        for (; targetIndex < mNextInputBufferId; targetIndex++) {
+-            if (mLastDmaBufferId[targetIndex] == dma_buf_id) {
+-                break;
+-            }
+-        }
+-
+-        if (targetIndex < kNumInputBuffers) {
+-            // If we didn't find a buffer and there is an unused buffer, use that one.
+-            if (targetIndex == mNextInputBufferId) {
+-                mNextInputBufferId++;
+-            }
+-
+-            inputBuffer = mInputQueue->getFreeBuffer(targetIndex);
+-        }
+-
+-        // If we didn't find a reusable/unused input buffer, clobber a free one.
+-        if (!inputBuffer) {
+-            inputBuffer = mInputQueue->getFreeBuffer();
+-        }
++        // h96: для MMAP-входа переиспользование буфера по dmabuf-id не имеет
++        // смысла — данные каждый раз копируются в буфер драйвера.
++        std::optional<V4L2WritableBufferRef> inputBuffer = mInputQueue->getFreeBuffer();
+ 
+         // Pause if no free input buffer. We resume decoding after dequeueing input buffers.
+         if (!inputBuffer) {
+@@ -496,8 +479,6 @@ void V4L2Decoder::pumpDecodeRequest() {
+             return;
+         }
+ 
+-        mLastDmaBufferId[inputBuffer->bufferId()] = *dma_buf_id;
+-
+         auto request = std::move(mDecodeRequests.front());
+         mDecodeRequests.pop();
+ 
+@@ -512,13 +493,22 @@ void V4L2Decoder::pumpDecodeRequest() {
+             return;
+         }
+ 
+-        ALOGV("Set bytes_used=%zu, offset=%zu", request.buffer->offset + request.buffer->size,
+-              request.buffer->offset);
+-        inputBuffer->setPlaneDataOffset(0, request.buffer->offset);
+-        inputBuffer->setPlaneBytesUsed(0, request.buffer->offset + request.buffer->size);
+-        std::vector<int> fds;
+-        fds.push_back(std::move(request.buffer->dmabuf.handle()->data[0]));
+-        if (!std::move(*inputBuffer).queueDMABuf(fds)) {
++        C2ReadView view = request.buffer->dmabuf.map().get();
++        if (view.error() != C2_OK) {
++            ALOGE("Failed to map input block, error: %d", view.error());
++            onError();
++            return;
++        }
++        void* dst = inputBuffer->getPlaneMapping(0);
++        if (dst == nullptr) {
++            ALOGE("Failed to map V4L2 MMAP input buffer.");
++            onError();
++            return;
++        }
++        memcpy(dst, view.data(), request.buffer->size);
++        inputBuffer->setPlaneDataOffset(0, 0);
++        inputBuffer->setPlaneBytesUsed(0, request.buffer->size);
++        if (!std::move(*inputBuffer).queueMMap()) {
+             ALOGE("%s(): Failed to QBUF to input queue, bitstreamId=%d", __func__, bitstreamId);
+             onError();
+             return;
+diff --git a/v4l2/V4L2Device.cpp b/v4l2/V4L2Device.cpp
+index 0190deb..d81ae5d 100644
+--- a/v4l2/V4L2Device.cpp
++++ b/v4l2/V4L2Device.cpp
+@@ -154,8 +154,10 @@ V4L2Buffer::V4L2Buffer(scoped_refptr<V4L2Device> device, enum v4l2_buf_type type
+             std::min(static_cast<size_t>(format.fmt.pix_mp.num_planes), base::size(mV4l2Planes));
+     mV4l2Buffer.index = bufferId;
+     mV4l2Buffer.type = type;
++    /* h96: ChromeOS-форк жёстко перебивал memory на DMABUF, из-за чего
++     * MMAP-очереди были невозможны (getPlaneMapping отказывал: «non-MMAP
++     * buffer»). Уважаем параметр вызывающего. */
+     mV4l2Buffer.memory = memory;
+-    mV4l2Buffer.memory = V4L2_MEMORY_DMABUF;
+     mPlaneMappings.resize(mV4l2Buffer.length);
+ }
+ 

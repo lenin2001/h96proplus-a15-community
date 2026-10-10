@@ -1,0 +1,22 @@
+diff --git a/libcutils/ashmem-dev.cpp b/libcutils/ashmem-dev.cpp
+index cebfa5d..030b1e8 100644
+--- a/libcutils/ashmem-dev.cpp
++++ b/libcutils/ashmem-dev.cpp
+@@ -104,7 +104,16 @@ static bool __has_memfd_support() {
+      * property will be removed once we switch everything over to ashmem.
+      * Currently it is used only for debugging to switch the system over.
+      */
+-    if (!android::base::GetBoolProperty("sys.use_memfd", false)) {
++    /* H96 Pro Plus / mainline-kernel: there is no /dev/ashmem driver in
++     * mainline at all (GKI ships it as the ashmem_linux module). When the
++     * device node is absent there is no alternative to memfd, so use it
++     * regardless of the property - otherwise system_server dies at startup
++     * with "Failed to create ashmem: No such file or directory".
++     * The property is still honoured whenever /dev/ashmem does exist.
++     */
++    if (access("/dev/ashmem", F_OK) != 0) {
++        ALOGI("no /dev/ashmem on this kernel, forcing memfd\n");
++    } else if (!android::base::GetBoolProperty("sys.use_memfd", false)) {
+         if (debug_log) {
+             ALOGD("sys.use_memfd=false so memfd disabled\n");
+         }

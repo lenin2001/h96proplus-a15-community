@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Allowlist привилегированных разрешений для приложений, которые кладутся
+    в /system/priv-app вне AOSP.
+
+    ⛔ ЭТОТ ФАЙЛ — НЕ ФОРМАЛЬНОСТЬ.
+
+    Если приложение лежит в priv-app и просит разрешение уровня
+    signature|privileged, которого нет в allowlist, Android НЕ «просто не
+    выдаёт» его. В AOSP 15:
+
+        frameworks/base/services/core/java/com/android/server/pm/permission/
+        PermissionManagerServiceImpl.java, метод onSystemReady():
+
+            if (mPrivappPermissionsViolations != null) {
+                throw new IllegalStateException(
+                    "Signature|privileged permissions not in "
+                    + "privapp-permissions allowlist: " + ...);
+            }
+
+    Исключение летит в system_server во время загрузки → устройство уходит в
+    bootloop. Симптом при отладке: логотип, перезагрузка, снова логотип, и
+    ничего в UI. Искать в logcat строку «privapp-permissions allowlist».
+
+    Проверено по исходникам синхронизированного дерева AOSP 15, а не по памяти.
+
+    Уровни разрешений ниже сверены с
+    frameworks/base/core/res/AndroidManifest.xml (AOSP 15) — см.
+    docs/launcher-port.md.
+-->
+<permissions>
+
+    <!--
+        LeanbackLauncher 1.11.2 из прошивки Франкенштейн 2.9.
+        Извлечён из проверенного дампа system: prebuilt/launcher/.
+
+        Разрешения взяты не «на всякий случай», а ровно те, что приложение
+        реально запрашивает (aapt dump badging) И которые в AOSP 15 имеют
+        уровень signature|privileged. Остальные 10 его разрешений — normal,
+        они выдаются сами и здесь не нужны.
+    -->
+    <privapp-permissions package="com.google.android.leanbacklauncher">
+        <permission name="android.permission.ACCESS_NOTIFICATIONS"/>
+        <permission name="android.permission.BIND_APPWIDGET"/>
+        <permission name="android.permission.INTERACT_ACROSS_USERS"/>
+        <permission name="android.permission.MEDIA_CONTENT_CONTROL"/>
+        <permission name="android.permission.PACKAGE_USAGE_STATS"/>
+        <permission name="android.permission.WRITE_SECURE_SETTINGS"/>
+    </privapp-permissions>
+
+</permissions>
+
+<!--
+    Чего здесь намеренно НЕТ:
+
+    android.permission.WRITE_SETTINGS
+        уровень signature|preinstalled|appop|pre23|role — не privileged.
+        Выдаётся по факту предустановки, в allowlist не нужен.
+
+    android.permission.GET_PACKAGE_SIZE
+        уровень normal. Метод, ради которого оно бралось, из API убрали
+        ещё в Android 8; само разрешение осталось безвредным пережитком.
+
+    com.google.android.providers.gsf.permission.READ_GSERVICES
+    com.android.providers.tv.permission.READ_EPG_DATA
+    com.google.android.leanbacklauncher.recommendations.permission.RECOMMENDATIONS
+        объявлены не платформой, а сторонними пакетами (GSF, TvProvider,
+        сам лаунчер). Механизм privapp-permissions на них не распространяется.
+        Если GSF в сборке не будет, READ_GSERVICES просто не выдастся —
+        на загрузку это не влияет, но часть функций лаунчера отвалится.
+-->

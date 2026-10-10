@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Символ: киноплёнка — проект про просмотр кино -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FF4FC3F7"
+        android:pathData="M30,36h48v36h-48z" />
+    <path
+        android:fillColor="#FF0B1020"
+        android:pathData="M34,40h6v6h-6z M34,50h6v6h-6z M34,60h6v6h-6z
+                          M68,40h6v6h-6z M68,50h6v6h-6z M68,60h6v6h-6z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M47,46l14,8l-14,8z" />
+</vector>

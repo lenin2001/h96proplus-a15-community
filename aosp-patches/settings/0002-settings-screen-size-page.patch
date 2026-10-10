@@ -1,0 +1,826 @@
+diff --git a/res/values-ru/strings.xml b/res/values-ru/strings.xml
+index 4dbbacc..536d12f 100644
+--- a/res/values-ru/strings.xml
++++ b/res/values-ru/strings.xml
+@@ -5543,4 +5543,16 @@
+     <string name="contacts_storage_account_category_title" msgid="6427149157377815586">"Куда сохранять контакты"</string>
+     <string name="search_gesture_feature_title" msgid="7037117019612710960">"Обвести и найти"</string>
+     <string name="search_gesture_feature_summary" msgid="1793056495030564014">"Чтобы запустить поиск по экрану, нажмите и удерживайте кнопку главного экрана или маркер навигации"</string>
++
++    <string name="screen_size_title">"Размер экрана"</string>
++    <string name="screen_size_percent_summary">"%1$d%% экрана"</string>
++    <string name="screen_size_title_with_percent">"Размер экрана: %1$d%%"</string>
++    <string name="screen_size_reset_title">"Сбросить до 100%"</string>
++    <string name="screen_size_reset_summary">"Вернуть картинку на весь экран"</string>
++    <string name="screen_size_confirm_title">"Оставить этот размер?"</string>
++    <string name="screen_size_confirm_message">"Картинка занимает %1$d%% экрана. Через %2$d с вернётся прежний."</string>
++    <string name="screen_size_keep">"Оставить"</string>
++    <string name="screen_size_revert">"Вернуть"</string>
++    <string name="screen_size_footer">"Влево и вправо — поджать картинку от краёв по одному проценту; OK — оставить, Назад — вернуть как было. Пригодится, когда телевизор срезает края. Двигается вся картинка, включая видео и курсор."</string>
++    <string name="keywords_screen_size">"размер экрана, оверскан, края, обрезает, масштаб"</string>
+ </resources>
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index db679d7..9b741fe 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -13918,4 +13918,27 @@
+     <string name="search_gesture_feature_title">Circle to Search</string>
+     <!-- Summary text for press and hold nav handle OR home button to invoke Circle to Search. [CHAR LIMIT=NONE] -->
+     <string name="search_gesture_feature_summary">Touch and hold the Home button or the navigation handle to search using the content on your screen.</string>
++
++    <!-- Title of the screen-size setting: how much of the panel the picture fills. [CHAR LIMIT=60] -->
++    <string name="screen_size_title">Screen size</string>
++    <!-- Summary showing the share of the panel the picture fills. [CHAR LIMIT=NONE] -->
++    <string name="screen_size_percent_summary">%1$d%% of the screen</string>
++    <!-- Slider label carrying the figure being adjusted. [CHAR LIMIT=60] -->
++    <string name="screen_size_title_with_percent">Screen size: %1$d%%</string>
++    <!-- Title of the row that puts the picture back to full size. [CHAR LIMIT=60] -->
++    <string name="screen_size_reset_title">Reset to 100%</string>
++    <!-- Summary of that row. [CHAR LIMIT=NONE] -->
++    <string name="screen_size_reset_summary">Let the picture fill the whole screen again</string>
++    <!-- Title of the confirmation dialog. [CHAR LIMIT=60] -->
++    <string name="screen_size_confirm_title">Keep this screen size?</string>
++    <!-- Body of the confirmation dialog, with a countdown. [CHAR LIMIT=NONE] -->
++    <string name="screen_size_confirm_message">The picture fills %1$d%% of the screen. It goes back to the old size in %2$d s.</string>
++    <!-- Button that keeps the previewed size. [CHAR LIMIT=30] -->
++    <string name="screen_size_keep">Keep</string>
++    <!-- Button that puts the old size back. [CHAR LIMIT=30] -->
++    <string name="screen_size_revert">Go back</string>
++    <!-- Explanation under the slider. [CHAR LIMIT=NONE] -->
++    <string name="screen_size_footer">Left and right pull the picture in from the edges, one percent at a time; OK keeps the size, Back leaves it as it was. Use this when a television cuts the edges off. The whole picture moves, video and pointer included.</string>
++    <!-- Search keywords for the screen-size setting. [CHAR LIMIT=NONE] -->
++    <string name="keywords_screen_size">screen size, overscan, edges, cut off, zoom, fit</string>
+ </resources>
+diff --git a/res/xml/display_settings.xml b/res/xml/display_settings.xml
+index 3baf439..59b1af5 100644
+--- a/res/xml/display_settings.xml
++++ b/res/xml/display_settings.xml
+@@ -154,6 +154,14 @@
+             settings:keywords="@string/keywords_screen_resolution"
+             settings:controller="com.android.settings.display.ScreenResolutionController"/>
+ 
++        <Preference
++            android:key="screen_size"
++            android:title="@string/screen_size_title"
++            android:summary="@string/summary_placeholder"
++            android:fragment="com.android.settings.display.ScreenSizeSettings"
++            settings:keywords="@string/keywords_screen_size"
++            settings:controller="com.android.settings.display.ScreenSizePreferenceController"/>
++
+         <SwitchPreferenceCompat
+             android:key="display_white_balance"
+             android:title="@string/display_white_balance_title"
+diff --git a/res/xml/screen_size_settings.xml b/res/xml/screen_size_settings.xml
+new file mode 100644
+index 0000000..cb983a5
+--- /dev/null
++++ b/res/xml/screen_size_settings.xml
+@@ -0,0 +1,39 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Copyright (C) 2026 The Android Open Source Project
++
++     Licensed under the Apache License, Version 2.0 (the "License");
++     you may not use this file except in compliance with the License.
++     You may obtain a copy of the License at
++
++          http://www.apache.org/licenses/LICENSE-2.0
++
++     Unless required by applicable law or agreed to in writing, software
++     distributed under the License is distributed on an "AS IS" BASIS,
++     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++     See the License for the specific language governing permissions and
++     limitations under the License.
++-->
++
++<PreferenceScreen
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    android:key="screen_size_screen"
++    android:title="@string/screen_size_title">
++
++    <com.android.settings.display.ScreenSizeSeekBarPreference
++        android:key="screen_size_seekbar"
++        android:title="@string/screen_size_title"
++        android:summary="@string/summary_placeholder"
++        android:persistent="false"/>
++
++    <Preference
++        android:key="screen_size_reset"
++        android:title="@string/screen_size_reset_title"
++        android:summary="@string/screen_size_reset_summary"
++        android:persistent="false"/>
++
++    <com.android.settingslib.widget.FooterPreference
++        android:key="screen_size_footer"
++        android:title="@string/screen_size_footer"
++        android:selectable="false"/>
++
++</PreferenceScreen>
+diff --git a/src/com/android/settings/display/ScreenSizeBorderView.java b/src/com/android/settings/display/ScreenSizeBorderView.java
+new file mode 100644
+index 0000000..b0c0f7d
+--- /dev/null
++++ b/src/com/android/settings/display/ScreenSizeBorderView.java
+@@ -0,0 +1,81 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.settings.display;
++
++import android.content.Context;
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.Paint;
++import android.view.View;
++
++/**
++ * The frame drawn over the whole screen while the size is being adjusted: all four edges, the
++ * four corners and a centre mark, so the owner can see exactly where the picture ends and pull
++ * it in until the television stops cutting it off.
++ */
++public class ScreenSizeBorderView extends View {
++
++    private static final float ARM_DP = 56f;
++    private static final float CENTRE_DP = 16f;
++    private static final float STROKE_DP = 2f;
++
++    private final Paint mUnder = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final Paint mOver = new Paint(Paint.ANTI_ALIAS_FLAG);
++    private final float mArm;
++    private final float mCentre;
++
++    public ScreenSizeBorderView(Context context) {
++        super(context);
++        final float density = context.getResources().getDisplayMetrics().density;
++        mArm = ARM_DP * density;
++        mCentre = CENTRE_DP * density;
++
++        // Drawn twice: a thick dark pass underneath keeps the frame readable on a light screen.
++        mUnder.setStyle(Paint.Style.STROKE);
++        mUnder.setColor(Color.BLACK);
++        mUnder.setStrokeWidth(STROKE_DP * density * 3f);
++
++        mOver.setStyle(Paint.Style.STROKE);
++        mOver.setColor(Color.WHITE);
++        mOver.setStrokeWidth(STROKE_DP * density);
++    }
++
++    @Override
++    protected void onDraw(Canvas canvas) {
++        super.onDraw(canvas);
++        draw(canvas, mUnder);
++        draw(canvas, mOver);
++    }
++
++    private void draw(Canvas canvas, Paint paint) {
++        final float w = getWidth();
++        final float h = getHeight();
++        final float inset = paint.getStrokeWidth() / 2f;
++
++        canvas.drawRect(inset, inset, w - inset, h - inset, paint);
++
++        // Corner arms: a clipped corner shows even when a whole edge is still visible.
++        canvas.drawLine(inset, mArm, mArm, inset, paint);
++        canvas.drawLine(w - mArm, inset, w - inset, mArm, paint);
++        canvas.drawLine(inset, h - mArm, mArm, h - inset, paint);
++        canvas.drawLine(w - mArm, h - inset, w - inset, h - mArm, paint);
++
++        // Centre mark, to check the picture stayed centred.
++        canvas.drawLine(w / 2f - mCentre, h / 2f, w / 2f + mCentre, h / 2f, paint);
++        canvas.drawLine(w / 2f, h / 2f - mCentre, w / 2f, h / 2f + mCentre, paint);
++    }
++}
+diff --git a/src/com/android/settings/display/ScreenSizePreferenceController.java b/src/com/android/settings/display/ScreenSizePreferenceController.java
+new file mode 100644
+index 0000000..5735272
+--- /dev/null
++++ b/src/com/android/settings/display/ScreenSizePreferenceController.java
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.settings.display;
++
++import android.content.Context;
++
++import androidx.preference.Preference;
++
++import com.android.settings.R;
++import com.android.settings.core.BasePreferenceController;
++
++/** Shows, on the Display screen, how much of the panel the picture currently fills. */
++public class ScreenSizePreferenceController extends BasePreferenceController {
++
++    public ScreenSizePreferenceController(Context context, String preferenceKey) {
++        super(context, preferenceKey);
++    }
++
++    @Override
++    public int getAvailabilityStatus() {
++        return AVAILABLE;
++    }
++
++    @Override
++    public void updateState(Preference preference) {
++        super.updateState(preference);
++        preference.setSummary(mContext.getString(R.string.screen_size_percent_summary,
++                ScreenSizeSettings.readConfirmed(mContext)));
++    }
++}
+diff --git a/src/com/android/settings/display/ScreenSizeSeekBarPreference.java b/src/com/android/settings/display/ScreenSizeSeekBarPreference.java
+new file mode 100644
+index 0000000..ed814c5
+--- /dev/null
++++ b/src/com/android/settings/display/ScreenSizeSeekBarPreference.java
+@@ -0,0 +1,94 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.settings.display;
++
++import android.content.Context;
++import android.util.AttributeSet;
++import android.view.KeyEvent;
++import android.view.View;
++import android.widget.SeekBar;
++
++import androidx.preference.PreferenceViewHolder;
++
++import com.android.settings.widget.SeekBarPreference;
++
++/**
++ * A slider whose centre key confirms the size instead of doing nothing, so the owner can adjust
++ * and accept without leaving the row.
++ */
++public class ScreenSizeSeekBarPreference extends SeekBarPreference {
++
++    /** Told when the owner presses OK on the slider. */
++    interface OnConfirmListener {
++        void onConfirm();
++    }
++
++    private OnConfirmListener mListener;
++
++    public ScreenSizeSeekBarPreference(Context context, AttributeSet attrs) {
++        super(context, attrs);
++    }
++
++    void setOnConfirmListener(OnConfirmListener listener) {
++        mListener = listener;
++    }
++
++    @Override
++    public void onBindViewHolder(PreferenceViewHolder view) {
++        super.onBindViewHolder(view);
++        final View found = view.findViewById(com.android.internal.R.id.seekbar);
++        if (!(found instanceof SeekBar)) {
++            return;
++        }
++        final SeekBar seekBar = (SeekBar) found;
++
++        // AbsSeekBar works its key step out from the range -- max(1, round(range / 20)) -- which
++        // over 80..100 is 5. This setting is specified in single percents, so say so rather than
++        // letting the widget guess.
++        seekBar.setKeyProgressIncrement(1);
++
++        // The parent installs its key listener on the row, but on a television the bar itself is
++        // what takes focus, so the centre key never reaches the row. Catch it where the focus
++        // actually is, and leave every other key to the bar.
++        seekBar.setOnKeyListener((ignored, keyCode, event) -> {
++            if (event.getAction() == KeyEvent.ACTION_DOWN && isConfirmKey(keyCode)) {
++                if (mListener != null) {
++                    mListener.onConfirm();
++                }
++                return true;
++            }
++            return false;
++        });
++    }
++
++    @Override
++    public boolean onKey(View v, int keyCode, KeyEvent event) {
++        if (event.getAction() == KeyEvent.ACTION_DOWN && isConfirmKey(keyCode)) {
++            if (mListener != null) {
++                mListener.onConfirm();
++            }
++            return true;
++        }
++        return super.onKey(v, keyCode, event);
++    }
++
++    private static boolean isConfirmKey(int keyCode) {
++        return keyCode == KeyEvent.KEYCODE_DPAD_CENTER
++                || keyCode == KeyEvent.KEYCODE_ENTER
++                || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER;
++    }
++}
+diff --git a/src/com/android/settings/display/ScreenSizeSettings.java b/src/com/android/settings/display/ScreenSizeSettings.java
+new file mode 100644
+index 0000000..507724e
+--- /dev/null
++++ b/src/com/android/settings/display/ScreenSizeSettings.java
+@@ -0,0 +1,466 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.settings.display;
++
++import android.app.Activity;
++import android.app.AlertDialog;
++import android.app.settings.SettingsEnums;
++import android.content.Context;
++import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.SystemClock;
++import android.provider.Settings;
++import android.view.KeyEvent;
++import android.view.View;
++import android.view.ViewGroup;
++import android.view.ViewParent;
++import android.view.Window;
++import android.view.WindowManager;
++import android.widget.Button;
++
++import androidx.preference.Preference;
++import androidx.recyclerview.widget.RecyclerView;
++
++import com.android.settings.R;
++import com.android.settings.SettingsPreferenceFragment;
++
++/**
++ * Pulls the whole picture in from the edges of a television that overscans.
++ *
++ * <p>Adjusting the slider writes a <em>preview</em> setting that the display service applies at
++ * once, so the preview is the screen itself rather than a drawing of it. Only a confirmed size
++ * is stored; leaving, cancelling or letting the countdown run out puts the old one back, and the
++ * display service drops a preview that stops being refreshed, so a Settings crash cannot leave
++ * an unconfirmed size behind.
++ */
++public class ScreenSizeSettings extends SettingsPreferenceFragment
++        implements Preference.OnPreferenceChangeListener,
++        ScreenSizeSeekBarPreference.OnConfirmListener {
++
++    /** The confirmed size. Read by DisplayManagerService at boot and kept across reboots. */
++    static final String SCREEN_SIZE_PERCENT = "screen_size_percent";
++
++    /** The size being tried out. Zero or absent means there is none. */
++    static final String SCREEN_SIZE_PERCENT_PREVIEW = "screen_size_percent_preview";
++
++    /**
++     * The preview's lease. Written with a NEW value on every step and every few seconds while
++     * the page is open: the settings provider only notifies the display service when a value
++     * actually changes, so rewriting the same percentage would never renew anything.
++     */
++    static final String SCREEN_SIZE_PREVIEW_LEASE = "screen_size_preview_lease";
++
++    static final int MIN_PERCENT = 80;
++    static final int MAX_PERCENT = 100;
++
++    private static final long REVERT_DELAY_MS = 15000L;
++    private static final long TICK_MS = 1000L;
++
++    /** Settings must renew the lease more often than the display service drops it (20 s). */
++    private static final long REFRESH_MS = 5000L;
++
++    private static final String KEY_SEEKBAR = "screen_size_seekbar";
++    private static final String KEY_RESET = "screen_size_reset";
++
++    private final Handler mHandler = new Handler(Looper.getMainLooper());
++
++    private Context mContext;
++    private ScreenSizeSeekBarPreference mSeekBar;
++    private Preference mReset;
++    private AlertDialog mConfirmDialog;
++    private ScreenSizeBorderView mBorder;
++    private ViewGroup mToolbar;
++    private int mToolbarFocusability;
++
++    /** The window flags showBorder() had to add, and therefore the only ones it removes. */
++    private int mAddedWindowFlags;
++
++    /** Renewed on every lease write, so each write is a change the provider notifies. */
++    private int mLease;
++
++    /** One-shot: asks the slider for focus once its row exists, then unhooks itself. */
++    /** Self-reposting focus request; nulled once focus lands or the page is left. */
++    private Runnable mFocusWhenReady;
++    private int mFocusTries;
++
++    /** What to go back to: the stored size on entry, or the last one confirmed since. */
++    private int mConfirmedPercent = MAX_PERCENT;
++    private long mRevertAt;
++
++    private final Runnable mCountdown = new Runnable() {
++        @Override
++        public void run() {
++            if (mConfirmDialog == null || !mConfirmDialog.isShowing()) {
++                return;
++            }
++            final long left = mRevertAt - SystemClock.uptimeMillis();
++            if (left <= 0) {
++                revert();
++                return;
++            }
++            mConfirmDialog.setMessage(confirmMessage(mSeekBar.getProgress(), (left + 999) / 1000));
++            mHandler.postDelayed(this, TICK_MS);
++        }
++    };
++
++    /** Renews the lease while a preview is open, so the watchdog does not drop it. */
++    private final Runnable mRefreshPreview = new Runnable() {
++        @Override
++        public void run() {
++            final int percent = mSeekBar == null ? mConfirmedPercent : mSeekBar.getProgress();
++            if (percent != mConfirmedPercent) {
++                renewLease();
++                mHandler.postDelayed(this, REFRESH_MS);
++            }
++        }
++    };
++
++    @Override
++    public void onAttach(Context context) {
++        super.onAttach(context);
++        mContext = context.getApplicationContext();
++    }
++
++    @Override
++    public int getMetricsCategory() {
++        return SettingsEnums.DISPLAY;
++    }
++
++    @Override
++    public void onCreatePreferences(Bundle savedInstanceState, String rootKey) {
++        addPreferencesFromResource(R.xml.screen_size_settings);
++
++        mConfirmedPercent = readConfirmed(mContext);
++
++        mSeekBar = (ScreenSizeSeekBarPreference) findPreference(KEY_SEEKBAR);
++        mSeekBar.setMin(MIN_PERCENT);
++        mSeekBar.setMax(MAX_PERCENT);
++        mSeekBar.setProgress(mConfirmedPercent);
++        mSeekBar.setContinuousUpdates(true);
++        mSeekBar.setOnPreferenceChangeListener(this);
++        mSeekBar.setOnConfirmListener(this);
++
++        mReset = findPreference(KEY_RESET);
++        showCurrent(mConfirmedPercent);
++    }
++
++    @Override
++    public void onStart() {
++        super.onStart();
++        // Seed the lease above any value the display service may still hold from a prior session,
++        // so the very first renewal is a strict change it recognises as a new preview.
++        mLease = Settings.Secure.getInt(mContext.getContentResolver(), SCREEN_SIZE_PREVIEW_LEASE, 0);
++        showBorder();
++        releaseTheToolbar();
++        focusTheSlider();
++    }
++
++    /**
++     * The toolbar's navigation button is the first focusable thing in this window, so it takes
++     * the focus before the list can ask for it and the slider then needs an extra key press to
++     * reach. While this page is open the toolbar steps out of the focus order; BACK still leaves,
++     * which is what the hint under the slider tells the owner to use.
++     */
++    private void releaseTheToolbar() {
++        final Activity activity = getActivity();
++        if (activity == null || mToolbar != null) {
++            return;
++        }
++        final View bar = activity.findViewById(R.id.action_bar);
++        if (bar instanceof ViewGroup) {
++            mToolbar = (ViewGroup) bar;
++            mToolbarFocusability = mToolbar.getDescendantFocusability();
++            mToolbar.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
++        }
++    }
++
++    private void restoreTheToolbar() {
++        if (mToolbar != null) {
++            mToolbar.setDescendantFocusability(mToolbarFocusability);
++            mToolbar = null;
++        }
++    }
++
++    /**
++     * Without this the page opens with the toolbar's back arrow focused and the slider two key
++     * presses away, which on a television reads as "the D-pad does nothing here".
++     */
++    private static final int FOCUS_MAX_TRIES = 25;   // ~1.25 s of frames, then give up quietly
++
++    private void focusTheSlider() {
++        final RecyclerView list = getListView();
++        if (list == null || mFocusWhenReady != null) {
++            return;
++        }
++        mFocusTries = 0;
++        mFocusWhenReady = new Runnable() {
++            @Override
++            public void run() {
++                if (mFocusWhenReady != this) {
++                    return;                       // superseded or cancelled
++                }
++                if (list.findFocus() != null) {
++                    mFocusWhenReady = null;       // the owner already moved somewhere; leave it
++                    return;
++                }
++                final View bar = list.findViewById(com.android.internal.R.id.seekbar);
++                if (bar != null && bar.isShown()) {
++                    // Opening from a touch (air-mouse tap) leaves the list in touch mode, where a
++                    // normally d-pad-focusable SeekBar refuses focus; allow it here so the slider
++                    // is ready on open however the page was reached, then the first remote press
++                    // adjusts instead of only waking focus.
++                    bar.setFocusableInTouchMode(true);
++                    if (bar.requestFocus()) {
++                        mFocusWhenReady = null;   // landed
++                        return;
++                    }
++                }
++                if (++mFocusTries < FOCUS_MAX_TRIES) {
++                    list.postDelayed(this, 50);   // row not focusable yet; try next frame
++                } else {
++                    mFocusWhenReady = null;
++                }
++            }
++        };
++        // post(), not a layout listener: the initial layout may already be done by onStart, and
++        // there would be no further layout to trigger a listener.
++        list.post(mFocusWhenReady);
++    }
++
++    private void unhookFocusWhenReady() {
++        if (mFocusWhenReady != null) {
++            final RecyclerView list = getListView();
++            if (list != null) {
++                list.removeCallbacks(mFocusWhenReady);
++            }
++            mFocusWhenReady = null;
++        }
++    }
++
++    private void renewLease() {
++        putInt(mContext, SCREEN_SIZE_PREVIEW_LEASE, ++mLease);
++    }
++
++    @Override
++    public void onStop() {
++        super.onStop();
++        // Leaving without confirming is the same as saying no. Every pending callback goes
++        // too: a countdown, a lease renewal or a focus request that fired after this point
++        // could revive a preview that was just cancelled.
++        unhookFocusWhenReady();
++        mHandler.removeCallbacksAndMessages(null);
++        revert();
++        hideBorder();
++        restoreTheToolbar();
++    }
++
++    @Override
++    public boolean onPreferenceChange(Preference preference, Object newValue) {
++        if (preference != mSeekBar || !(newValue instanceof Integer)) {
++            return false;
++        }
++        preview(clamp((Integer) newValue));
++        return true;
++    }
++
++    @Override
++    public boolean onPreferenceTreeClick(Preference preference) {
++        if (KEY_RESET.equals(preference.getKey())) {
++            // Going back to a full-size picture can never hide the confirmation, so it is
++            // applied straight away rather than asking.
++            mSeekBar.setProgress(MAX_PERCENT);
++            keep(MAX_PERCENT);
++            return true;
++        }
++        return super.onPreferenceTreeClick(preference);
++    }
++
++    /** OK on the slider. */
++    @Override
++    public void onConfirm() {
++        final int percent = mSeekBar.getProgress();
++        if (percent == mConfirmedPercent) {
++            return;
++        }
++        dismissDialog();
++        mRevertAt = SystemClock.uptimeMillis() + REVERT_DELAY_MS;
++        mConfirmDialog = new AlertDialog.Builder(getPrefContext())
++                .setTitle(R.string.screen_size_confirm_title)
++                .setMessage(confirmMessage(percent, REVERT_DELAY_MS / 1000))
++                .setCancelable(false)
++                .setPositiveButton(R.string.screen_size_keep, (dialog, which) -> keep(percent))
++                .setNegativeButton(R.string.screen_size_revert, (dialog, which) -> revert())
++                .create();
++        // Asked for on show rather than straight after show(): the dialog's window has not
++        // taken focus yet at that point, and the request is simply lost.
++        mConfirmDialog.setOnShowListener(dialog -> {
++            final Button keep = mConfirmDialog.getButton(AlertDialog.BUTTON_POSITIVE);
++            if (keep != null) {
++                keep.setFocusableInTouchMode(true);
++                keep.requestFocus();
++            }
++        });
++        // And if focus still does not arrive, the keys must not fall on the floor: OK keeps,
++        // Back puts it away, exactly as the hint under the slider says. When a button did take
++        // focus, this steps aside so the owner's choice between the two stands.
++        mConfirmDialog.setOnKeyListener((dialog, keyCode, event) -> {
++            if (event.getAction() != KeyEvent.ACTION_DOWN) {
++                return false;
++            }
++            if (keyCode == KeyEvent.KEYCODE_BACK) {
++                revert();
++                return true;
++            }
++            if (isConfirmKey(keyCode) && !aButtonHasFocus()) {
++                keep(percent);
++                return true;
++            }
++            return false;
++        });
++        mConfirmDialog.show();
++        mHandler.postDelayed(mCountdown, TICK_MS);
++    }
++
++    private void preview(int percent) {
++        putInt(mContext, SCREEN_SIZE_PERCENT_PREVIEW,
++                percent == mConfirmedPercent ? 0 : percent);
++        mHandler.removeCallbacks(mRefreshPreview);
++        if (percent != mConfirmedPercent) {
++            renewLease();
++            mHandler.postDelayed(mRefreshPreview, REFRESH_MS);
++        }
++        showCurrent(percent);
++    }
++
++    private void keep(int percent) {
++        mConfirmedPercent = clamp(percent);
++        putInt(mContext, SCREEN_SIZE_PERCENT, mConfirmedPercent);
++        putInt(mContext, SCREEN_SIZE_PERCENT_PREVIEW, 0);
++        mHandler.removeCallbacks(mRefreshPreview);
++        dismissDialog();
++        showCurrent(mConfirmedPercent);
++    }
++
++    private void revert() {
++        putInt(mContext, SCREEN_SIZE_PERCENT_PREVIEW, 0);
++        mHandler.removeCallbacks(mRefreshPreview);
++        if (mSeekBar != null) {
++            mSeekBar.setProgress(mConfirmedPercent);
++        }
++        dismissDialog();
++        showCurrent(mConfirmedPercent);
++    }
++
++    private boolean aButtonHasFocus() {
++        if (mConfirmDialog == null) {
++            return false;
++        }
++        final Button keep = mConfirmDialog.getButton(AlertDialog.BUTTON_POSITIVE);
++        final Button back = mConfirmDialog.getButton(AlertDialog.BUTTON_NEGATIVE);
++        return (keep != null && keep.hasFocus()) || (back != null && back.hasFocus());
++    }
++
++    private static boolean isConfirmKey(int keyCode) {
++        return keyCode == KeyEvent.KEYCODE_DPAD_CENTER
++                || keyCode == KeyEvent.KEYCODE_ENTER
++                || keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER;
++    }
++
++    private void dismissDialog() {
++        mHandler.removeCallbacks(mCountdown);
++        if (mConfirmDialog != null) {
++            mConfirmDialog.dismiss();
++            mConfirmDialog = null;
++        }
++    }
++
++    private void showBorder() {
++        final Activity activity = getActivity();
++        if (activity == null || mBorder != null) {
++            return;
++        }
++        // The frame has to reach the true edges of the picture, not the edges of the content
++        // area, or it would measure the wrong rectangle. Only the flags that were not already
++        // set are remembered, so hideBorder() removes exactly what this page added.
++        final Window window = activity.getWindow();
++        final int wanted = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
++                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
++        mAddedWindowFlags = wanted & ~window.getAttributes().flags;
++        window.addFlags(mAddedWindowFlags);
++        mBorder = new ScreenSizeBorderView(activity);
++        // Into the decor rather than the content view: the content sits below the status bar, and
++        // a frame drawn there would tell the owner the picture ends where it does not.
++        final View decor = window.getDecorView();
++        if (decor instanceof ViewGroup) {
++            ((ViewGroup) decor).addView(mBorder, new ViewGroup.LayoutParams(
++                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
++        } else {
++            activity.addContentView(mBorder, new ViewGroup.LayoutParams(
++                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
++        }
++    }
++
++    private void hideBorder() {
++        if (mBorder != null) {
++            final ViewParent parent = mBorder.getParent();
++            if (parent instanceof ViewGroup) {
++                ((ViewGroup) parent).removeView(mBorder);
++            }
++            mBorder = null;
++        }
++        final Activity activity = getActivity();
++        if (activity != null && mAddedWindowFlags != 0) {
++            activity.getWindow().clearFlags(mAddedWindowFlags);
++            mAddedWindowFlags = 0;
++        }
++    }
++
++    private void showCurrent(int percent) {
++        if (mSeekBar != null) {
++            // The seek bar's own layout has no summary line, so the number goes in the title:
++            // while the owner is adjusting, the figure has to be readable.
++            mSeekBar.setTitle(getString(R.string.screen_size_title_with_percent, percent));
++            mSeekBar.setSeekBarStateDescription(
++                    getString(R.string.screen_size_percent_summary, percent));
++        }
++        if (mReset != null) {
++            mReset.setEnabled(mConfirmedPercent != MAX_PERCENT || percent != MAX_PERCENT);
++        }
++    }
++
++    private String confirmMessage(int percent, long secondsLeft) {
++        return getString(R.string.screen_size_confirm_message, percent, secondsLeft);
++    }
++
++    /** The stored size, with anything out of range treated as a full-size picture. */
++    static int readConfirmed(Context context) {
++        return clamp(Settings.Secure.getInt(
++                context.getContentResolver(), SCREEN_SIZE_PERCENT, MAX_PERCENT));
++    }
++
++    private static void putInt(Context context, String key, int value) {
++        Settings.Secure.putInt(context.getContentResolver(), key, value);
++    }
++
++    static int clamp(int percent) {
++        if (percent < MIN_PERCENT || percent > MAX_PERCENT) {
++            return MAX_PERCENT;
++        }
++        return percent;
++    }
++}

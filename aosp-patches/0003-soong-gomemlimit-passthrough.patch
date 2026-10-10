@@ -1,0 +1,26 @@
+diff --git a/ui/build/soong.go b/ui/build/soong.go
+index 0963f76..1c67b19 100644
+--- a/ui/build/soong.go
++++ b/ui/build/soong.go
+@@ -212,6 +212,21 @@ func (pb PrimaryBuilderFactory) primaryBuilderInvocation(config Config) bootstra
+ 
+ 	commonArgs = append(commonArgs, "-l", filepath.Join(pb.config.FileListDir(), "Android.bp.list"))
+ 	invocationEnv := make(map[string]string)
++
++	// ── ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 23.08.2026) ──────────────────────
++	// soong_build запускается с ПУСТЫМ окружением, поэтому обычный
++	// `export GOMEMLIMIT=...` до него не доходит вовсе. Машина сборки —
++	// 4 ядра / 24 ГБ, и без предела куча Go разрастается до ~30 ГБ, уводя
++	// систему в непрерывную подкачку (замерено: 44% времени в ожидании
++	// диска, 9% полезной работы, хосту остаётся 870 МБ и он близок к
++	// зависанию). Пропускаем два значения через SOONG_-префикс.
++	if v := os.Getenv("SOONG_GOMEMLIMIT"); v != "" {
++		invocationEnv["GOMEMLIMIT"] = v
++	}
++	if v := os.Getenv("SOONG_GODEBUG"); v != "" {
++		invocationEnv["GODEBUG"] = v
++	}
++	// ── конец локальной правки ───────────────────────────────────────────
+ 	if pb.debugPort != "" {
+ 		//debug mode
+ 		commonArgs = append(commonArgs, "--delve_listen", pb.debugPort,

@@ -1,0 +1,125 @@
+From: h96 work order 2026-09-14
+Subject: [PATCH] media: meson: vdec: fix the VP9 ANC2AXI dirty-mask publication
+
+0027 protects VP9 against the carry-forward reference address that this driver's own comment in
+codec_hevc_common.c describes as "kvadraty / vertikal'nye polosy musora" - squares and vertical
+stripes of garbage. A CAPTURE slot whose ANC2AXI entry was written while its buffer was not yet
+mapped keeps the address of a different buffer; frames decode into it correctly, but every later
+frame that uses it as a reference reads the wrong memory. H264 closes this hole in
+.program_capture_buf; VP9 had no such path until 0027 added one, driven by the anc_dirty bitmask.
+
+Two defects in how that mask is published.
+
+1. It is a plain u32 read-modify-written from two contexts with no common lock:
+
+     set     codec_vp9_program_capture_buf()  anc_dirty |= BIT(index)
+             reached from vdec_vb2_buf_queue(), which holds sess->lock only
+     clear   codec_vp9_process_frame()        read it, refresh the table, anc_dirty = 0
+             reached from the interrupt thread, which holds vp9->lock
+
+   A set racing a clear loses the bit. Use set_bit() and xchg() so it cannot.
+
+2. In codec_vp9_resume() the reset stood AFTER codec_hevc_setup_buffers(), which is what actually
+   rewrites the table. 0027's comment describing the table as "just written" was accurate; an
+   earlier draft of this patch claimed the reset ran before the rewrite, and that claim was simply
+   wrong about the code. Because .program_capture_buf runs without vp9->lock, a QBUF can set its
+   bit while setup_buffers() is mid-rewrite - and that buffer's slot is not in the table being
+   written. Clearing afterwards wipes exactly the mark that mattered. The reset now precedes the
+   rewrite, which is the ordering the comment always claimed: marks accumulated earlier are
+   superseded by the rewrite, and a mark set during or after it survives for the next
+   process_frame().
+
+Scope of the consequence, stated accurately: a lost mark does not strand a slot forever. Any later
+QBUF on any buffer sets a bit, and codec_hevc_refresh_buffers() rewrites the whole table, so the
+stale entry is repaired at the next refresh. The damage is therefore bounded - corruption between
+the lost mark and the next refresh - which is consistent with the owner reporting that VP9 seeks
+work but the picture breaks up intermittently, and with a systematic defect being ruled out.
+
+This is a race and ordering fix supported by reading the compiled function and its locks. The lost
+update has not been observed directly, and that is not claimed.
+
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -4,6 +4,8 @@
+  * Copyright (C) 2015 Amlogic, Inc. All rights reserved.
+  */
+ 
++#include <linux/atomic.h>
++#include <linux/bitops.h>
+ #include <media/v4l2-mem2mem.h>
+ #include <media/videobuf2-dma-contig.h>
+ 
+@@ -489,8 +491,14 @@
+ 	 * tablica byla napisana. Vystavlyaetsya v .program_capture_buf (tam
+ 	 * tol'ko bit, nikakogo MMIO), gasitsya v process_frame - v tot moment,
+ 	 * kogda proshivka garantirovanno ne dekodiruet.
++	 *
++	 * h96 0028 (13.09.2026): dostup TOL'KO atomarnymi operaciyami. Stavitsya
++	 * iz vdec_vb2_buf_queue() (sess->lock), gasitsya iz treda preryvaniya
++	 * (vp9->lock) - obshchej blokirovki u etih dvuh putej net, poetomu
++	 * obychnyj |= / = 0 teryal by bit, vystavlennyj parallel'nym QBUF, a
++	 * poteryannyj bit = slot navsegda ostaetsya s chuzhim adresom.
+ 	 */
+-	u32 anc_dirty;
++	unsigned long anc_dirty;
+ 
+ 	/*
+ 	 * Nomer pokoleniya formata: +1 na kazhdyj src_change. Nuzhen, chtoby v
+@@ -1630,9 +1638,8 @@
+ 	 * zavershaetsya obnuleniem 32 slotov ANC_CANVAS_DATA, poetomu posle nee
+ 	 * referensy obyazatel'no propisyvayutsya zanovo, chto nizhe i proishodit.
+ 	 */
+-	if (vp9->anc_dirty) {
++	if (xchg(&vp9->anc_dirty, 0)) {
+ 		codec_hevc_refresh_buffers(sess, &vp9->common, vp9->is_10bit);
+-		vp9->anc_dirty = 0;
+ 		vp9->stats.anc_refresh++;
+ 	}
+ 
+@@ -1709,19 +1716,30 @@
+ 	struct codec_vp9 *vp9 = sess->priv;
+ 
+ 	mutex_lock(&vp9->lock);
++
++	/*
++	 * h96 0028: gasim otmetki DO perezapisi tablicy, a ne posle nee.
++	 *
++	 * codec_hevc_setup_buffers() nizhe perepisyvaet tablicu ANC2AXI celikom po
++	 * tekushchemu sostoyaniyu ocheredi, poetomu vse nakoplennye do etogo momenta
++	 * otmetki dejstvitel'no perestayut byt' aktual'nymi. No .program_capture_buf
++	 * vyzyvaetsya iz vdec_vb2_buf_queue() BEZ vp9->lock, tak chto QBUF mozhet
++	 * postavit' bit imenno vo vremya etoj perezapisi - i ego slot v tablicu uzhe
++	 * ne popadet. Esli gasit' POSLE perezapisi (kak bylo), takaya otmetka
++	 * zatiraetsya, i slot ostaetsya s chuzhim adresom, poka ego ne pochinit
++	 * kakoj-nibud' sleduyushchij refresh.
++	 *
++	 * Gasim atomarno: na etom slove rabotaet set_bit(), meshat' ego s obychnoj
++	 * zapis'yu nel'zya.
++	 */
++	xchg(&vp9->anc_dirty, 0);
++
+ 	if (codec_hevc_setup_buffers(sess, &vp9->common, vp9->is_10bit)) {
+ 		mutex_unlock(&vp9->lock);
+ 		amvdec_abort(sess);
+ 		return;
+ 	}
+ 
+-	/*
+-	 * h96 0027: tablica ANC2AXI tol'ko chto napisana celikom po tekushchemu
+-	 * sostoyaniyu ocheredi - nakoplennye otmetki o "podozritel'nyh" slotah
+-	 * bol'she ne aktual'ny.
+-	 */
+-	vp9->anc_dirty = 0;
+-
+ 	codec_vp9_setup_workspace(sess, vp9);
+ 	codec_hevc_setup_decode_head(sess, vp9->is_10bit);
+ 	codec_vp9_process_lf(vp9);
+@@ -1817,7 +1835,7 @@
+ 	if (!vp9 || vb->index >= 32)
+ 		return;
+ 
+-	vp9->anc_dirty |= BIT(vb->index);
++	set_bit(vb->index, &vp9->anc_dirty);
+ }
+ 
+ /*

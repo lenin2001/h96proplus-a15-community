@@ -1,0 +1,8 @@
+# h96: built-in ath10k_sdio probes the QCA9377 SDIO function (mmc2:0001:1, 0271:0701)
+# at ~2 s, before /vendor (firmware_class.path=/vendor/firmware) is mounted, so the first
+# firmware request fails with -2 and no phy/wlan0 is created. Re-bind ONLY that function
+# once vendor is available. Does not touch the MMC host, the boot SD or Bluetooth.
+on post-fs
+    write /sys/bus/sdio/drivers/ath10k_sdio/unbind mmc2:0001:1
+    write /sys/bus/sdio/drivers/ath10k_sdio/bind mmc2:0001:1
+    setprop wifi.interface wlan0

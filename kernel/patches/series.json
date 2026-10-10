@@ -1,0 +1,333 @@
+{
+  "schema": 1,
+  "description": "Linux kernel for H96 Pro Plus (Amlogic S912/GXM): the ACTIVE series in application order, plus the status of every other file in kernel/patches. Applied by build/prepare-kernel.sh.",
+  "base": {
+    "repository": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+    "tag": "v7.1",
+    "tag_object": "b3f94b2b3f3e51ab880a51fc6510e1dafba654ed",
+    "commit": "8cd9520d35a6c38db6567e97dd93b1f11f185dc6"
+  },
+  "active": [
+    {
+      "step": 1,
+      "file": "hevc/0001-meson-vdec-implement-10bit-bitstream-handling.patch",
+      "method": "git-am",
+      "origin": "linux-media mailing list, HEVC series v3 (2023-03-14, not merged upstream)"
+    },
+    {
+      "step": 2,
+      "file": "hevc/0002-meson-vdec-add-HEVC-decode-codec.patch",
+      "method": "git-am",
+      "origin": "same series"
+    },
+    {
+      "step": 3,
+      "file": "0001-vdec-deferred-drain.patch",
+      "method": "apply",
+      "note": "the maintainer's two EOS/drain commits on top of HEVC (correct EOS/drain sequencing; EOS padding tuning via module params)"
+    },
+    {
+      "step": 4,
+      "file": "snapshots/k77-tree-vs-6c8eb7356.diff",
+      "method": "apply",
+      "kind": "cumulative-snapshot",
+      "note": "tracked-file state of kernel build #77 relative to the step-3 result: folds the early vdec, Panfrost (0021), IR, watchdog and PM hooks as they stood on 2026-09-08"
+    },
+    {
+      "step": 5,
+      "file": "0024-meson-wdt-stop-on-shutdown.patch",
+      "method": "reverse",
+      "note": "the #77 snapshot contains 0024, but the #80..#112 line did not: #96 and #102 were 'base + 0024' candidates that were never installed"
+    },
+    {
+      "step": 6,
+      "file": "0025-vdec-recycle-stall-activity-gated.patch",
+      "method": "apply",
+      "build": "#80",
+      "note": "v2"
+    },
+    {
+      "step": 7,
+      "file": "0026-zram-zspages-not-movable.patch",
+      "method": "apply",
+      "build": "#80"
+    },
+    {
+      "step": 8,
+      "file": "0026a-vdec-comment-as-in-built-tree.patch",
+      "method": "apply",
+      "build": "#81",
+      "note": "comment-only: one line of 0025's comment as it stood in the built tree; makes vdec.c byte-identical to the maintainer's #81 commit"
+    },
+    {
+      "step": 9,
+      "file": "0027-meson-vdec-vp9-defer-frame-instead-of-dropping-it.patch",
+      "method": "apply",
+      "build": "#82"
+    },
+    {
+      "step": 10,
+      "file": "0028-meson-vdec-vp9-atomic-anc-dirty-mask.patch",
+      "method": "apply",
+      "build": "#85",
+      "note": "corrected version"
+    },
+    {
+      "step": 11,
+      "file": "0029-meson-aiu-default-hdmi-source-to-i2s.patch",
+      "method": "apply",
+      "build": "#85"
+    },
+    {
+      "step": 12,
+      "file": "0030-meson-vdec-terminate-drain-with-last-buffer.patch",
+      "method": "apply",
+      "build": "#87"
+    },
+    {
+      "step": 13,
+      "file": "0031-meson-vdec-drain-completion-hardening.patch",
+      "method": "apply",
+      "build": "#95"
+    },
+    {
+      "step": 14,
+      "file": "0032-meson-vdec-match-timestamps-by-payload-end.patch",
+      "method": "apply",
+      "build": "#95"
+    },
+    {
+      "step": 15,
+      "file": "0033-meson-vdec-hevc-drain-match-by-offset.patch",
+      "method": "apply",
+      "build": "#95"
+    },
+    {
+      "step": 16,
+      "file": "0034-meson-vdec-synchronize-irq-before-free.patch",
+      "method": "apply",
+      "build": "#95"
+    },
+    {
+      "step": 17,
+      "file": "0035-meson-vdec-vp9-fix-backward-adaptation.patch",
+      "method": "apply",
+      "build": "#95"
+    },
+    {
+      "step": 18,
+      "file": "0036-meson-vdec-reserve-workspace-at-probe.patch",
+      "method": "apply",
+      "build": "#95"
+    },
+    {
+      "step": 19,
+      "file": "0037-meson-vdec-no-new-picture-after-teardown-started.patch",
+      "method": "apply",
+      "build": "#98"
+    },
+    {
+      "step": 20,
+      "file": "0038-meson-vdec-failed-drain-reaches-userspace.patch",
+      "method": "apply",
+      "build": "#98"
+    },
+    {
+      "step": 21,
+      "file": "0042-arm_scpi-amlogic-set-usr-data-ir-wake-key.patch",
+      "method": "apply",
+      "build": "#112"
+    },
+    {
+      "step": 22,
+      "copy": "../meson_gx_pm.c",
+      "to": "drivers/firmware/meson/meson_gx_pm.c",
+      "build": "#112",
+      "note": "canonical PM driver; its Kconfig/Makefile hooks come from step 4"
+    },
+    {
+      "step": 23,
+      "file": "0044-meson-ir-suspend-resume-register-dump.patch",
+      "method": "apply",
+      "build": "#112",
+      "note": "dynamic-debug output only"
+    },
+    {
+      "step": 24,
+      "file": "0046-meson-ir-raw-decoder-sets-input-filter.patch",
+      "method": "apply",
+      "build": "#112"
+    },
+    {
+      "step": 25,
+      "copy": "../../dt/meson-gxm-h96proplus.dts",
+      "to": "arch/arm64/boot/dts/amlogic/meson-gxm-h96proplus.dts",
+      "note": "the DTS of builds #77..#112 (sha256 e84b56b7...); compiles to the DTB installed on the maintainer's unit (26f81f59...); the dtb Makefile line comes from step 4"
+    },
+    {
+      "step": 26,
+      "copy": "../config/h96proplus_defconfig",
+      "to": "arch/arm64/configs/h96proplus_defconfig",
+      "note": "savedefconfig of the #112 .config (sha256 1070eb3f...); regenerates that .config byte for byte"
+    }
+  ],
+  "verification": {
+    "steps_1_to_4": "byte-exact: after step 3 the git blob hashes of all 19 files touched later equal the pre-image hashes recorded in the #77 snapshot; after step 4 all 19 post-image hashes match",
+    "after_step_8": "byte-exact against the maintainer's local commit 124a496af ('kernel #81 exactly as built'): every file the series has touched by then is identical (blob hashes)",
+    "final": "byte-exact against the source hashes recorded in boot111r.manifest (kernel build #112, the last documented running baseline): all 30 source files listed there, the DTS and the .config; the only listed file not reproduced is meson-vdec.mod.c, a build-generated file",
+    "dtb": "the DTS compiles to sha256 26f81f595d10487f92674e681f9809a763a7aed3d66ba4ff09f6d30205a3ffc9, the DTB written to both reserved records on the maintainer's unit",
+    "checked_on": "2026-10-10, against the maintainer's build tree mounted read-only"
+  },
+  "builds": {
+    "#77": "steps 1-4 (state of 2026-09-08)",
+    "#80": "#74 + 0025 + 0026  (#77 = #74 + PM work)",
+    "#81": "#80 + CONFIG_PARTITION_ADVANCED + CONFIG_CMDLINE_PARTITION; committed by the maintainer as 124a496af = this series up to step 8",
+    "#82": "#81 + 0027",
+    "#85": "#82 + 0028 (corrected) + 0029",
+    "#87": "#85 + 0030",
+    "#95": "#87 + 0031..0036",
+    "#98": "#95 + 0037 + 0038",
+    "#112": "#98 + 0042 + canonical meson_gx_pm + 0044 + 0046 - last documented running baseline (image boot111r)",
+    "#113": "#112 + AVC experiment knobs (0045 vdec1_hz, 0047 h264_vendor_init, 0048 vdec1_mcrcc_reset) - experimental image boot113r, not a baseline; these knobs were never published as patch files"
+  },
+  "not_applied": [
+    {
+      "file": "0002-meson-gxbb-wdt-start-at-probe.patch",
+      "status": "folded",
+      "note": "present in the step-4 snapshot"
+    },
+    {
+      "file": "0003-vdec-vp9-ref-lifecycle-and-seek.patch",
+      "status": "historical",
+      "note": "early vdec work; its state at #77 is in the snapshot"
+    },
+    {
+      "file": "0004-vdec-hevc-vp9-single-dmabuf-chroma.patch",
+      "status": "historical"
+    },
+    {
+      "file": "0005-vdec-debug-frame-map-dump.patch",
+      "status": "historical",
+      "note": "debugging aid"
+    },
+    {
+      "file": "0006-bt-kernel-configs.txt",
+      "status": "description",
+      "note": "Bluetooth options; covered by the defconfig"
+    },
+    {
+      "file": "0007-vdec-seek-teardown-and-buffer-count.patch",
+      "status": "historical"
+    },
+    {
+      "file": "0008-vdec-srcchange-loop-and-vp9-noshow-reclaim.patch",
+      "status": "historical"
+    },
+    {
+      "file": "0009-vdec-remove-esparser-cancel-deadlock.patch",
+      "status": "historical"
+    },
+    {
+      "file": "0010-vdec-buffer-balance-and-4k-stride.patch",
+      "status": "historical"
+    },
+    {
+      "file": "0010-vdec-buffer-balance-start.patch",
+      "status": "historical"
+    },
+    {
+      "file": "0012-meson-ir-remote-mouse-mode.patch",
+      "status": "superseded",
+      "note": "mouse mode moved to the userspace daemon device/h96proplus/h96mouse; the kernel code is still in meson-ir.c (hardware NEC handler) but is not reached: the board matches meson-gxbb-ir and uses the software decoder"
+    },
+    {
+      "file": "0013-meson-gx-deep-suspend-and-ir-wakeup.patch",
+      "status": "superseded",
+      "note": "replaced by the canonical meson_gx_pm driver"
+    },
+    {
+      "file": "0014-meson-gx-suspend-gate-hdmi5v-fan-rail.patch",
+      "status": "failed-experiment",
+      "note": "HDMI 5 V gating is not a whole-board power switch"
+    },
+    {
+      "file": "0015-vdec-recycle-stall-recovery.patch",
+      "status": "description",
+      "note": "no diff; superseded by 0025"
+    },
+    {
+      "file": "0016-meson-ir-hw-decode-real-remote-mouse.patch",
+      "status": "reverted",
+      "note": "no diff; the hardware decoder broke OK/long-press handling"
+    },
+    {
+      "file": "0017-vdec-program-all-dpb-buffers-seek-fix.patch",
+      "status": "description",
+      "note": "no diff"
+    },
+    {
+      "file": "0018-vdec-h264-late-buf-topup-and-clamps.patch",
+      "status": "historical"
+    },
+    {
+      "file": "0019-meson-ir-power-key-full-poweroff.patch",
+      "status": "failed-experiment",
+      "note": "full power-off resets this board; the code is in the hardware NEC handler and not reached with the software decoder"
+    },
+    {
+      "file": "0020-vdec-gate-recycle-until-buf-output.patch",
+      "status": "historical",
+      "note": "a revised form of its buf_output gate is in the step-4 snapshot; the stall handling around it was reworked by 0025"
+    },
+    {
+      "file": "0021-panfrost-gxm-forbid-runtime-pm.patch",
+      "status": "folded",
+      "note": "present in the step-4 snapshot"
+    },
+    {
+      "file": "0022-vdec-clear-stopping-on-drc-resume.patch",
+      "status": "folded",
+      "note": "the only vdec.c change of the #77 snapshot"
+    },
+    {
+      "file": "0023-meson-gx-pm-poweroff-sip-handshake.patch",
+      "status": "failed-experiment",
+      "note": "SYSTEM_OFF with the vendor handshake still reset the board"
+    },
+    {
+      "file": "0024-meson-wdt-stop-on-shutdown.patch",
+      "status": "reversed-in-step-5"
+    },
+    {
+      "file": "0027-RATIONALE.md",
+      "status": "description"
+    },
+    {
+      "file": "experiments/0039-EXPERIMENT-recycle-hold.patch",
+      "status": "experiment",
+      "note": "research for AVC corruption, not a fix"
+    },
+    {
+      "file": "experiments/0040-EXPERIMENT-es-split-vld-gate.patch",
+      "status": "experiment"
+    },
+    {
+      "file": "experiments/0041-EXPERIMENT-h264-mv-refs.patch",
+      "status": "experiment"
+    },
+    {
+      "file": "vdec-cumulative-2026-09-05.diff",
+      "status": "historical-snapshot",
+      "note": "superseded by the #77 snapshot"
+    },
+    {
+      "file": "hevc/0000-cover-letter.txt",
+      "status": "description"
+    },
+    {
+      "file": "hevc/README.md",
+      "status": "description"
+    }
+  ],
+  "unnumbered_gaps": "0011, 0043, 0045, 0047, 0048: no patch files; 0045/0047/0048 were the #113 AVC experiment knobs, removed from the tree again"
+}

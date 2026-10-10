@@ -1,0 +1,197 @@
+{
+  "schema": 1,
+  "description": "AOSP changes for H96 Pro Plus: the AOSP base, which overlay files replace upstream files, which patches apply to which project, and the status of every patch file.",
+  "base": {
+    "manifest_url": "https://android.googlesource.com/platform/manifest",
+    "tag": "android-15.0.0_r36",
+    "manifest_commit": "a0601d2912a6cedcaf97e1372173f8704a2715b0",
+    "manifest_title": "Manifest for Android 15.0.0 Release 36 (BP1A.250505.005.D1)",
+    "verified": "2026-10-10, maintainer's build tree read-only: all 1030 checked-out projects are exactly at this tag (3 darwin-only prebuilts are not checked out); no local_manifests",
+    "lunch_target": "h96proplus-trunk_staging-userdebug",
+    "fingerprint_note": "the build fingerprint shows codename 'Baklava' because of the trunk_staging release config; the source base is the Android 15 release tag above"
+  },
+  "overlay": [
+    {
+      "path": "aosp-overlay/external/v4l2_codec2",
+      "replaces": "external/v4l2_codec2",
+      "method": "replace the whole module",
+      "note": "cumulative effective state of the codec; already contains 0005, 0007, 0011, 0013, 0017 and 0018 (0017 partly replaced by 0018, 0008 partly replaced by both)"
+    },
+    {
+      "path": "aosp-overlay/external/minigbm/drv_helpers.c",
+      "replaces": "external/minigbm/drv_helpers.c",
+      "method": "replace file"
+    },
+    {
+      "path": "aosp-overlay/external/minigbm/dumb_driver.c",
+      "replaces": "external/minigbm/dumb_driver.c",
+      "method": "replace file"
+    },
+    {
+      "path": "aosp-overlay/frameworks/av/media/codec2/hal/client/GraphicsTracker.cpp",
+      "replaces": "frameworks/av/media/codec2/hal/client/GraphicsTracker.cpp",
+      "method": "replace file"
+    },
+    {
+      "path": "aosp-overlay/frameworks/av/media/codec2/vndk/C2Fence.cpp",
+      "replaces": "frameworks/av/media/codec2/vndk/C2Fence.cpp",
+      "method": "replace file"
+    },
+    {
+      "path": "aosp-overlay/frameworks/av/media/codec2/vndk/platform/C2IgbaBuffer.cpp",
+      "replaces": "frameworks/av/media/codec2/vndk/platform/C2IgbaBuffer.cpp",
+      "method": "replace file"
+    },
+    {
+      "path": "aosp-overlay/hardware/interfaces/audio/aidl/default/primary/StreamPrimary.cpp",
+      "replaces": "hardware/interfaces/audio/aidl/default/primary/StreamPrimary.cpp",
+      "method": "replace file"
+    },
+    {
+      "path": "aosp-overlay/system/media/alsa_utils/alsa_device_proxy.c",
+      "replaces": "system/media/alsa_utils/alsa_device_proxy.c",
+      "method": "replace file"
+    },
+    {
+      "path": "aosp-overlay/frameworks/av/media/codec2/hal/client/include/codec2/aidl/GraphicsTracker.h",
+      "replaces": "frameworks/av/media/codec2/hal/client/include/codec2/aidl/GraphicsTracker.h",
+      "method": "replace file",
+      "note": "required by the overlay GraphicsTracker.cpp"
+    },
+    {
+      "path": "aosp-overlay/hardware/interfaces/audio/aidl/default/include/core-impl/StreamPrimary.h",
+      "replaces": "hardware/interfaces/audio/aidl/default/include/core-impl/StreamPrimary.h",
+      "method": "replace file",
+      "note": "required by the overlay StreamPrimary.cpp"
+    }
+  ],
+  "patches": [
+    {
+      "file": "0001-minigbm-drop-drm-master.patch",
+      "project": "external/minigbm",
+      "apply_in": "external/minigbm",
+      "status": "active"
+    },
+    {
+      "file": "0002-libcutils-memfd-without-ashmem.patch",
+      "project": "system/core",
+      "apply_in": "system/core",
+      "status": "active"
+    },
+    {
+      "file": "0003-soong-gomemlimit-passthrough.patch",
+      "project": "build/soong",
+      "apply_in": "build/soong",
+      "status": "optional-build-host",
+      "note": "lets SOONG_GOMEMLIMIT reach soong_build; needed on hosts where soong analysis otherwise runs out of memory"
+    },
+    {
+      "file": "0005-v4l2-codec2-aidl-service-and-64bit-only.patch",
+      "project": "external/v4l2_codec2",
+      "status": "included-in-overlay"
+    },
+    {
+      "file": "0007-v4l2-decoder-mmap-input-copy.patch",
+      "project": "external/v4l2_codec2",
+      "status": "included-in-overlay"
+    },
+    {
+      "file": "0008-v4l2-codec2-seek-flush-csd-replay.patch",
+      "project": "external/v4l2_codec2",
+      "status": "superseded",
+      "note": "replaced by 0017/0018 as contained in the overlay"
+    },
+    {
+      "file": "0009-drm-hwcomposer-meson-primary-fullscreen-and-no-flatten.patch",
+      "project": "external/drm_hwcomposer",
+      "apply_in": "external/drm_hwcomposer",
+      "status": "active"
+    },
+    {
+      "file": "0011-v4l2-codec2-outputdelay-13.patch",
+      "project": "external/v4l2_codec2",
+      "status": "included-in-overlay"
+    },
+    {
+      "file": "0012-framework-short-power-clean-shutdown.patch",
+      "project": "frameworks/base",
+      "status": "historical-excluded",
+      "note": "applied in the maintainer's tree (PhoneWindowManager.java there = upstream + exactly this patch), excluded from public builds: full power-off resets this board; the public overlay uses sleep (config_shortPressOnPowerBehavior=1). Do not apply."
+    },
+    {
+      "file": "0013-v4l2-mmap-capture-stability.patch",
+      "project": "external/v4l2_codec2",
+      "status": "included-in-overlay"
+    },
+    {
+      "file": "0014-device-remote-userspace.patch",
+      "project": "device/h96proplus",
+      "status": "included-in-device-tree"
+    },
+    {
+      "file": "0015-framework-display-size-percent.patch",
+      "project": "frameworks/base",
+      "apply_in": "frameworks/base",
+      "status": "active",
+      "note": "whole-screen scale via display projection; pairs with settings/0002"
+    },
+    {
+      "file": "0016-surfaceflinger-null-buffer-guards-writeBufferStateToHWC.patch",
+      "project": "frameworks/native",
+      "apply_in": "frameworks/native",
+      "status": "active"
+    },
+    {
+      "file": "0017-v4l2-codec2-replay-full-csd-run.patch",
+      "project": "external/v4l2_codec2",
+      "status": "included-in-overlay",
+      "note": "refined by 0018"
+    },
+    {
+      "file": "0018-v4l2-codec2-csd-ownership-and-session-boundary.patch",
+      "project": "external/v4l2_codec2",
+      "status": "included-in-overlay"
+    },
+    {
+      "file": "0019-drm-hwcomposer-keep-display-on-hotplug.patch",
+      "project": "external/drm_hwcomposer",
+      "apply_in": ".",
+      "status": "active",
+      "note": "paths are relative to the AOSP root"
+    },
+    {
+      "file": "settings/0001-settings-homepage-let-leanback-rows-take-focus.patch",
+      "project": "packages/apps/Settings",
+      "apply_in": ".",
+      "status": "active",
+      "note": "paths are relative to the AOSP root"
+    },
+    {
+      "file": "settings/0002-settings-screen-size-page.patch",
+      "project": "packages/apps/Settings",
+      "apply_in": "packages/apps/Settings",
+      "status": "active"
+    },
+    {
+      "file": "v4l2_codec2-cumulative-2026-09-04.diff",
+      "project": "external/v4l2_codec2",
+      "status": "historical-snapshot",
+      "note": "superseded by the overlay"
+    },
+    {
+      "file": "0020-drm-hwcomposer-keep-unfit-planes-available.patch",
+      "project": "external/drm_hwcomposer",
+      "apply_in": "external/drm_hwcomposer",
+      "status": "active",
+      "note": "exported 2026-10-10 from the maintainer's tree, where it was applied but never committed"
+    },
+    {
+      "file": "0021-renderengine-skip-unimportable-input-buffers.patch",
+      "project": "frameworks/native",
+      "apply_in": "frameworks/native",
+      "status": "active",
+      "note": "exported 2026-10-10 from the maintainer's tree, where it was applied but never committed"
+    }
+  ],
+  "verification": "2026-10-10 against the maintainer's build tree (read-only): starting from android-15.0.0_r36, the overlay plus all 'active' patches plus 0003 reproduce every locally changed AOSP file byte for byte, except PhoneWindowManager.java, which differs by exactly the excluded patch 0012. A full AOSP build from these inputs was not run."
+}

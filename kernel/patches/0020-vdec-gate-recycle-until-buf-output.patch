@@ -1,0 +1,88 @@
+Гейт recycle до первого вывода буфера — фикс «видео H264 не стартует» (surface).
+
+Симптом: аппаратный H264 (c2.v4l2.avc.decoder, surface/ExoPlayer) декодирует ~6
+кадров, потом «recycle stalled (fw not draining)» → amvdec_abort (0015) → сессия
+сброшена → клиент повторяет → вечный цикл abort. Видео не стартует.
+
+Корень (глубокий разбор кода + диагностика на железе num_dst=22 recycle_pending=10
+scr7=11 scr8=12 — оба мейлбокса прошивки ненулевые и НЕ разгребаются = прошивка
+ЗАВИСЛА, а не голодает): драйвер шлёт прошивке recycle («буфер свободен»,
+AV_SCRATCH_7/8) для КАЖДОГО CAPTURE-QBUF после streamon_cap. В MMAP (ffmpeg) все
+CAPTURE-буферы квешатся ДО streamon_cap, поэтому первичные в recycle не попадают —
+прошивка узнаёт про весь пул из AV_SCRATCH_0 (codec_h264_resume) и владеет им сама;
+recycle = ТОЛЬКО «верни отображённый буфер». Но CCodec в surface-режиме квешит
+CAPTURE ПОСЛЕ streamon_cap (буферы из gralloc-пула дотекают), поэтому все 22 гонятся
+через recycle, включая те, куда прошивка сейчас декодирует / держит как reference.
+Спурьёзный recycle активного буфера рушит DPB внутри микрокода → hang после ~6
+кадров. (Подтверждено: в MMAP декод идёт бит-в-бит вообще без recycle на старте.)
+
+Фикс: рециклить CAPTURE-буфер ТОЛЬКО после того, как прошивка хотя бы раз его
+вывела (отобразила) — та же семантика, что в mainline, но выражена явно, а не через
+«QBUF до/после STREAMON». Поле sess->buf_output[32] (сброс на resume в
+amvdec_set_canvases; ставится в amvdec_dst_buf_done_idx при успешной выдаче кадра);
+гейт в vdec_vb2_buf_queue. Затрагивает только канвас-кодеки с recycle (H264/MPEG12);
+VP9/HEVC в recycle-путь не входят. MMAP/MPEG12 не меняются (первичные и так не
+рециклились). Seek-фикс (0017/0018) не трогается.
+
+Проверено на железе (ядро #69): за весь прогон (SmartTube адаптив 720p/480p + MX
+1080p) НОЛЬ «recycle stalled»/«Aborting», против постоянного abort-цикла на #66.
+Зависание прошивки устранено. (Плавность полного воспроизведения проверять в
+реальных приложениях — MX Player на этом боксе сам крашится, SmartTube упирался в
+буферизацию потока YouTube, оба — не декодер.)
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -300,6 +300,13 @@
+ 	u8 slot_canvas[32][3];
+ 	u8 slot_ncanvas[32];
+ 	bool slot_real[32];
++	/*
++	 * h96 06.09: fw hotya by raz vydal (otobrazil) etot CAPTURE-index.
++	 * Recycle (AV_SCRATCH_7/8) razreshon TOL'KO posle etogo (kak mainline):
++	 * inache CCodec-QBUF posle STREAMON recycl'it bufery, kotorye fw derzhit
++	 * kak reference/tsel' dekoda -> DPB fw rushitsya -> hang posle ~6 kadrov.
++	 */
++	bool buf_output[32];
+ 
+ 	enum amvdec_status status;
+ 	void *priv;
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -283,6 +283,8 @@
+ 		/* h96: po umolchaniyu slot pust/placeholder */
+ 		sess->slot_ncanvas[i] = 0;
+ 		sess->slot_real[i] = false;
++		if (i < 32)
++			sess->buf_output[i] = false;
+ 
+ 		if (!reg_base[reg_base_cur])
+ 			return -EINVAL;
+@@ -624,6 +626,10 @@
+ 		return;
+ 	}
+ 
++	/* h96: fw vydal (otobrazil) etot bufer -> recycle etogo idx razreshon */
++	if (vbuf->vb2_buf.index < 32)
++		sess->buf_output[vbuf->vb2_buf.index] = true;
++
+ 	if (offset != -1)
+ 		amvdec_dst_buf_done_offset(sess, vbuf, offset, field, true);
+ 	else
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -419,8 +419,16 @@
+ 	    codec_ops->program_capture_buf)
+ 		codec_ops->program_capture_buf(sess, vb);
+ 
++	/*
++	 * h96 06.09: recycl'im CAPTURE-bufer TOL'KO posle togo, kak fw ego hotya
++	 * by raz vydal (buf_output). Inache pervichnye CCodec-QBUF (surface-rejim,
++	 * prihodyat POSLE streamon_cap) recycl'ili by aktivnye reference-bufery fw
++	 * -> DPB fw rushilsya -> hang. V MMAP pervichnye QBUF idut do streamon_cap
++	 * i syuda ne popadali - vosproizvodim tu zhe semantiku yavno.
++	 */
+ 	if (sess->streamon_cap &&
+ 	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    vb->index < 32 && sess->buf_output[vb->index] &&
+ 	    vdec_codec_needs_recycle(sess))
+ 		vdec_queue_recycle(sess, vb);
+ 

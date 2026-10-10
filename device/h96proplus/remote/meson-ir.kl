@@ -1,0 +1,95 @@
+# Раскладка ИК-пульта H96 Pro Plus для Android.
+#
+# Ставится в /vendor/usr/keylayout/ (мастер-инструкция §22).
+#
+# Слева — коды ядра Linux (те, что придут от meson-ir через RC-core после
+# применения h96proplus-nec.toml), справа — имена кнопок Android.
+#
+# ⛔ ИМЯ ФАЙЛА — meson-ir.kl (С ДЕФИСОМ), и никак иначе (03.09.2026). Устройство
+# meson-ir имеет НУЛЕВЫЕ vendor/product, поэтому Vendor_XXXX-файлы
+# Android даже не пробует — ищет по ИМЕНИ устройства, заменяя недопустимые
+# символы на «_», НО дефис валиден (isValidNameChar) - имя остаётся meson-ir.kl. Каталог /data/system/devices Android больше НЕ ищет. Из-за старого имени
+# Vendor_0001_Product_0001.kl раскладка не подхватывалась вовсе, пульт
+# работал через Generic.kl - БЕЗ флага WAKE у POWER: усыпить приставку
+# пульт мог, а разбудить - нет (события спящего экрана отбрасываются).
+
+# --- навигация ---
+key 103   DPAD_UP
+key 108   DPAD_DOWN
+key 105   DPAD_LEFT
+key 106   DPAD_RIGHT
+key 28    DPAD_CENTER
+key 96    DPAD_CENTER
+key 97    DPAD_CENTER
+key 353   DPAD_CENTER              # ОК (KEY_SELECT) — пульт шлёт 353, не 28; без него центр крестовины мёртв (Generic.kl имел, meson-ir нет)
+
+# --- системные ---
+key 116   POWER              WAKE
+key 158   BACK
+key 1     BACK
+key 139   MENU
+key 125   MENU
+key 172   HOME
+key 102   HOME               WAKE
+key 217   SEARCH
+
+# --- звук ---
+key 113   VOLUME_MUTE
+key 115   VOLUME_UP
+key 114   VOLUME_DOWN
+
+# --- воспроизведение ---
+key 164   MEDIA_PLAY_PAUSE
+key 119   MEDIA_PLAY_PAUSE
+key 163   MEDIA_NEXT
+key 165   MEDIA_PREVIOUS
+key 123   MEDIA_NEXT
+key 122   MEDIA_PREVIOUS
+key 128   MEDIA_STOP
+key 226   MEDIA_PLAY_PAUSE
+
+# --- цифры ---
+key 2     1
+key 3     2
+key 4     3
+key 5     4
+key 6     5
+key 7     6
+key 8     7
+key 9     8
+key 10    9
+key 11    0
+
+# --- прочее ---
+key 14    DEL
+key 52    PERIOD
+key 580   ALL_APPS
+key 398   PROG_RED
+key 399   PROG_GREEN
+key 400   PROG_YELLOW
+key 401   PROG_BLUE
+
+# ---------------------------------------------------------------------------
+# Про WAKE
+#
+# Флаг WAKE у POWER и HOME означает: нажатие будит устройство из сна.
+# Без него приставку нельзя включить пультом — придётся дёргать питание.
+#
+# ⚠️ Мастер-инструкция §23 требует, чтобы IR будил устройство после suspend.
+# На mainline это работает не всегда: нужна поддержка со стороны драйвера и
+# правильная настройка wakeup-источника в device tree. Проверяется на M8:
+#     cat /sys/kernel/debug/wakeup_sources | grep -i ir
+# Если не работает — отдельная задача, не блокирующая остальное.
+# ---------------------------------------------------------------------------
+
+# ─── КНОПКИ ИЗ СТОКОВОЙ ТАБЛИЦЫ (31.08.2026) ────────────────────────────
+# Коды взяты из /system/etc/remote.conf прошивки «Франкенштейн». Без имён
+# ниже эти кнопки нажимались бы «в пустоту»: событие от ядра приходит, а
+# система не знает, что оно означает.
+
+key 150   SETTINGS            # кнопка настроек
+key 153   ALL_APPS            # список приложений
+key 154   MEDIA_PLAY          # воспроизведение
+key 151   BUTTON_1            # цветная жёлтая (в стоке — проводник)
+key 152   BUTTON_2            # цветная синяя (в стоке — музыка)
+key 159   BUTTON_3            # отдельная кнопка приложения

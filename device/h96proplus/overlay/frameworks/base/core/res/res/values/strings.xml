@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Английские варианты тех же загрузочных надписей: система может
+     показать их до применения локали, а также при смене языка.
+     Про обязательный product="default" — см. комментарий в values-ru. -->
+<resources>
+    <string name="android_start_title" product="default">Starting…</string>
+    <string name="android_upgrading_title" product="default">Updating…</string>
+</resources>

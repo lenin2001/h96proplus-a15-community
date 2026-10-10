@@ -1,0 +1,69 @@
+Subject: [PATCH 0021] renderengine: skip layers whose input buffer cannot be imported
+
+Mesa/Panfrost on Midgard cannot import the NV12 buffers of the video decoder
+(eglCreateImage returns NULL without an error). LOG_ALWAYS_FATAL then killed
+SurfaceFlinger on every video frame that went through client composition. Input buffers
+now fail softly and the layer is skipped; an invalid OUTPUT buffer stays fatal.
+---
+diff --git a/libs/renderengine/skia/SkiaRenderEngine.cpp b/libs/renderengine/skia/SkiaRenderEngine.cpp
+index b986967..55a1a85 100644
+--- a/libs/renderengine/skia/SkiaRenderEngine.cpp
++++ b/libs/renderengine/skia/SkiaRenderEngine.cpp
+@@ -1037,6 +1037,13 @@ void SkiaRenderEngine::drawLayersInternal(
+                     : item.usePremultipliedAlpha         ? kPremul_SkAlphaType
+                                                          : kUnpremul_SkAlphaType;
+             sk_sp<SkImage> image = imageTextureRef->makeImage(layerDataspace, alphaType);
++            /* h96 (03.09.2026): Mesa/Panfrost не импортирует NV12 - для такого
++             * слоя image == nullptr. Пропускаем слой вместо разыменования null
++             * (image->width() ниже) и вместо прежнего фатала в makeImage. */
++            if (!image) {
++                ALOGE("h96: skipping layer with unimportable buffer");
++                continue;
++            }
+ 
+             auto texMatrix = getSkM44(item.textureTransform).asM33();
+             // textureTansform was intended to be passed directly into a shader, so when
+diff --git a/libs/renderengine/skia/compat/GaneshBackendTexture.cpp b/libs/renderengine/skia/compat/GaneshBackendTexture.cpp
+index 88282e7..c360dbe 100644
+--- a/libs/renderengine/skia/compat/GaneshBackendTexture.cpp
++++ b/libs/renderengine/skia/compat/GaneshBackendTexture.cpp
+@@ -70,10 +70,22 @@ GaneshBackendTexture::GaneshBackendTexture(sk_sp<GrDirectContext> grContext,
+     }
+ 
+     if (!mBackendTexture.isValid() || !desc.width || !desc.height) {
+-        LOG_ALWAYS_FATAL("Failed to create a valid texture. [%p]:[%d,%d] isProtected:%d "
+-                         "isWriteable:%d format:%d",
+-                         this, desc.width, desc.height, createProtectedImage, isOutputBuffer,
+-                         desc.format);
++        /* h96 (03.09.2026): Mesa/Panfrost на Midgard не импортирует NV12-буферы
++         * видеодекодера (eglCreateImage возвращает NULL без ошибки). Раньше здесь
++         * был LOG_ALWAYS_FATAL - и КАЖДЫЙ видеокадр в клиентской композиции
++         * убивал SurfaceFlinger (рестарт фреймворка на любом фильме). Для входных
++         * буферов теперь мягкий отказ: слой будет пропущен в drawLayersInternal.
++         * Для выходных (isOutputBuffer) фатал сохранён: без выходного буфера
++         * рисовать некуда, это настоящая катастрофа. */
++        if (isOutputBuffer) {
++            LOG_ALWAYS_FATAL("Failed to create a valid texture. [%p]:[%d,%d] isProtected:%d "
++                             "isWriteable:%d format:%d",
++                             this, desc.width, desc.height, createProtectedImage, isOutputBuffer,
++                             desc.format);
++        }
++        ALOGE("h96: unimportable input buffer, layer will be skipped. [%p]:[%d,%d] format:%d",
++              this, desc.width, desc.height, desc.format);
++        mBackendTexture = {};
+     }
+ }
+ 
+@@ -87,6 +99,12 @@ GaneshBackendTexture::~GaneshBackendTexture() {
+ sk_sp<SkImage> GaneshBackendTexture::makeImage(SkAlphaType alphaType, ui::Dataspace dataspace,
+                                                TextureReleaseProc releaseImageProc,
+                                                ReleaseContext releaseContext) {
++    /* h96: невалидная базовая текстура (неимпортируемый буфер) - сразу nullptr,
++     * иначе BorrowTextureFrom вернёт null и logFatalTexture убьёт процесс. */
++    if (!mBackendTexture.isValid()) {
++        ALOGE("h96: makeImage on invalid backend texture - returning nullptr");
++        return nullptr;
++    }
+     if (mBackendTexture.isValid()) {
+         mUpdateProc(mImageCtx, mGrContext.get());
+     }

@@ -1,0 +1,38 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0033] meson-vdec: HEVC drain matches timestamps by offset
+
+codec_hevc_show_frames() hands frames out with amvdec_dst_buf_done_offset() and
+the frame's own stream offset, but __codec_hevc_flush_output() - the drain at
+end of stream - used amvdec_dst_buf_done(), which pops the HEAD of the timestamp
+list. The head is the CSD packet's record (VPS/SPS/PPS produce no picture), so
+the first drained tail frame carried the finished CSD work's timestamp:
+
+  DecodeComponent: Work with bitstreamId=0 not found, already abandoned?
+  DecodeComponent: reportError(error=14)
+
+Measured 23.09 with dectest on an 8 s x265 clip (200 frames, B-frames): kernel
+#89 delivered 193/200 and failed the codec at EOS; with this patch (#90) 200/200,
+bit-identical to c2.android.hevc.decoder, OUTPUT EOS reached.
+
+---
+diff -ruN s32/drivers/staging/media/meson/vdec/codec_hevc.c s33/drivers/staging/media/meson/vdec/codec_hevc.c
+--- a/drivers/staging/media/meson/vdec/codec_hevc.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc.c
+@@ -714,7 +714,16 @@
+ 	struct hevc_frame *tmp, *n;
+ 
+ 	while ((tmp = codec_hevc_get_next_ready_frame(hevc))) {
+-		amvdec_dst_buf_done(sess, tmp->vbuf, V4L2_FIELD_NONE);
++		/*
++		 * h96 0033 (23.09.2026): match by the frame's own stream offset,
++		 * exactly like codec_hevc_show_frames(). amvdec_dst_buf_done() pops
++		 * the HEAD of the timestamp list, and the head is the CSD packet's
++		 * record (VPS/SPS/PPS produce no picture): every drained tail frame
++		 * then carried the finished CSD work's timestamp, userspace answered
++		 * "Work with bitstreamId=0 not found" and failed the codec at EOS.
++		 */
++		amvdec_dst_buf_done_offset(sess, tmp->vbuf, tmp->offset,
++					   V4L2_FIELD_NONE, false);
+ 		tmp->show = 0;
+ 		hevc->frames_num--;
+ 	}

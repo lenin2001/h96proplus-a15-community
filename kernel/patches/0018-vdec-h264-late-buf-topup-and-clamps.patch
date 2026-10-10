@@ -1,0 +1,273 @@
+H264 top-up позднего seek-буфера + клампы безопасности к 0017 (Variant B).
+
+Симптом: 0017 (Variant B) выравнивает таблицу канвасов/референсов по индексу и
+чинит корень «квадратов при перемотке», но оставляет ОСТАТОЧНЫЙ баг для H264.
+
+Корень остатка (скептик-проверка двух вариантов через workflow):
+ 0017 программирует всю таблицу ТОЛЬКО на resume(). CAPTURE-буфер, впервые
+ заквешенный уже ПОСЛЕ resume() (дисплей держал его на момент resume, клиент
+ переквешил в STATUS_RUNNING), на resume получает placeholder-канвас соседа
+ (carry-forward). Для H264 адрес ЗАПИСИ кадра идёт ЧЕРЕЗ канвас слота=index, и
+ recycle отдаёт прошивке vb->index -> прошивка пишет кадр этого буфера по чужому
+ (placeholder) адресу -> перезапись чужого буфера + показ stale -> квадраты.
+ (Для HEVC/VP9 запись покадровая из SAO, поэтому им top-up НЕ нужен; их остаток —
+ только stale-референс позднего буфера до следующего resume, безопасно чинится лишь
+ хуком «между кадрами» в threaded_isr, вне buf_queue — здесь НЕ трогаем.)
+
+Почему buf_queue — верная точка: dma_addr импортного gralloc-DMABUF пиннится в
+__prepare_dmabuf (videobuf2-core) ДО __enqueue_in_driver -> в vdec_vb2_buf_queue он
+уже валиден. Программируем СОБСТВЕННЫЙ адрес именно этого vb по vb->index, РОВНО
+ОДИН РАЗ (битовый статус sess->slot_real[], сбрасывается на resume) и ДО того, как
+recycle сообщит прошивке индекс. В стационаре (recycle-requeue) slot_real уже true
+-> no-op, горячий путь не трогается. Канвас-ID слота ПЕРЕИСПОЛЬЗУЕТСЯ
+(amvdec_reprogram_canvas_slot без canvas_alloc) -> нет утечки пула. Identity
+slot==index сохранён (recycle H264 шлёт vb->index) -> декод не рвётся.
+
+program_capture_buf регистрирует ТОЛЬКО codec_h264 (канвас-путь). Реализация
+reprogram повторяет адресную арифметику set_canvas_nv12m бит-в-бит (single-dmabuf
+gralloc: stride=ALIGN(w,64), uv=y+stride*ALIGN(h,32), endian SWAP64).
+
+Клампы безопасности к 0017 (обязательны по скептик-проверке):
+ - amvdec_set_canvases: цикл ограничен i < ARRAY_SIZE(fw_idx_to_vb2_idx)=32
+   (иначе OOB при num_dst_bufs>32).
+ - codec_hevc_setup_buffers_gxl: n = min(num_dst_bufs, MAX_REF_PIC_NUM=24)
+   (иначе OOB по fbc_buffer_paddr/mmu_header_paddr[idx], массивы [24]); в
+   downsample&&!fbc ветке добавлен гвард vb2_plane_cookie перед chroma_paddr.
+
+Собрано ядром #64 (make ARCH=arm64), vdec-объекты компилируются чисто, загрузка
+подтверждена. Визуальную чистоту перемотки проверять глазами: screencap не
+захватывает аппаратный видео-оверлей этой приставки.
+
+--- a/drivers/staging/media/meson/vdec/vdec.h	2026-09-05 21:52:30.972107376 +0200
++++ b/drivers/staging/media/meson/vdec/vdec.h	2026-09-05 21:53:44.458817004 +0200
+@@ -137,6 +137,14 @@
+ 	void (*recycle)(struct amvdec_core *core, u32 buf_idx);
+ 	void (*drain)(struct amvdec_session *sess);
+ 	void (*resume)(struct amvdec_session *sess);
++	/*
++	 * h96: refresh ODNOGO pozdno-zakveshennogo CAPTURE-slota posle
++	 * resume() (seek). Programmiruet kanvas imenno etogo vb po ego
++	 * vb->index (identity), dma_addr validen v buf_queue. Opcionalno;
++	 * realizovano tolko dlya kanvas-kodekov (H264/MPEG12).
++	 */
++	void (*program_capture_buf)(struct amvdec_session *sess,
++				    struct vb2_buffer *vb);
+ 	const u8 * (*eos_sequence)(u32 *len);
+ 	irqreturn_t (*isr)(struct amvdec_session *sess);
+ 	irqreturn_t (*threaded_isr)(struct amvdec_session *sess);
+@@ -284,6 +292,14 @@
+ 	u32 last_offset;
+ 	u32 wrap_count;
+ 	u32 fw_idx_to_vb2_idx[32];
++	/*
++	 * h96: canvas ID i status kazhdogo CAPTURE-slota (index) dlya
++	 * leak-free single-slot refresh posle seek. Zapolnyayutsya v
++	 * amvdec_set_canvases na kazhdom resume.
++	 */
++	u8 slot_canvas[32][3];
++	u8 slot_ncanvas[32];
++	bool slot_real[32];
+ 
+ 	enum amvdec_status status;
+ 	void *priv;
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h	2026-09-05 21:52:30.982108138 +0200
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h	2026-09-05 21:53:44.458817004 +0200
+@@ -18,6 +18,14 @@
+  */
+ int amvdec_set_canvases(struct amvdec_session *sess,
+ 			u32 reg_base[], u32 reg_num[]);
++/*
++ * h96: pereprogrammirovat kanvas ODNOGO CAPTURE-bufera v ego slot
++ * (reg_base + vb->index*4), PEREISPOLZUYA uzhe vydelennye slotu canvas ID
++ * (bez canvas_alloc -> bez utechki). Tolko NV12M. reg_base = ANC0_CANVAS_ADDR
++ * dlya H264. Vozvrat 0 pri uspehe (vystavlyaet sess->slot_real[index]).
++ */
++int amvdec_reprogram_canvas_slot(struct amvdec_session *sess,
++				 struct vb2_buffer *vb, u32 reg_base);
+ 
+ /* Helpers to read/write to the various IPs (DOS, PARSER) */
+ u32 amvdec_read_dos(struct amvdec_core *core, u32 reg);
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-09-05 21:52:31.012110435 +0200
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c	2026-09-05 21:53:44.458817004 +0200
+@@ -274,9 +274,15 @@
+ 		meson_canvas_free(sess->core->canvas,
+ 				  sess->canvas_alloc[--sess->canvas_num]);
+ 
+-	for (i = 0; i < sess->num_dst_bufs; ++i) {
++	for (i = 0; i < sess->num_dst_bufs &&
++		    i < ARRAY_SIZE(sess->fw_idx_to_vb2_idx); ++i) {
+ 		struct vb2_buffer *vb = vb2_get_buffer(q, i);
+ 		struct vb2_buffer *prog;
++		u32 cbase, c;
++
++		/* h96: po umolchaniyu slot pust/placeholder */
++		sess->slot_ncanvas[i] = 0;
++		sess->slot_real[i] = false;
+ 
+ 		if (!reg_base[reg_base_cur])
+ 			return -EINVAL;
+@@ -293,6 +299,7 @@
+ 		if (!prog)
+ 			goto advance;
+ 
++		cbase = sess->canvas_num;
+ 		switch (pixfmt) {
+ 		case V4L2_PIX_FMT_NV12M:
+ 			ret = set_canvas_nv12m(sess, prog, width,
+@@ -312,6 +319,15 @@
+ 			return -EINVAL;
+ 		}
+ 
++		/* h96: zapomnit canvas ID etogo slota dlya leak-free refresh */
++		sess->slot_ncanvas[i] = sess->canvas_num - cbase;
++		if (sess->slot_ncanvas[i] > 3)
++			sess->slot_ncanvas[i] = 3;
++		for (c = 0; c < sess->slot_ncanvas[i]; ++c)
++			sess->slot_canvas[i][c] = sess->canvas_alloc[cbase + c];
++		/* realnyj adres poluchil tolko bufer v slote po indeksu */
++		sess->slot_real[i] = (prog == vb);
++
+ advance:
+ 		reg_num_cur++;
+ 		if (reg_num_cur >= reg_num[reg_base_cur]) {
+@@ -326,6 +342,53 @@
+ }
+ EXPORT_SYMBOL_GPL(amvdec_set_canvases);
+ 
++int amvdec_reprogram_canvas_slot(struct amvdec_session *sess,
++				 struct vb2_buffer *vb, u32 reg_base)
++{
++	struct amvdec_core *core = sess->core;
++	u32 idx = vb->index;
++	u32 width = ALIGN(sess->width, 32);
++	u32 height = ALIGN(sess->height, 32);
++	u32 stride = width;
++	dma_addr_t y, uv;
++
++	/* tolko kanvas-put 8-bit NV12M (nash GXM) */
++	if (sess->pixfmt_cap != V4L2_PIX_FMT_NV12M)
++		return -EINVAL;
++	if (idx >= 32 || sess->slot_ncanvas[idx] < NUM_CANVAS_NV12)
++		return -EINVAL;
++	/* dma_addr validen tolko esli dmabuf primaplen (prepare/queue) */
++	if (!vb2_plane_cookie(vb, 0))
++		return -EINVAL;
++
++	/* ta zhe adresnaya arifmetika, chto v set_canvas_nv12m */
++	y  = vb2_dma_contig_plane_dma_addr(vb, 0);
++	uv = vb2_dma_contig_plane_dma_addr(vb, 1);
++	if (uv == y) {
++		stride = ALIGN(width, 64);
++		uv = y + stride * ALIGN(height, 32);
++	}
++
++	/* perekonfiguriruem UZHE vydelennye slotu canvas ID (bez alloc) */
++	meson_canvas_config(core->canvas, sess->slot_canvas[idx][0], y,
++			    stride, height, MESON_CANVAS_WRAP_NONE,
++			    MESON_CANVAS_BLKMODE_LINEAR,
++			    MESON_CANVAS_ENDIAN_SWAP64);
++	meson_canvas_config(core->canvas, sess->slot_canvas[idx][1], uv,
++			    stride, height / 2, MESON_CANVAS_WRAP_NONE,
++			    MESON_CANVAS_BLKMODE_LINEAR,
++			    MESON_CANVAS_ENDIAN_SWAP64);
++
++	amvdec_write_dos(core, reg_base + idx * 4,
++			 (sess->slot_canvas[idx][1] << 16) |
++			 (sess->slot_canvas[idx][1] << 8)  |
++			 (sess->slot_canvas[idx][0]));
++
++	sess->slot_real[idx] = true;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(amvdec_reprogram_canvas_slot);
++
+ int amvdec_add_ts(struct amvdec_session *sess, u64 ts,
+ 		  struct v4l2_timecode tc, u32 offset, u32 vbuf_flags)
+ {
+--- a/drivers/staging/media/meson/vdec/vdec.c	2026-09-05 21:52:31.032112055 +0200
++++ b/drivers/staging/media/meson/vdec/vdec.c	2026-09-05 21:53:44.458817004 +0200
+@@ -386,12 +386,27 @@
+ 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+ 	struct amvdec_session *sess = vb2_get_drv_priv(vb->vb2_queue);
+ 	struct v4l2_m2m_ctx *m2m_ctx = sess->m2m_ctx;
++	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 
+ 	v4l2_m2m_buf_queue(m2m_ctx, vbuf);
+ 
+ 	if (!sess->streamon_out)
+ 		return;
+ 
++	/*
++	 * h96: bufer, vernuvshijsya POSLE resume() (seek), na moment resume v
++	 * ocheredi ne stoyal -> ego slot=index derzhit placeholder-kanvas.
++	 * Dopisyvaem REALNYJ adres imenno etogo vb (dma_addr validen zdes)
++	 * ROVNO ODIN RAZ i DO togo, kak recycle soobshchit fw, chto indeks
++	 * svoboden. V norme (recycle-requeue) slot_real uzhe true -> no-op.
++	 */
++	if (sess->streamon_cap &&
++	    sess->status == STATUS_RUNNING &&
++	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    vb->index < 32 && !sess->slot_real[vb->index] &&
++	    codec_ops->program_capture_buf)
++		codec_ops->program_capture_buf(sess, vb);
++
+ 	if (sess->streamon_cap &&
+ 	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+ 	    vdec_codec_needs_recycle(sess))
+--- a/drivers/staging/media/meson/vdec/codec_h264.c	2026-09-05 21:52:31.052113675 +0200
++++ b/drivers/staging/media/meson/vdec/codec_h264.c	2026-09-05 21:53:44.458817004 +0200
+@@ -484,6 +484,17 @@
+ 	return IRQ_WAKE_THREAD;
+ }
+ 
++/*
++ * h96: pozdnij CAPTURE-bufer posle seek. Slot == vb->index (identity),
++ * chto soglasovano s recycle (shlet vb->index) i frames_ready
++ * (fw_idx_to_vb2_idx[i]=i). Pereispolzuem canvas ID slota -> bez utechki.
++ */
++static void codec_h264_program_capture_buf(struct amvdec_session *sess,
++					   struct vb2_buffer *vb)
++{
++	amvdec_reprogram_canvas_slot(sess, vb, ANC0_CANVAS_ADDR);
++}
++
+ struct amvdec_codec_ops codec_h264_ops = {
+ 	.start = codec_h264_start,
+ 	.stop = codec_h264_stop,
+@@ -494,4 +505,5 @@
+ 	.recycle = codec_h264_recycle,
+ 	.eos_sequence = codec_h264_eos_sequence,
+ 	.resume = codec_h264_resume,
++	.program_capture_buf = codec_h264_program_capture_buf,
+ };
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.c	2026-09-05 21:52:31.052113675 +0200
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.c	2026-09-05 21:53:44.458817004 +0200
+@@ -128,7 +128,7 @@
+ 	u32 pixfmt_cap = sess->pixfmt_cap;
+ 	const u32 revision = core->platform->revision;
+ 	dma_addr_t last_y = 0, last_uv = 0;
+-	unsigned int idx;
++	unsigned int idx, n;
+ 	int i;
+ 
+ 	amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_CONF_ADDR,
+@@ -143,7 +143,8 @@
+ 	 * (vb2_plane_cookie != NULL); незаквешенный слот -> carry-forward
+ 	 * (fw его не читает как активный референс).
+ 	 */
+-	for (idx = 0; idx < sess->num_dst_bufs; ++idx) {
++	n = min(sess->num_dst_bufs, (unsigned int)MAX_REF_PIC_NUM);
++	for (idx = 0; idx < n; ++idx) {
+ 		struct vb2_buffer *vb = vb2_get_buffer(q, idx);
+ 		dma_addr_t buf_y_paddr = 0;
+ 		dma_addr_t buf_uv_paddr = 0;
+@@ -153,6 +154,9 @@
+ 				buf_y_paddr = comm->mmu_header_paddr[idx];
+ 			else
+ 				buf_y_paddr = comm->fbc_buffer_paddr[idx];
++			if (!codec_hevc_use_fbc(pixfmt_cap, is_10bit) &&
++			    vb && vb2_plane_cookie(vb, 0))
++				buf_uv_paddr = codec_hevc_chroma_paddr(sess, vb);
+ 		} else if (vb && vb2_plane_cookie(vb, 0)) {
+ 			buf_y_paddr = vb2_dma_contig_plane_dma_addr(vb, 0);
+ 			buf_uv_paddr = codec_hevc_chroma_paddr(sess, vb);

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     Манифест намеренно пустой: приложение ничего не делает и никуда не
+     показывается. Оно существует только ради строки overrides в Android.bp,
+     которая убирает телефонные приложения из сборки.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.h96proplus.notelephony">
+
+    <application
+        android:hasCode="false"
+        android:label="H96 No Telephony"
+        android:allowBackup="false" />
+
+</manifest>

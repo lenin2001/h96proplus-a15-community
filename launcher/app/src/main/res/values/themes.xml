@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Тёмная тема без ActionBar: лаунчеру он не нужен, а тёмный фон —
+        требование ТЗ §12 и просто разумно для экрана в тёмной комнате.
+    -->
+    <style name="Theme.MovieLauncher" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@drawable/wallpaper</item>
+        <item name="android:statusBarColor">#00000000</item>
+        <item name="android:navigationBarColor">#00000000</item>
+        <item name="android:windowContentTransitions">false</item>
+    </style>
+</resources>

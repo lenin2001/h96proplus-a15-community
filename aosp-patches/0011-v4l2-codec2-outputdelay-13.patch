@@ -1,0 +1,79 @@
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index 53689bd..7610ed8 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <v4l2_codec2/components/DecodeInterface.h>
+ 
++#include <algorithm>
++
+ #include <C2PlatformSupport.h>
+ #include <SimpleC2Interface.h>
+ #include <android/hardware/graphics/common/1.0/types.h>
+@@ -132,9 +134,29 @@ DecodeInterface::DecodeInterface(const std::string& name,
+         }
+     }
+ 
++    // h96: не заявляем 10-битные профили. Вывод у нас NV12/SDR, а 10-бит
++    // на GXM требует непрерывных FBC-аллокаций, которые тихо не собираются
++    // (26.08: SmartTube выбрал vp9.2 1440p60 HDR — декодер молча не выдал
++    // ни кадра, плеер вечно BUFFERING; ср. hevc-4k-10bit в docs/hevc-testing).
++    // Без этих профилей ExoPlayer сам выбирает vp9 profile 0 или AVC.
++    profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
++                                  [](uint32_t p) {
++                                      return p == C2Config::PROFILE_VP9_2 ||
++                                             p == C2Config::PROFILE_VP9_3 ||
++                                             p == C2Config::PROFILE_HEVC_MAIN_10;
++                                  }),
++                   profiles.end());
++
+     // In case of no supported profile or uninitialized device maxSize is set to default
+     if (maxSize == ui::Size(1, 1)) maxSize = ui::Size(4096, 4096);
+ 
++    // h96: MMAP+CPU-copy output path sustains only ~10 fps at 1080p on the
++    // S912's A53 cores - not realtime, the player starves and deadlocks.
++    // Advertise 720p max so adaptive players pick a stream we can decode
++    // at full speed. Remove when a zero-copy/GE2D output path lands.
++    if (maxSize.width > 1280) maxSize.setWidth(1280);
++    if (maxSize.height > 736) maxSize.setHeight(736);
++
+     if (profiles.empty()) {
+         ALOGW("No supported profiles for H264 codec");
+         switch (*mVideoCodec) {  //default values used when querry is not supported
+@@ -427,13 +449,19 @@ c2_status_t DecodeInterface::queryColorAspects(
+ uint32_t DecodeInterface::getOutputDelay(VideoCodec codec) {
+     switch (codec) {
+     case VideoCodec::H264:
+-        // Due to frame reordering an H264 decoder might need multiple additional input frames to be
+-        // queued before being able to output the associated decoded buffers. We need to tell the
+-        // codec2 framework that it should not stop queuing new work items until the maximum number
+-        // of frame reordering is reached, to avoid stalling the decoder.
+-        return 16;
++        /* h96 (26.08): meson-vdec программирует ПОЛНЫЙ canvas-список на
++         * start_streaming и через min_queued_buffers требует, чтобы ВСЕ
++         * выданные REQBUFS буферы (24 для h264 1080p) были в очереди до
++         * старта. CCodec же ограничивает surface maxDequeue величиной
++         * outputDelay+pipeline(3)+smoothness(4): при 16 это 23 < 24 —
++         * клиент физически не может отдать 24-й буфер, декодер никогда
++         * не стартует (вечное «1+23/24», ни одного done-кадра, SmartTube
++         * навечно в BUFFERING). Поднимаем задержку до max_buffers
++         * платформы, чтобы лимит surface был выше списка драйвера.
++         * То же для HEVC и VP9 (у VP9 8+7=15 < 20 — та же мина). */
++        return 13; /* h96 04.09: maxDequeue=13+7=20 <= max_buffers(22); min_queued развязан в vdec.c -> старт HEVC/VP9 не голодает, over-commit снят */
+     case VideoCodec::HEVC:
+-        return 16;
++        return 13; /* h96 04.09: maxDequeue=13+7=20 <= max_buffers(22); min_queued развязан в vdec.c -> старт HEVC/VP9 не голодает, over-commit снят */
+     case VideoCodec::VP8:
+         // The decoder might held a few frames as a reference for decoding. Since Android T
+         // the Codec2 is more prone to timeout the component if one is not producing frames. This
+@@ -445,7 +473,8 @@ uint32_t DecodeInterface::getOutputDelay(VideoCodec codec) {
+         return 3;
+     case VideoCodec::VP9:
+         // Reference: https://www.webmproject.org/vp9/levels/
+-        return 8;
++        // h96: 24 вместо 8 — см. комментарий у H264 (дедлок canvas-списка).
++        return 13; /* h96 04.09: maxDequeue=13+7=20 <= max_buffers(22); min_queued развязан в vdec.c -> старт HEVC/VP9 не голодает, over-commit снят */
+     }
+ }
+ 

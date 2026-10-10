@@ -1,0 +1,7 @@
+cc_binary {
+    name: "h96mouse",
+    srcs: ["h96mouse.c"],
+    vendor: true,
+    cflags: ["-Wall", "-Wextra", "-Werror"],
+    init_rc: ["h96mouse.rc"],
+}

@@ -1,0 +1,144 @@
+ОТЛАДКА (по желанию): гейтованный дамп кадра из dst_buf_done
+
+echo N > /sys/module/meson_vdec/parameters/h96_dump — следующие N кадров
+печатают в dmesg карту буфера: границу однородной области, байты с шагом
+64К и три пробы (начало, граница, смещение цветности). По умолчанию 0 —
+накладных расходов нет. Именно этим дампом был пойман баг 0004.
+
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index e504e5aea..42db6a731 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -11,6 +11,14 @@
+ 
+ #include "vdec_helpers.h"
+ 
++#include <linux/moduleparam.h>
++
++/* h96 (01.09.2026): vremennyj damp kadra. Skol'ko kadrov dampit'.
++ * Vklyuchat' pered proigryvaniem: echo 3 > .../parameters/h96_dump */
++static int h96_dump;
++module_param(h96_dump, int, 0644);
++MODULE_PARM_DESC(h96_dump, "dump N decoded frames (luma+chroma bytes)");
++
+ #define NUM_CANVAS_NV12 2
+ #define NUM_CANVAS_YUV420 3
+ 
+@@ -164,15 +172,58 @@ static int set_canvas_nv12m(struct amvdec_session *sess,
+ 		    vb2_dma_contig_plane_dma_addr(vb, i);
+ 	}
+ 
++	/* h96 (26.08): Android gralloc отдаёт NV12 одним dmabuf на обе
++	 * плоскости, а vb2-dma-contig игнорирует смещение плоскости при
++	 * импорте — адрес плоскости 1 совпадает с плоскостью 0, и хрома
++	 * писалась поверх люмы (зелёный кадр, сдвиг картинки). Раскладка
++	 * minigbm (drv_bo_from_format): stride = ALIGN(width, 64), хрома
++	 * вплотную за люмой: offset = stride * height (высота НЕ
++	 * выравнивается). Пишем кадр тем же страйдом, каким его будет
++	 * читать потребитель gralloc-буфера.
++	 */
++	u32 stride = width;
++
++	if (buf_paddr[1] == buf_paddr[0]) {
++		stride = ALIGN(width, 64);
++		/*
++		 * 01.09.2026: EKSPERIMENT. Damp syrogo kadra pokazal, chto po
++		 * smeshcheniyu stride*ALIGN(h,32) lezhit korrektnaya cvetnost'
++		 * (pary "9c 2c"), a po stride*h - eshche hvost yarkosti ("eb eb").
++		 * Znachit dekoder pishet tuda, kuda my emu skazali. No na ekrane
++		 * cveta razrusheny, hotya programmnyj dekoder na tom zhe fajle daet
++		 * ideal. Ostaetsya odno: POTREBITEL' (gralloc/minigbm) ishchet
++		 * hromu po drugomu smeshcheniyu - imenno tomu, chto opisano v
++		 * kommentarii vyshe: stride * height, bez vyravnivaniya vysoty.
++		 * Pishem tuda, kuda on chitaet.
++		 */
++		/*
++		 * 01.09.2026, PROVERENO: menyat' eto smeshchenie BESPOLEZNO.
++		 * Stavili stride*sess->height (1920*1080) - adres kanvasa
++		 * dejstvitel'no menyalsya (uv-y = 0x1FA400 v zhurnale), no damp
++		 * syrogo kadra pokazyval hromu vse ravno po 1920*1088. Znachit
++		 * raspolozhenie hromy zadaet ne kanvas.
++		 */
++		buf_paddr[1] = buf_paddr[0] + stride * ALIGN(height, 32);
++		pr_info_once("h96 canvas: single-dmabuf NV12, y=%pad uv=%pad stride=%u h=%u\n",
++			     &buf_paddr[0], &buf_paddr[1], stride, height);
++	} else {
++		pr_info_once("h96 canvas: separate planes, y=%pad uv=%pad w=%u h=%u\n",
++			     &buf_paddr[0], &buf_paddr[1], width, height);
++	}
++
+ 	/* Y plane */
+ 	meson_canvas_config(core->canvas, canvas_id[0], buf_paddr[0],
+-			    width, height, MESON_CANVAS_WRAP_NONE,
++			    stride, height, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+ 			    MESON_CANVAS_ENDIAN_SWAP64);
+ 
+-	/* U/V plane */
++	/* U/V plane.
++	 * h96 (28.08): fw pishet chroma kak CrCb (NV21-poryadok), a gralloc
++	 * potrebitel chitaet bufer kak NV12 (CbCr) - rozovo-fioletovyj sdvig
++	 * cveta. Endian 0x6 (= SWAP64 bez SWAP16) menyaet sosednie bajty
++	 * mestami otnositelno 0x7 - apparatnyj swap Cb<->Cr pri zapisi. */
+ 	meson_canvas_config(core->canvas, canvas_id[1], buf_paddr[1],
+-			    width, height / 2, MESON_CANVAS_WRAP_NONE,
++			    stride, height / 2, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+ 			    MESON_CANVAS_ENDIAN_SWAP64);
+ 
+@@ -286,6 +337,47 @@ static void dst_buf_done(struct amvdec_session *sess,
+ 	struct device *dev = sess->core->dev_dec;
+ 	u32 output_size = amvdec_get_output_size(sess);
+ 
++	if (h96_dump > 0) {
++		void *va = vb2_plane_vaddr(&vbuf->vb2_buf, 0);
++
++		if (va) {
++			u8 *b = va;
++			u32 stride = ALIGN(sess->width, 64);
++			u32 uvoff = stride * ALIGN(sess->height, 32);
++			u32 total = uvoff + uvoff / 2;
++			u32 off, gran = 0;
++			u8 first = b[64];
++			char line[256];
++			int n = 0, i;
++
++			/* gde konchaetsya odnorodnaya oblast' (dlya sploshnogo
++			 * cveta eto granica lumy) */
++			for (off = 4096; off < total; off += 4096) {
++				if (b[off] != first) {
++					gran = off;
++					break;
++				}
++			}
++
++			for (i = 0; i < 40 && (u32)i * 65536 < total; i++)
++				n += scnprintf(line + n, sizeof(line) - n,
++					       "%02x", b[(u32)i * 65536]);
++
++			pr_info("h96 map w=%u h=%u stride=%u uvoff=%u total=%u\n",
++				sess->width, sess->height, stride, uvoff, total);
++			pr_info("h96 map granica=%u (stroka %u) bajt %02x -> %02x\n",
++				gran, gran / stride, first,
++				gran ? b[gran] : 0);
++			pr_info("h96 map po64k: %s\n", line);
++			pr_info("h96 map @0     : %*ph\n", 16, b + 64);
++			pr_info("h96 map @gran  : %*ph\n", 16,
++				b + (gran ? gran : 0) + 64);
++			pr_info("h96 map @uvoff : %*ph\n", 16, b + uvoff + 64);
++		} else {
++			pr_info("h96 dump: vaddr NULL\n");
++		}
++		h96_dump--;
++	}
+ 	switch (sess->pixfmt_cap) {
+ 	case V4L2_PIX_FMT_NV12M:
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, 0, output_size);
+@@ -406,6 +498,7 @@ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
+ 	spin_unlock_irqrestore(&sess->ts_spinlock, flags);
+ 
+ 	dst_buf_done(sess, vbuf, field, timestamp, timecode, vbuf_flags);
++
+ 	if (match)
+ 		atomic_dec(&sess->esparser_queued_bufs);
+ }

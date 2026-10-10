@@ -1,0 +1,5 @@
+service h96mouse /vendor/bin/h96mouse
+    class main
+    user root
+    group input
+    restart_period 5

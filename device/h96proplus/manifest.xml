@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- VINTF-манифест vendor-раздела H96 Pro Plus.
+
+     Без этого файла сборка падает на 97% в check_vintf_vendor:
+     «Cannot fetch vendor manifest» (сборка №9, 19 часов впустую).
+
+     Все наши HAL-ы — AIDL и самодекларируются vintf-фрагментами
+     (в Android 16 hwservicemanager удалён, HIDL-сервисы мертвы —
+     бывшие здесь записи audio 7.1 / bluetooth 1.1 убраны вместе с
+     переходом на AIDL-реализации, попытка №11):
+       graphics.allocator (minigbm AIDL) + mapper.minigbm (stable-C),
+       wifi-service, audio.service-aidl, bluetooth-service.default,
+       media.c2@1.2-service-v4l2 (фрагмент в его Android.bp),
+       composer hwc3 и gatekeeper — внутри APEX.
+
+     target-level="7" оставлен: не сертифицируемся, поднимем осознанно. -->
+<manifest version="1.0" type="device" target-level="7">
+</manifest>

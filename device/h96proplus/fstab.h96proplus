@@ -1,0 +1,31 @@
+# fstab.h96proplus
+#
+# Составлен по стоковому fstab.amlogic (см. docs/stock-image-analysis.md §4a),
+# с поправками под Android 15.
+#
+# ⚠️ TODO(M1): имена блочных устройств сверить с /dev/block/by-name на живом
+# устройстве. У Amlogic они обычно совпадают, но проверить обязательно —
+# ошибка здесь означает систему, которая не смонтирует свои разделы.
+#
+#<src>                  <mnt_point>  <type>  <mnt_flags and options>                    <fs_mgr_flags>
+
+# ⚠️ Без флага `logical`: dynamic partitions (super) у нас НЕТ, с этим флагом
+# first-stage init искал бы разделы внутри несуществующего super и не грузился.
+# ⚠️ TODO(M12): раздела vendor в стоковой разметке нет, а mainline-ядро вообще
+# не читает фирменную таблицу разделов Amlogic (MPT из DTB) — имена появятся
+# только после переразметки через blkdevparts=/GPT. Этот fstab — для финальной
+# eMMC-разметки; первая загрузка идёт с SD по fstab.sdboot.
+/dev/block/system       /system      ext4    ro,barrier=1                               wait,first_stage_mount
+/dev/block/vendor       /vendor      ext4    ro,barrier=1                               wait,first_stage_mount
+/dev/block/data         /data        ext4    noatime,nosuid,nodev,errors=remount-ro          wait,check,fileencryption=aes-256-xts
+/dev/block/cache        /cache       ext4    noatime,nosuid,nodev,errors=remount-ro          wait,check
+/dev/block/misc         /misc        emmc    defaults                                   defaults
+
+# ZRAM. У стоковой прошивки было 500 МиБ; здесь 512 МиБ (фактическая память платы — 2 ГиБ).
+/dev/block/zram0        none         swap    defaults                                   zramsize=536870912
+
+# SD-карта
+/devices/*.sd/mmc_host/sd*  auto     auto    defaults    voldmanaged=sdcard1:auto,noemulatedsd
+
+# USB-накопители. В стоке шли через xhci — контроллер USB 3.0.
+/devices/*dwc3/xhci-hcd.0.auto/usb*  auto  auto  defaults  voldmanaged=usb:auto

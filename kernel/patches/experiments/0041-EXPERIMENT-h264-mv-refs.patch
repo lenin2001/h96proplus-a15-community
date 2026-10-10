@@ -1,0 +1,56 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0041] EXPERIMENT meson-vdec: h264_mv_extra / h264_scr0_refs
+
+Not part of the installed kernel. h264_mv_extra adds co-located MV slots beyond
+max_refs; h264_scr0_refs overrides the reference count in AV_SCRATCH_0. With the
+recycle_hold=6 amplifier, h264_mv_extra=8 gave 3/15 corrupted runs (5/13 without):
+no effect beyond noise. h264_scr0_refs was not exercised.
+
+---
+diff -ruN s40/drivers/staging/media/meson/vdec/codec_h264.c cur/drivers/staging/media/meson/vdec/codec_h264.c
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -145,6 +145,14 @@
+ 	u32 max_refs;
+ };
+ 
++/* h96 0041: experiment knobs (default off) */
++static unsigned int h264_mv_extra;
++module_param(h264_mv_extra, uint, 0644);
++MODULE_PARM_DESC(h264_mv_extra, "extra co-located MV slots beyond max_refs");
++static unsigned int h264_scr0_refs;
++module_param(h264_scr0_refs, uint, 0644);
++MODULE_PARM_DESC(h264_scr0_refs, "override the reference count written to AV_SCRATCH_0");
++
+ static int codec_h264_can_recycle(struct amvdec_core *core)
+ {
+ 	return !amvdec_read_dos(core, AV_SCRATCH_7) ||
+@@ -300,7 +308,8 @@
+ 	mb_height = ALIGN(h264->mb_height, 4);
+ 	mb_total = mb_width * mb_height;
+ 
+-	h264->ref_size = mb_total * MB_MV_SIZE * h264->max_refs;
++	h264->ref_size = mb_total * MB_MV_SIZE *
++			 (h264->max_refs + READ_ONCE(h264_mv_extra));
+ 	h264->ref_vaddr = dma_alloc_coherent(core->dev, h264->ref_size,
+ 					     &h264->ref_paddr, GFP_KERNEL);
+ 	if (!h264->ref_vaddr) {
+@@ -313,9 +322,15 @@
+ 	/* End of ref MV */
+ 	amvdec_write_dos(core, AV_SCRATCH_4, h264->ref_paddr + h264->ref_size);
+ 
+-	amvdec_write_dos(core, AV_SCRATCH_0, (h264->max_refs << 24) |
+-					     (sess->num_dst_bufs << 16) |
+-					     ((h264->max_refs - 1) << 8));
++	{
++		u32 refs = READ_ONCE(h264_scr0_refs) ?: h264->max_refs;
++
++		pr_info("h96 h264 resume: refs=%u bufs=%u mv=%u bytes\n",
++			refs, sess->num_dst_bufs, h264->ref_size);
++		amvdec_write_dos(core, AV_SCRATCH_0, (refs << 24) |
++				 (sess->num_dst_bufs << 16) |
++				 ((refs - 1) << 8));
++	}
+ }
+ 
+ /*

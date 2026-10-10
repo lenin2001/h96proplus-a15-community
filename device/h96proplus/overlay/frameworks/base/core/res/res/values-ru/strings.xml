@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Загрузочные надписи для ТВ-приставки.
+
+     AOSP считает устройство телефоном, если для него не объявлен другой
+     «product», и показывает при старте «Запуск телефона…», а после
+     обновления или чистой установки — «Обновление телефона…», пока
+     компилируются приложения. На приставке, подключённой к телевизору,
+     это выглядит нелепо, поэтому упоминание телефона убрано.
+
+     ⚠️ Атрибут product="default" ОБЯЗАТЕЛЕН. Без него сборка падает:
+         error: multiple default products defined for resource
+         android:string/android_upgrading_title
+     Исходные строки в frameworks/base объявлены с product="default", и
+     объявление без атрибута воспринимается как второе определение того же
+     варианта, а не как переопределение. -->
+<resources>
+    <string name="android_start_title" product="default">Загрузка…</string>
+    <string name="android_upgrading_title" product="default">Обновление…</string>
+</resources>

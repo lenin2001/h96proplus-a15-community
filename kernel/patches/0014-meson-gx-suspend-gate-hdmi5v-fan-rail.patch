@@ -1,0 +1,40 @@
+Гашение периферийной 5В рельсы (HDMI_5V / GPIOH_3) в глубоком сне.
+
+Проблема: в глубоком сне (patch 0013) вентилятор продолжает крутиться.
+На стоке standby-прошивка BL301 опускала GPIOH_3 (hdmi_5v_ctrl OFF) и
+вентилятор вставал. Вентилятор H96 Pro Plus — «глупый» 2-проводный 5В без
+управления; узла fan нет ни в mainline, ни в стоковом DTS. Единственная
+коммутируемая 5В рельса — регулятор HDMI_5V на GPIOH_3 (на ней же HDMI 5В
+и аудиоусилитель DIO2133). В mainline он regulator-always-on, поэтому
+GPIOH_3 держится в 1 всегда, а CPU_SUSPEND(0x10000) его не трогает.
+
+Решение: GPIOH_3 отдан драйверу meson_gx_pm (peripheral-power-gpios в узле
+pm; у регулятора HDMI_5V сняты gpio/enable-active-high/regulator-always-on
+переопределением в board-DTS). Драйвер держит пин высоким в работе и
+опускает его в dev_pm_ops.suspend (процессный контекст, ДО cpu_suspend),
+возвращает в .resume. IR-пробуждение не затрагивается (IR в AO-домене).
+Худший случай (вентилятор на постоянной DC-in 5В) — хук безвреден, HDMI
+не страдает: пин высокий в работе, опускается только во сне.
+
+Файлы:
+ - drivers/firmware/meson/meson_gx_pm.c  (см. kernel/meson_gx_pm.c: gpiod +
+   dev_pm_ops .suspend/.resume + .driver.pm)
+ - arch/arm64/boot/dts/amlogic/meson-gxm-h96proplus.dts:
+
+--- a/arch/arm64/boot/dts/amlogic/meson-gxm-h96proplus.dts
++++ b/arch/arm64/boot/dts/amlogic/meson-gxm-h96proplus.dts
+@@ meson_gx_pm: pm node @@
+ 	meson_gx_pm: pm {
+ 		compatible = "amlogic,meson-gx-pm";
++		/* GPIOH_3: коммутируемая 5В рельса (HDMI + аудиоусилитель +
++		 * вентилятор). Отдана драйверу, чтобы гасить её в suspend. */
++		peripheral-power-gpios = <&gpio GPIOH_3 GPIO_ACTIVE_HIGH>;
+ 	};
+@@ конец файла @@
++/* HDMI_5V/GPIOH_3 переведён под meson_gx_pm: снять управление пином у
++ * регулятора, оставив фиксированную 5В болванку для hdmi/VCC-supply. */
++&hdmi_5v {
++	/delete-property/ gpio;
++	/delete-property/ enable-active-high;
++	/delete-property/ regulator-always-on;
++};

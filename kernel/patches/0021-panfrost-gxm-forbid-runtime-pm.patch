@@ -1,0 +1,78 @@
+panfrost: GXM (Mali-T820) — никогда не уходить в runtime-suspend (pm_runtime_forbid)
+
+07.09.2026. На Amlogic GXM выключение ядер (SHADER/TILER/L2_PWROFF) не завершается
+за 2 мс НИКОГДА: 100% runtime-suspend'ов дают три «power transition timeout»
+(987 за 2,5 ч на H96 Pro+, то же на X92/Armbian). Quirk PWR_OVERRIDE1 обязателен и
+не причина. У GXM нет GPU power-domain, регулятора и GPU_PM_RT — runtime-suspend
+ничего не экономит, а каждое пробуждение стоит полного panfrost_device_reset().
+Держим устройство runtime-active через pm_runtime_forbid() (то же, что
+`echo on > power/control`, но с первой секунды и без зависимости от vendor).
+Userspace по-прежнему может вернуть `auto` для A/B. System-suspend (0013) не
+затронут: pm_runtime_force_suspend() зовёт runtime_suspend напрямую.
+Проверка: power/control=on, runtime_status=active, dmesg без «power transition timeout».
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.h b/drivers/gpu/drm/panfrost/panfrost_device.h
+index 0f3992412..9a16c397a 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.h
++++ b/drivers/gpu/drm/panfrost/panfrost_device.h
+@@ -43,11 +43,15 @@ enum panfrost_drv_comp_bits {
+  * @GPU_PM_VREG_OFF: Allow turning off regulators during system suspend
+  * @GPU_PM_RT: Allow disabling clocks and asserting the reset control during
+  *  system runtime suspend
++ * @GPU_PM_RT_FORBID: Never runtime-suspend the device (pm_runtime_forbid)
+  */
+ enum panfrost_gpu_pm {
+ 	GPU_PM_CLK_DIS,
+ 	GPU_PM_VREG_OFF,
+-	GPU_PM_RT
++	GPU_PM_RT,
++	/* h96 0021: keep the device runtime-active (core power-off never
++	 * completes on Amlogic GXM Mali-T820; runtime suspend saves nothing there) */
++	GPU_PM_RT_FORBID
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/panfrost/panfrost_drv.c b/drivers/gpu/drm/panfrost/panfrost_drv.c
+index 074c0995d..f83489146 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_drv.c
++++ b/drivers/gpu/drm/panfrost/panfrost_drv.c
+@@ -993,6 +993,8 @@ static int panfrost_probe(struct platform_device *pdev)
+ 	pm_runtime_enable(pfdev->base.dev);
+ 	pm_runtime_set_autosuspend_delay(pfdev->base.dev, 50); /* ~3 frames */
+ 	pm_runtime_use_autosuspend(pfdev->base.dev);
++	if (pfdev->comp->pm_features & BIT(GPU_PM_RT_FORBID))
++		pm_runtime_forbid(pfdev->base.dev);
+ 
+ 	/*
+ 	 * Register the DRM device with the core and the connectors with
+@@ -1091,6 +1093,21 @@ static const struct panfrost_compatible amlogic_data = {
+ 	.vendor_quirk = panfrost_gpu_amlogic_quirk,
+ };
+ 
++/*
++ * h96 0021 — Meson GXM (Mali-T820): SHADER/TILER/L2_PWROFF never clears *_PWRTRANS
++ * ("power transition timeout" on 100% of runtime suspends on H96 Pro+ and X92).
++ * The SoC has no GPU power domain, no GPU regulator and amlogic_data has no
++ * GPU_PM_RT, so runtime suspend saves nothing and only costs a failed power-off
++ * plus a full device reset per wake. Keep the GPU runtime-active; userspace may
++ * still write "auto" to power/control for A/B tests.
++ */
++static const struct panfrost_compatible amlogic_gxm_data = {
++	.num_supplies = ARRAY_SIZE(default_supplies) - 1,
++	.supply_names = default_supplies,
++	.vendor_quirk = panfrost_gpu_amlogic_quirk,
++	.pm_features = BIT(GPU_PM_RT_FORBID),
++};
++
+ static const char * const mediatek_pm_domains[] = { "core0", "core1", "core2",
+ 						    "core3", "core4" };
+ /*
+@@ -1155,7 +1172,7 @@ static const struct panfrost_compatible mediatek_mt8370_data = {
+ static const struct of_device_id dt_match[] = {
+ 	/* Set first to probe before the generic compatibles */
+ 	{ .compatible = "amlogic,meson-gxm-mali",
+-	  .data = &amlogic_data, },
++	  .data = &amlogic_gxm_data, },
+ 	{ .compatible = "amlogic,meson-g12a-mali",
+ 	  .data = &amlogic_data, },
+ 	{ .compatible = "renesas,r9a09g047-mali", .data = &default_pm_rt_data },

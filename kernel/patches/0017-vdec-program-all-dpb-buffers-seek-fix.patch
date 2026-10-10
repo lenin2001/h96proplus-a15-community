@@ -1,0 +1,32 @@
+Программировать канвасы/референсы на ВСЕ буферы DPB по индексу (фикс перемотки).
+
+Симптом (05.09.2026, повторно от пользователя): в Alfa/SmartTube видео H264/HEVC/VP9
+«не стартует» ИЛИ при перемотке (seek) «рассыпается на чёрно-белые квадраты».
+
+Корень (вскрыт workflow-разбором, подтверждён по коду, dma_addr — по vb2):
+ amvdec_set_canvases (vdec_helpers.c) и codec_hevc_setup_buffers_gxl
+ (codec_hevc_common.c) заполняли аппаратную таблицу канвасов/референсов CAPTURE
+ ТОЛЬКО обходом m2m-очереди dst на момент resume() (v4l2_m2m_for_each_dst_buf),
+ индекс по vb->index. Буфер, вернувшийся после seek (дисплей держал его, потом
+ вернул, клиент переквешил уже в STATUS_RUNNING), в очередь на момент resume НЕ
+ попадает -> его слот остаётся со stale/нулевым адресом.
+ - H264: адрес ЗАПИСИ кадра идёт через канвас -> запись по мусору -> квадраты И
+   «No dst buffer»/не стартует.
+ - HEVC/VP9 (8-бит NV12M): адрес записи программируется покадрово из dma_addr
+   (HEVC_SAO_*), а ломается таблица РЕФЕРЕНСОВ -> квадраты на P/B после seek.
+
+Фикс (Variant B): перебирать i=0..sess->num_dst_bufs-1 через vb2_get_buffer(cap_q,i)
+и программировать слот для КАЖДОГО индекса (identity fw_idx_to_vb2_idx[i]=i).
+Безопасность dma_addr импортного gralloc-DMABUF: пинится в buf_prepare (первый QBUF)
+и держится валидным ЧЕРЕЗ DQBUF до смены fd/teardown (vb2-dma-contig) -> seek-буфер
+(сейчас dequeued, раньше queued) безопасен по индексу. НИКОГДА не заквешенный буфер:
+mem_priv==NULL, vb2_plane_cookie()==NULL, vb2_dma_contig_plane_dma_addr разыменует
+NULL -> ГВАРД vb2_plane_cookie(vb,0)!=NULL + carry-forward адреса последнего
+валидного (fw такой слот не выберет под активную запись/референс).
+Плюс освобождение старых canvas ID в начале amvdec_set_canvases -> чинит
+предсуществующую утечку (повторные seek упирались в MAX_CANVAS).
+
+Файлы: drivers/staging/media/meson/vdec/vdec_helpers.c (amvdec_set_canvases),
+       drivers/staging/media/meson/vdec/codec_hevc_common.c (codec_hevc_setup_buffers_gxl).
+Оставляет min_queued низким (не возвращает «не стартует»). 10-бит/FBC путь у нас не
+используется; при включении там нужна аллокация fbc/mmu тоже по индексу + free.

@@ -1,0 +1,85 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0019] drm_hwcomposer: stop destroying the display while reporting a hotplug
+
+DrmHwcThree::HandleDisplayHotplugEvent() erased the HwcDisplay object out of
+DrmHwc::displays_ while merely *reporting* a hotplug. Those objects are owned by DrmHwc
+and their lifetime belongs to BindDisplay()/UnbindDisplay()/FinalizeDisplayBinding();
+erasing one here destroys it behind DrmHwc's back. display_handles_ still maps the
+pipeline to handle 0 while displays_ no longer holds it, so GetDisplay() returns null and
+every subsequent HWC3 call answers BAD_DISPLAY (2).
+
+It ran on every detach AND on every attach after the first, because
+HwcDisplay::SetPipeline() always schedules kConnected for the primary display
+(SurfaceFlinger LOG_ALWAYS_FATALs if the primary is reported disconnected), while
+AddPhysicalDisplay() is called only from this function - so once display 0 has been
+announced, HasDisplay(0) stays true forever.
+
+On this board the result was that an HDMI sink going into standby, or being attached
+after a sink-less boot, left SurfaceFlinger with a dead display 0 ("Failed to hotplug
+display 0") and a permanent "Invalid display" error storm until reboot; see
+docs/evidence/2026-09-18/display-hwc-storm.txt, about 1200 errors per second.
+
+The fix keeps the buffer-cache bookkeeping (RemoveDisplay/AddPhysicalDisplay) and drops
+the erase. Upstream drm_hwcomposer has removed this whole block, which is corroboration.
+CleanDisplayResources() is deliberately no longer called on the re-announcement path: its
+first act is SetPowerMode(OFF), which - with the display now surviving - would really
+execute and DPMS off the pipeline SetPipeline() has just built; its cache work is
+redundant because SetPipeline()->Deinit() has already released the client target and
+RemoveDisplay() drops the cache. The function is left defined but unused, so the diff
+stays minimal.
+
+Nothing about composition strategy is touched, so patch 0009's YUV overlay and
+full-screen RGB client target are unaffected. No logging suppression, no unconditional
+success return, no composer restart.
+
+Built into vendor/apex/com.android.hardware.graphics.composer.drm_hwcomposer.apex
+(sha256 4d65af97..., was 50acec62...); the only file that differs inside the APEX payload
+is bin/hw/android.hardware.composer.hwc3-service.drm.
+---
+diff --git a/external/drm_hwcomposer/hwc3/DrmHwcThree.cpp b/external/drm_hwcomposer/hwc3/DrmHwcThree.cpp
+--- a/external/drm_hwcomposer/hwc3/DrmHwcThree.cpp
++++ b/external/drm_hwcomposer/hwc3/DrmHwcThree.cpp
+@@ -143,17 +143,39 @@
+ void DrmHwcThree::HandleDisplayHotplugEvent(uint64_t display_id,
+                                             bool connected) {
+   DEBUG_FUNC();
++  /* h96 21.09: do NOT erase from Displays() here.
++   *
++   * The HwcDisplay objects are owned by DrmHwc; their lifetime belongs to
++   * BindDisplay()/UnbindDisplay()/FinalizeDisplayBinding(). Erasing one while
++   * merely *reporting* a hotplug destroys it behind DrmHwc's back:
++   * display_handles_ still maps the pipeline to handle 0 while displays_ no
++   * longer holds it, so GetDisplay() returns null and every subsequent HWC3
++   * call answers BAD_DISPLAY.
++   *
++   * This ran on every detach AND on every attach after the first, because
++   * HwcDisplay::SetPipeline() always schedules kConnected for the primary
++   * display (SurfaceFlinger aborts if the primary is reported disconnected),
++   * while AddPhysicalDisplay() is called only from here -- so once display 0
++   * has been announced, HasDisplay(0) is true forever. The result on this
++   * board was that an HDMI sink going into standby, or being attached after a
++   * sink-less boot, left SurfaceFlinger with a dead display and a permanent
++   * "Invalid display" error storm until reboot.
++   *
++   * Upstream drm_hwcomposer has removed this block entirely. Keep only the
++   * buffer-cache bookkeeping. */
+   if (!connected) {
+     composer_resources_->RemoveDisplay(display_id);
+-    Displays().erase(display_id);
+     return;
+   }
+ 
+   if (composer_resources_->HasDisplay(display_id)) {
+-    /* Cleanup existing display resources */
+-    CleanDisplayResources(display_id);
++    /* Re-announcement of a display we already advertised (pipeline swap, or a
++     * headless <-> real transition). SetPipeline()->Deinit() has already
++     * released the client target, so dropping the stale buffer cache is all
++     * that is needed. CleanDisplayResources() is deliberately NOT called: it
++     * begins with SetPowerMode(OFF), which would now really execute and DPMS
++     * off the pipeline that SetPipeline() has just built. */
+     composer_resources_->RemoveDisplay(display_id);
+-    Displays().erase(display_id);
+   }
+   composer_resources_->AddPhysicalDisplay(display_id);
+ }

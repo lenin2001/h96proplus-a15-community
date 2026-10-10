@@ -1,0 +1,76 @@
+Subject: [PATCH 0020] drm_hwcomposer: keep planes that do not fit a layer available
+
+On Amlogic meson the primary plane accepts only RGB and the overlay plane only YUV.
+The original loop removed every plane it tried, so the NV12 video layer discarded the
+primary plane, took the overlay, and the UI layer above had no plane left: the whole KMS
+plan was rejected and every layer fell back to client composition. DrmFbImporter.cpp only
+gains an include and a note about a reverted NV12/NV21 experiment.
+---
+diff --git a/compositor/DrmKmsPlan.cpp b/compositor/DrmKmsPlan.cpp
+index 4f75e89..055d9ab 100644
+--- a/compositor/DrmKmsPlan.cpp
++++ b/compositor/DrmKmsPlan.cpp
+@@ -34,15 +34,28 @@ auto DrmKmsPlan::CreateDrmKmsPlan(DrmDisplayPipeline &pipe,
+   for (auto &dhl : composition) {
+     std::shared_ptr<BindingOwner<DrmPlane>> plane;
+ 
+-    /* Skip unsupported planes */
+-    do {
+-      if (avail_planes.empty()) {
+-        return {};
++    /* Keep planes that don't fit this layer available for the next ones.
++     *
++     * The original code removed every plane it tried, which breaks hardware
++     * with specialized planes. On Amlogic meson the primary plane accepts
++     * only RGB and the overlay plane only YUV: the bottom video layer (NV12)
++     * discarded the primary plane, took the overlay, and the UI layer above
++     * was left with no planes at all, so the whole KMS plan was rejected and
++     * every layer fell back to client composition.
++     */
++    auto it = avail_planes.begin();
++    for (; it != avail_planes.end(); ++it) {
++      if ((*it)->Get()->IsValidForLayer(&dhl)) {
++        plane = *it;
++        break;
+       }
++    }
+ 
+-      plane = *avail_planes.begin();
+-      avail_planes.erase(avail_planes.begin());
+-    } while (!plane->Get()->IsValidForLayer(&dhl));
++    if (!plane) {
++      return {};
++    }
++
++    avail_planes.erase(it);
+ 
+     LayerToPlaneJoining joining = {
+         .layer = std::move(dhl),
+diff --git a/drm/DrmFbImporter.cpp b/drm/DrmFbImporter.cpp
+index fe80891..fa4c2bb 100644
+--- a/drm/DrmFbImporter.cpp
++++ b/drm/DrmFbImporter.cpp
+@@ -21,6 +21,8 @@
+ 
+ #include "DrmFbImporter.h"
+ 
++#include <drm_fourcc.h>
++
+ #include <hardware/gralloc.h>
+ #include <utils/Trace.h>
+ #include <xf86drm.h>
+@@ -72,6 +74,14 @@ auto DrmFbIdHandle::CreateInstance(BufferInfo *bo, GemHandle first_gem_handle,
+     return local;
+   }
+ 
++  /* NOTE (31.08.2026): swapping NV12 -> NV21 here was tried and REVERTED.
++   * The theory was that the Amlogic decoder writes Cr,Cb while the buffer
++   * is labeled NV12. On hardware the result got worse: instead of a green
++   * and magenta shift the picture turned solid bright green. So the chroma
++   * order is not (only) the problem, and the format must be passed through
++   * unchanged.
++   */
++
+   /* Create framebuffer object */
+   if (!has_modifiers) {
+     err = drmModeAddFB2(*drm.GetFd(), bo->width, bo->height, bo->format,

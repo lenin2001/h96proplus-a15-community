@@ -1,0 +1,41 @@
+watchdog: meson_gxbb: stop the timer on orderly shutdown
+
+Incremental patch AFTER 0002-meson-gxbb-wdt-start-at-probe.patch.
+Do not re-add start_at_probe: doing so makes the series fail to apply.
+
+The reported shutdown was followed by a reset around a watchdog timeout.
+This is a candidate cause, not yet a demonstrated poweroff fix. In particular,
+WDOG_HW_RUNNING alone does not prevent stop: watchdog_release also checks
+magic-close and nowayout. Preserve the boot watchdog, stop it in .shutdown,
+and log the control register before/after for the next hardware test.
+
+Uses the driver's existing stop operation. Also runs on orderly reboot;
+verify both reboot and poweroff. A register with EN=0 proves this timer was
+disabled at this point, not that firmware powered down or that IR wake works.
+
+diff --git a/drivers/watchdog/meson_gxbb_wdt.c b/drivers/watchdog/meson_gxbb_wdt.c
+--- a/drivers/watchdog/meson_gxbb_wdt.c
++++ b/drivers/watchdog/meson_gxbb_wdt.c
+@@ -229,8 +229,22 @@
+ 	return devm_watchdog_register_device(dev, &data->wdt_dev);
+ }
+ 
++/* Stop late in orderly shutdown, without disabling boot-hang recovery. */
++static void meson_gxbb_wdt_shutdown(struct platform_device *pdev)
++{
++	struct meson_gxbb_wdt *data = platform_get_drvdata(pdev);
++	u32 before, after;
++
++	before = readl(data->reg_base + GXBB_WDT_CTRL_REG);
++	meson_gxbb_wdt_stop(&data->wdt_dev);
++	after = readl(data->reg_base + GXBB_WDT_CTRL_REG);
++	dev_info(&pdev->dev, "shutdown: WDT_CTRL %#x -> %#x, enabled=%u\n",
++		 before, after, !!(after & GXBB_WDT_CTRL_EN));
++}
++
+ static struct platform_driver meson_gxbb_wdt_driver = {
+ 	.probe	= meson_gxbb_wdt_probe,
++	.shutdown = meson_gxbb_wdt_shutdown,
+ 	.driver = {
+ 		.name = "meson-gxbb-wdt",
+ 		.pm = &meson_gxbb_wdt_pm_ops,

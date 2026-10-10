@@ -1,0 +1,650 @@
+H96: hardware MMAP CAPTURE bridge; zero-copy disabled pending device validation.
+
+Apply inside external/v4l2_codec2 to the project's current overlay baseline.
+Not a replacement for hardware tests; see docs/reports/2026-09-06-stability-fixes.md.
+
+diff --git a/components/VideoFramePool.cpp b/components/VideoFramePool.cpp
+index fd7bad8..d3064ac 100644
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -86,6 +86,9 @@ std::unique_ptr<VideoFramePool> VideoFramePool::Create(
+         // CPU access to buffers is only required in byte buffer mode.
+         usage |= C2MemoryUsage::CPU_READ;
+     }
++    // H96 decodes into driver MMAP buffers, then writes each client graphic
++    // block on the CPU, including Surface-backed blocks (not just GRALLOC).
++    if (!isSecure) usage |= C2MemoryUsage::CPU_WRITE;
+     const C2MemoryUsage memoryUsage(usage);
+ 
+     std::unique_ptr<VideoFramePool> pool =
+@@ -148,16 +151,8 @@ bool VideoFramePool::shouldDropBuffer(uint32_t bufferId) {
+     /* h96: MMAP-выход с копированием — клиентские блоки одноразовые,
+      * их id не повторяются; ограничение по множеству известных id
+      * зацикливало фетчер (Got/Dropping id по кругу). */
++    (void)bufferId;
+     return false;
+-    if (mBuffers.size() < mMaxBufferCount) {
+-        return false;
+-    }
+-
+-    if (mBuffers.find(bufferId) != mBuffers.end()) {
+-        return false;
+-    }
+-
+-    return true;
+ }
+ 
+ bool VideoFramePool::getVideoFrame(GetVideoFrameCB cb) {
+@@ -264,6 +259,11 @@ void VideoFramePool::getVideoFrameTask() {
+ 
+     if (err != C2_OK) {
+         ALOGE("%s(): Failed to fetch block, err=%d", __func__, err);
++        // A permanent allocator error must complete the pending callback.
++        // Silently returning kept mOutputCb occupied forever (black screen).
++        mClientTaskRunner->PostTask(
++                FROM_HERE, ::base::BindOnce(&VideoFramePool::onVideoFrameReady,
++                                             mClientWeakThis, std::nullopt));
+         return;
+     }
+ 
+@@ -275,7 +275,9 @@ void VideoFramePool::getVideoFrameTask() {
+         // Only pass the frame + id pair if both have successfully been obtained.
+         // Otherwise exit the loop so a nullopt is passed to the client.
+         frameWithBlockId = std::make_pair(std::move(frame), *bufferId);
+-        mBuffers.insert(*bufferId);
++        // Client IDs can change every frame in the MMAP-copy path.
++        // Retain only a bounded sample rather than growing a set indefinitely.
++        if (mBuffers.size() < mMaxBufferCount) mBuffers.insert(*bufferId);
+     } else {
+         ALOGE("%s(): Failed to generate VideoFrame or get the buffer id.", __func__);
+     }
+diff --git a/v4l2/Nv12Copy.h b/v4l2/Nv12Copy.h
+new file mode 100644
+index 0000000..8be9ba4
+--- /dev/null
++++ b/v4l2/Nv12Copy.h
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#ifndef H96_NV12_COPY_H
++#define H96_NV12_COPY_H
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++
++namespace android::h96 {
++
++struct Plane8 {
++    uint8_t* data;
++    size_t rowStride;
++    size_t pixelStride;
++};
++
++inline bool validPlane(size_t width, size_t height, size_t rowStride,
++                       size_t pixelStride, size_t available) {
++    if (!width || !height || !rowStride || !pixelStride) return false;
++    constexpr size_t max = std::numeric_limits<size_t>::max();
++    if (width - 1 > (max - 1) / pixelStride) return false;
++    const size_t rowBytes = (width - 1) * pixelStride + 1;
++    if (rowStride < rowBytes || height - 1 > (max - rowBytes) / rowStride) return false;
++    return (height - 1) * rowStride + rowBytes <= available;
++}
++
++// Destination storage is owned/validated by the mapped C2GraphicView.
++// Support interleaved UV, interleaved VU and separate U/V planes.
++inline bool copyNv12(const uint8_t* y, size_t ySize, size_t yStride,
++                     const uint8_t* uv, size_t uvSize, size_t uvStride,
++                     size_t width, size_t height, Plane8 dstY, Plane8 dstU, Plane8 dstV) {
++    constexpr size_t max = std::numeric_limits<size_t>::max();
++    if (!y || !uv || !dstY.data || !dstU.data || !dstV.data ||
++        !width || !height || width == max || height == max) return false;
++    const size_t cw = (width + 1) / 2;
++    const size_t ch = (height + 1) / 2;
++    if (cw > max / 2 ||
++        !validPlane(width, height, yStride, 1, ySize) ||
++        !validPlane(cw * 2, ch, uvStride, 1, uvSize) ||
++        !validPlane(width, height, dstY.rowStride, dstY.pixelStride, max) ||
++        !validPlane(cw, ch, dstU.rowStride, dstU.pixelStride, max) ||
++        !validPlane(cw, ch, dstV.rowStride, dstV.pixelStride, max)) return false;
++    for (size_t row = 0; row < height; ++row) {
++        uint8_t* dst = dstY.data + row * dstY.rowStride;
++        if (dstY.pixelStride == 1) {
++            std::memcpy(dst, y + row * yStride, width);
++        } else {
++            for (size_t col = 0; col < width; ++col)
++                dst[col * dstY.pixelStride] = y[row * yStride + col];
++        }
++    }
++    for (size_t row = 0; row < ch; ++row) {
++        const uint8_t* src = uv + row * uvStride;
++        uint8_t* u = dstU.data + row * dstU.rowStride;
++        uint8_t* v = dstV.data + row * dstV.rowStride;
++        if (dstU.pixelStride == 2 && dstV.pixelStride == 2 &&
++            dstU.rowStride == dstV.rowStride && v == u + 1) {
++            std::memcpy(u, src, cw * 2);
++        } else {
++            for (size_t col = 0; col < cw; ++col) {
++                u[col * dstU.pixelStride] = src[col * 2];
++                v[col * dstV.pixelStride] = src[col * 2 + 1];
++            }
++        }
++    }
++    return true;
++}
++}  // namespace android::h96
++#endif
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+index 2a9522e..c977d95 100644
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -26,12 +26,14 @@
+ #include <v4l2_codec2/common/H264NalParser.h>
+ #include <v4l2_codec2/common/HEVCNalParser.h>
+ #include <v4l2_codec2/plugin_store/DmabufHelpers.h>
++#include "Nv12Copy.h"
+ 
+ namespace android {
+ namespace {
+ 
+ // Extra buffers for transmitting in the whole video pipeline.
+ constexpr size_t kNumExtraOutputBuffers = 4;
++constexpr size_t kMaxReadyClientFrames = 3;
+ 
+ bool waitForDRC(const C2ConstLinearBlock& input, std::optional<VideoCodec> codec) {
+     C2ReadView view = input.map().get();
+@@ -127,6 +129,11 @@ bool V4L2Decoder::start(const VideoCodec& codec, const size_t inputBufferSize,
+     mErrorCb = std::move(errorCb);
+     mCodec = codec;
+     mIsSecure = isSecure;
++    // The MMAP bridge must never map protected content on the CPU.
++    if (isSecure) {
++        ALOGE("Protected playback is not supported by the H96 MMAP bridge.");
++        return false;
++    }
+ 
+     if (mState == State::Error) {
+         ALOGE("Ignore due to error state.");
+@@ -263,6 +270,10 @@ bool V4L2Decoder::setupInitialOutput() {
+         ALOGE("Failed to queue initial EOS buffer");
+         return false;
+     }
++    if (!mOutputQueue->streamon()) {
++        ALOGE("Failed to streamon initial output queue.");
++        return false;
++    }
+ 
+     return true;
+ }
+@@ -272,8 +283,7 @@ bool V4L2Decoder::setupMinimalOutputFormat() {
+ 
+     for (const uint32_t& pixfmt :
+          mDevice->enumerateSupportedPixelformats(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)) {
+-        if (std::find(kSupportedOutputFourccs.begin(), kSupportedOutputFourccs.end(), pixfmt) ==
+-            kSupportedOutputFourccs.end()) {
++        if (pixfmt != Fourcc::NM12) {
+             ALOGD("Pixel format %s is not supported, skipping...", fourccToString(pixfmt).c_str());
+             continue;
+         }
+@@ -295,6 +305,10 @@ bool V4L2Decoder::setupMinimalOutputFormat() {
+ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memory memory) {
+     ALOGV("%s()", __func__);
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
++    if (memory != V4L2_MEMORY_MMAP) {
++        ALOGE("H96 zero-copy capture is disabled pending hardware validation.");
++        return false;
++    }
+ 
+     const std::optional<struct v4l2_format> format = getFormatInfo();
+     std::optional<size_t> numOutputBuffers = getNumOutputBuffers();
+@@ -303,13 +317,28 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+     }
+     *numOutputBuffers = std::max(*numOutputBuffers, minOutputBuffersCount);
+ 
++    // Release old mappings before REQBUFS(0) / S_FMT, including DRC frames
++    // which are still waiting for a client block.
++    if (mOutputQueue->allocatedBuffersCount() > 0 && !mOutputQueue->streamoff())
++        return false;
++    while (!mDecodedMmapFrames.empty()) mDecodedMmapFrames.pop();
++    mDrainLastSeen = false;
++    while (!mReadyClientFrames.empty()) mReadyClientFrames.pop();
++    mFrameAtDevice.clear();
++    while (!mReuseFrameQueue.empty()) mReuseFrameQueue.pop();
++    mQuarantineBlocks.clear();
++    mBlockIdToV4L2Id.clear();
++    if (mOutputQueue->allocatedBuffersCount() > 0 &&
++        !mOutputQueue->deallocateBuffers()) return false;
++
+     const ui::Size codedSize(format->fmt.pix_mp.width, format->fmt.pix_mp.height);
+     if (!setupOutputFormat(codedSize)) {
+         return false;
+     }
+ 
+     const std::optional<struct v4l2_format> adjustedFormat = getFormatInfo();
+-    if (!adjustedFormat) {
++    if (!adjustedFormat || adjustedFormat->fmt.pix_mp.pixelformat != Fourcc::NM12 ||
++        adjustedFormat->fmt.pix_mp.num_planes != 2) {
+         return false;
+     }
+     mCodedSize.set(adjustedFormat->fmt.pix_mp.width, adjustedFormat->fmt.pix_mp.height);
+@@ -322,19 +351,6 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+         return false;
+     }
+ 
+-    if (mOutputQueue->isStreaming()) {
+-        mOutputQueue->streamoff();
+-    }
+-    if (mOutputQueue->allocatedBuffersCount() > 0) {
+-        mOutputQueue->deallocateBuffers();
+-    }
+-
+-    mFrameAtDevice.clear();
+-    mBlockIdToV4L2Id.clear();
+-    while (!mReuseFrameQueue.empty()) {
+-        mReuseFrameQueue.pop();
+-    }
+-
+     const size_t adjustedNumOutputBuffers =
+             mOutputQueue->allocateBuffers(*numOutputBuffers, memory);
+     if (adjustedNumOutputBuffers == 0) {
+@@ -343,29 +359,11 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+     }
+ 
+     ALOGV("Allocated %zu output buffers.", adjustedNumOutputBuffers);
+-    if (!mOutputQueue->streamon()) {
+-        ALOGE("Failed to streamon output queue.");
+-        return false;
+-    }
+ 
+-    while (!mDecodedMmapFrames.empty())
+-        mDecodedMmapFrames.pop();
+-    while (!mReadyClientFrames.empty())
+-        mReadyClientFrames.pop();
+-    mQuarantineBlocks.clear();
+     mCaptureStride = adjustedFormat->fmt.pix_mp.plane_fmt[0].bytesperline;
++    mCaptureChromaStride = adjustedFormat->fmt.pix_mp.plane_fmt[1].bytesperline;
+ 
+-    mUseDmabufOutput = (memory == V4L2_MEMORY_DMABUF);
+-    if (mUseDmabufOutput) {
+-        /* h96 zero-copy: рабочая очередь — DMABUF, клиентские gralloc-блоки
+-         * уходят декодеру напрямую, без CPU-копии. Привязка blockId->v4l2Id
+-         * СТАТИЧНА на весь стрим: meson vdec защёлкивает канвасы по
+-         * физадресам queued-буферов в момент start_streaming, поэтому чужой
+-         * fd на уже привязанный индекс отдавать нельзя. vb2 отложит
+-         * start_streaming до полного набора QBUF — фетчи блоков раскрутит
+-         * changeResolution() после создания пула. */
+-        return true;
+-    }
++    mUseDmabufOutput = false;
+ 
+     /* h96: MMAP-выход стартовой фиктивной очереди (до SOURCE_CHANGE).
+      * Один буфер оставляем свободным — start() берёт его под пробный
+@@ -380,6 +378,14 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+         }
+     }
+ 
++    // All MMAP capture buffers must be queued before the driver snapshots
++    // canvas addresses. Initial setup queues its final EOS slot separately.
++    if (keepFree == 0 && !mOutputQueue->streamon()) {
++        ALOGE("Failed to streamon populated MMAP capture queue.");
++        return false;
++    }
++    ALOGI("h96: hardware decode, MMAP capture (%zu buffers), CPU frame copy",
++          adjustedNumOutputBuffers);
+     return true;
+ }
+ 
+@@ -494,6 +500,7 @@ void V4L2Decoder::pumpDecodeRequest() {
+                 return;
+             }
+             mDrainCb = std::move(request.decodeCb);
++            mDrainLastSeen = false;
+             setState(State::Draining);
+             return;
+         }
+@@ -569,11 +576,15 @@ void V4L2Decoder::flush() {
+     if (mDrainCb) {
+         std::move(mDrainCb).Run(VideoDecoder::DecodeStatus::kAborted);
+     }
++    mDrainLastSeen = false;
+ 
+     // Streamoff both V4L2 queues to drop input and output buffers.
+     const bool isOutputStreaming = mOutputQueue->isStreaming();
+     mDevice->stopPolling();
+-    mOutputQueue->streamoff();
++    if (!mOutputQueue->streamoff()) {
++        onError();
++        return;
++    }
+ 
+     // Extract currently enqueued output picture buffers to be queued later first.
+     // See b/270003218 and b/297228544.
+@@ -590,12 +601,14 @@ void V4L2Decoder::flush() {
+     }
+     mFrameAtDevice.clear();
+ 
+-    mInputQueue->streamoff();
++    if (!mInputQueue->streamoff()) {
++        onError();
++        return;
++    }
+ 
+-    // Streamon both V4L2 queues.
+-    mInputQueue->streamon();
++    // Populate CAPTURE while both queues are stopped. Starting first let
++    // meson-vdec snapshot an incomplete pool (also after every seek).
+     if (isOutputStreaming) {
+-        mOutputQueue->streamon();
+         if (mUseDmabufOutput) {
+             /* h96 zero-copy: кадры, снятые с драйвера, лежат в
+              * mReuseFrameQueue — tryFetchVideoFrame() вернёт их в свои
+@@ -609,11 +622,17 @@ void V4L2Decoder::flush() {
+             while (auto ob = mOutputQueue->getFreeBuffer()) {
+                 if (!std::move(*ob).queueMMap()) {
+                     ALOGE("h96: flush MMAP re-queue failed");
+-                    break;
++                    onError();
++                    return;
+                 }
+             }
+         }
+     }
++    if (!mInputQueue->streamon() ||
++        (isOutputStreaming && !mOutputQueue->streamon())) {
++        onError();
++        return;
++    }
+ 
+     // If there is no free buffer at mOutputQueue, tryFetchVideoFrame() should be triggerred after
+     // a buffer is DQBUF from output queue. Now all the buffers are dropped at mOutputQueue, we
+@@ -692,6 +711,7 @@ void V4L2Decoder::serviceDeviceTask(bool event) {
+         const int32_t bitstreamId = static_cast<int32_t>(dequeuedBuffer->getTimeStamp().tv_sec);
+         const size_t bytesUsed = dequeuedBuffer->getPlaneBytesUsed(0);
+         const bool isLast = dequeuedBuffer->isLast();
++        if (mDrainCb && isLast) mDrainLastSeen = true;
+         ALOGV("DQBUF from output queue, bufferId=%zu, bitstreamId=%d, bytesused=%zu, isLast=%d",
+               bufferId, bitstreamId, bytesUsed, isLast);
+ 
+@@ -725,23 +745,24 @@ void V4L2Decoder::serviceDeviceTask(bool event) {
+             const size_t emptyId = bufferId;
+             dequeuedBuffer.reset();
+             auto ob = mOutputQueue->getFreeBuffer(emptyId);
+-            if (ob && !std::move(*ob).queueMMap()) {
++            if (!ob || !std::move(*ob).queueMMap()) {
+                 ALOGE("h96: re-queue empty MMAP buffer failed");
+                 onError();
+                 return;
+             }
+         } else {
+-            mDecodedMmapFrames.push(dequeuedBuffer);
++            // Transfer the only readable reference. Keeping a local copy
++            // would prevent tryOutputDecodedFrame() from reclaiming this slot.
++            mDecodedMmapFrames.push(std::move(dequeuedBuffer));
+             tryOutputDecodedFrame();
+             if (mReadyClientFrames.empty()) tryFetchVideoFrame();
+         }
+ 
+-        if (mDrainCb && isLast) {
+-            ALOGV("All buffers are drained.");
+-            sendV4L2DecoderCmd(true);
+-            std::move(mDrainCb).Run(VideoDecoder::DecodeStatus::kOk);
+-            setState(State::Idle);
+-        }
++        // LAST can be an empty marker behind frames awaiting a client block.
++        // Do not report EOS before those frames have reached the client.
++        if (mState == State::Error) return;
++        finishDrainIfReady();
++        if (mState == State::Error) return;
+     }
+ 
+     // Handle resolution change event.
+@@ -789,7 +810,10 @@ bool V4L2Decoder::changeResolution() {
+         mInitialEosBuffer = nullptr;
+     }
+ 
+-    if (!startOutputQueue(mMinNumOutputBuffers, V4L2_MEMORY_DMABUF)) {
++    // Fixed driver-owned capture buffers avoid late gralloc QBUF/recycle and
++    // buffer-ID churn. This remains hardware decoding, not a software codec.
++    mVideoFramePool.reset();
++    if (!startOutputQueue(mMinNumOutputBuffers, V4L2_MEMORY_MMAP)) {
+         ALOGE("Failed to start output queue during DRC.");
+         return false;
+     }
+@@ -802,9 +826,7 @@ bool V4L2Decoder::changeResolution() {
+                               ::base::BindOnce(&V4L2Decoder::pumpDecodeRequest, mWeakThis));
+     }
+ 
+-    // Release the previous VideoFramePool before getting a new one to guarantee only one pool
+-    // exists at the same time.
+-    mVideoFramePool.reset();
++    // The previous pool was released before reconfiguring the capture queue.
+     // Always use flexible pixel 420 format YCBCR_420_888 in Android.
+     mVideoFramePool = mGetPoolCb.Run(mCodedSize, HalPixelFormat::YCBCR_420_888,
+                                      mOutputQueue->allocatedBuffersCount());
+@@ -820,8 +842,7 @@ bool V4L2Decoder::changeResolution() {
+ bool V4L2Decoder::setupOutputFormat(const ui::Size& size) {
+     for (const uint32_t& pixfmt :
+          mDevice->enumerateSupportedPixelformats(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)) {
+-        if (std::find(kSupportedOutputFourccs.begin(), kSupportedOutputFourccs.end(), pixfmt) ==
+-            kSupportedOutputFourccs.end()) {
++        if (pixfmt != Fourcc::NM12) {
+             ALOGD("Pixel format %s is not supported, skipping...", fourccToString(pixfmt).c_str());
+             continue;
+         }
+@@ -837,6 +858,7 @@ bool V4L2Decoder::setupOutputFormat(const ui::Size& size) {
+ 
+ void V4L2Decoder::tryOutputDecodedFrame() {
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
++    if (mState == State::Error) return;
+ 
+     while (!mDecodedMmapFrames.empty() && !mReadyClientFrames.empty()) {
+         V4L2ReadableBufferRef src = mDecodedMmapFrames.front();
+@@ -847,49 +869,17 @@ void V4L2Decoder::tryOutputDecodedFrame() {
+         const int32_t bitstreamId = static_cast<int32_t>(src->getTimeStamp().tv_sec);
+         const size_t srcBufferId = src->bufferId();
+ 
+-        C2GraphicBlock* block = frame->getMutableBlock();
+-        C2GraphicView view = block->map().get();
+-        if (view.error() != C2_OK) {
+-            ALOGE("h96: map client block failed: %d", view.error());
+-            onError();
+-            return;
+-        }
+-        const C2PlanarLayout& layout = view.layout();
+-        uint8_t* dstY = view.data()[C2PlanarLayout::PLANE_Y];
+-        uint8_t* dstUV = view.data()[C2PlanarLayout::PLANE_U];
+-        const uint32_t dstStrideY = layout.planes[C2PlanarLayout::PLANE_Y].rowInc;
+-        const uint32_t dstStrideUV = layout.planes[C2PlanarLayout::PLANE_U].rowInc;
+-
+-        const uint8_t* srcY = static_cast<const uint8_t*>(src->getPlaneMapping(0));
+-        const uint8_t* srcUV = static_cast<const uint8_t*>(src->getPlaneMapping(1));
+-        if (!srcY || !srcUV || !dstY || !dstUV) {
+-            ALOGE("h96: plane mapping missing (srcY=%p srcUV=%p dstY=%p dstUV=%p)",
+-                  srcY, srcUV, dstY, dstUV);
++        // The mapping is released (and CPU writes flushed) before handing the
++        // graphic block to Surface. Do not keep a C2GraphicView alive across OutputCB.
++        if (!copyMmapFrame(src, frame.get())) {
++            ALOGE("h96: invalid MMAP/client plane layout or mapping");
+             onError();
+             return;
+         }
+ 
+-        const uint32_t width = static_cast<uint32_t>(mVisibleRect.width());
+-        const uint32_t height = static_cast<uint32_t>(mVisibleRect.height());
+-        const uint32_t srcStride = mCaptureStride ? mCaptureStride : width;
+-        /* h96: при совпадающих страйдах — одна длинная копия на плоскость. */
+-        if (srcStride == dstStrideY && srcStride == width) {
+-            memcpy(dstY, srcY, (size_t)srcStride * height);
+-        } else {
+-            for (uint32_t row = 0; row < height; ++row)
+-                memcpy(dstY + row * dstStrideY, srcY + row * srcStride, width);
+-        }
+-        if (srcStride == dstStrideUV && srcStride == width) {
+-            memcpy(dstUV, srcUV, (size_t)srcStride * (height / 2));
+-        } else {
+-            for (uint32_t row = 0; row < height / 2; ++row)
+-                memcpy(dstUV + row * dstStrideUV, srcUV + row * srcStride, width);
+-        }
+-
+-        const bool isLast = src->isLast();
+         src.reset();  /* вернуть MMAP-буфер драйверу */
+         auto ob = mOutputQueue->getFreeBuffer(srcBufferId);
+-        if (ob && !std::move(*ob).queueMMap()) {
++        if (!ob || !std::move(*ob).queueMMap()) {
+             ALOGE("h96: re-queue MMAP buffer failed");
+             onError();
+             return;
+@@ -900,20 +890,68 @@ void V4L2Decoder::tryOutputDecodedFrame() {
+         frame->setVisibleRect(mVisibleRect);
+         mOutputCb.Run(std::move(frame));
+ 
+-        if (mDrainCb && isLast) {
+-            std::move(mDrainCb).Run(VideoDecoder::DecodeStatus::kOk);
+-            setState(State::Idle);
+-        }
++        if (mState == State::Error) return;
+     }
++    finishDrainIfReady();
++    if (mState == State::Error) return;
+ 
+     /* держим небольшой запас клиентских блоков наготове */
+-    if (mReadyClientFrames.size() < 8 && mVideoFramePool) tryFetchVideoFrame();
++    if (mReadyClientFrames.size() < kMaxReadyClientFrames && mVideoFramePool)
++        tryFetchVideoFrame();
++}
++
++void V4L2Decoder::finishDrainIfReady() {
++    if (!mDrainCb || !mDrainLastSeen || !mDecodedMmapFrames.empty() ||
++        mState == State::Error) return;
++    if (!sendV4L2DecoderCmd(true)) {
++        onError();
++        return;
++    }
++    mDrainLastSeen = false;
++    setState(State::Idle);
++    std::move(mDrainCb).Run(VideoDecoder::DecodeStatus::kOk);
++}
++
++bool V4L2Decoder::copyMmapFrame(const V4L2ReadableBufferRef& src, VideoFrame* frame) {
++    if (src->planesCount() != 2) return false;
++    C2GraphicView view = frame->getMutableBlock()->map().get();
++    if (view.error() != C2_OK || !view.data()) return false;
++    const C2PlanarLayout layout = view.layout();
++    const uint32_t width = mCodedSize.width;
++    const uint32_t height = mCodedSize.height;
++    const C2Rect crop = view.crop();
++    if (layout.type != C2PlanarLayout::TYPE_YUV || layout.numPlanes != 3 ||
++        crop.left != 0 || crop.top != 0 || crop.width < width || crop.height < height)
++        return false;
++    h96::Plane8 dst[3];
++    for (unsigned int i = 0; i < 3; ++i) {
++        const C2PlaneInfo& p = layout.planes[i];
++        const uint32_t sampling = i == 0 ? 1 : 2;
++        if (p.rowInc <= 0 || p.colInc <= 0 || p.allocatedDepth != 8 ||
++            p.bitDepth != 8 || p.rightShift != 0 ||
++            p.colSampling != sampling || p.rowSampling != sampling)
++            return false;
++        dst[i] = {view.data()[i], static_cast<size_t>(p.rowInc),
++                  static_cast<size_t>(p.colInc)};
++    }
++    const uint8_t* y = static_cast<const uint8_t*>(src->getPlaneMapping(0));
++    const uint8_t* uv = static_cast<const uint8_t*>(src->getPlaneMapping(1));
++    const size_t yOffset = src->getPlaneDataOffset(0);
++    const size_t uvOffset = src->getPlaneDataOffset(1);
++    if (!y || !uv || yOffset > src->getPlaneSize(0) || uvOffset > src->getPlaneSize(1))
++        return false;
++    // Copy the coded rectangle; retain mVisibleRect for downstream cropping.
++    // Copying only visible width/height from (0,0) broke non-zero crop offsets.
++    return h96::copyNv12(y + yOffset, src->getPlaneSize(0) - yOffset, mCaptureStride,
++                         uv + uvOffset, src->getPlaneSize(1) - uvOffset,
++                         mCaptureChromaStride, width, height, dst[0], dst[1], dst[2]);
+ }
+ 
+ void V4L2Decoder::tryFetchVideoFrame() {
+     ATRACE_CALL();
+     ALOGV("%s()", __func__);
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
++    if (mState == State::Error) return;
+ 
+     if (!mVideoFramePool) {
+         ALOGE("mVideoFramePool is null, failed to get the instance after resolution change?");
+@@ -930,7 +968,7 @@ void V4L2Decoder::tryFetchVideoFrame() {
+             ALOGV("No free V4L2 output slot, wait for DQBUF.");
+             return;
+         }
+-    } else if (mReadyClientFrames.size() >= 10) {
++    } else if (mReadyClientFrames.size() >= kMaxReadyClientFrames) {
+         ALOGV("Enough client frames queued, ignore.");
+         return;
+     }
+@@ -961,6 +999,7 @@ void V4L2Decoder::onVideoFrameReady(
+         std::optional<VideoFramePool::FrameWithBlockId> frameWithBlockId) {
+     ALOGV("%s()", __func__);
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
++    if (mState == State::Error) return;
+ 
+     if (!frameWithBlockId) {
+         ALOGE("Got nullptr VideoFrame.");
+@@ -1110,6 +1149,7 @@ void V4L2Decoder::onError() {
+     ALOGV("%s()", __func__);
+     ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
+ 
++    if (mState == State::Error) return;
+     setState(State::Error);
+     mErrorCb.Run();
+ }
+diff --git a/v4l2/V4L2Device.cpp b/v4l2/V4L2Device.cpp
+index c235830..6a5e64b 100644
+--- a/v4l2/V4L2Device.cpp
++++ b/v4l2/V4L2Device.cpp
+@@ -671,6 +671,12 @@ size_t V4L2ReadableBuffer::getPlaneBytesUsed(const size_t plane) const {
+     return mBufferData->mV4l2Planes[plane].bytesused;
+ }
+ 
++size_t V4L2ReadableBuffer::getPlaneSize(const size_t plane) const {
++    DCHECK_CALLED_ON_VALID_SEQUENCE(mSequenceChecker);
++    if (plane >= planesCount()) return 0;
++    return mBufferData->mV4l2Planes[plane].length;
++}
++
+ size_t V4L2ReadableBuffer::getPlaneDataOffset(const size_t plane) const {
+     DCHECK_CALLED_ON_VALID_SEQUENCE(mSequenceChecker);
+     ALOG_ASSERT(mBufferData);
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+index c955e5a..eaf7653 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -133,6 +133,7 @@ private:
+     GetPoolCB mGetPoolCb;
+     OutputCB mOutputCb;
+     DecodeCB mDrainCb;
++    bool mDrainLastSeen = false;
+     ErrorCB mErrorCb;
+ 
+     ui::Size mCodedSize;
+@@ -156,9 +157,12 @@ private:
+     std::queue<std::unique_ptr<VideoFrame>> mReadyClientFrames;
+     std::queue<V4L2ReadableBufferRef> mDecodedMmapFrames;
+     uint32_t mCaptureStride = 0;
++    uint32_t mCaptureChromaStride = 0;
+     bool mUseDmabufOutput = false;
+     std::vector<std::unique_ptr<VideoFrame>> mQuarantineBlocks;
+     void tryOutputDecodedFrame();
++    void finishDrainIfReady();
++    bool copyMmapFrame(const V4L2ReadableBufferRef& src, VideoFrame* frame);
+ 
+     State mState = State::Idle;
+ 
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
+index 29d4a2e..01774b6 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Device.h
+@@ -159,6 +159,8 @@ public:
+     size_t planesCount() const;
+     // Returns the number of bytes used for |plane|.
+     size_t getPlaneBytesUsed(size_t plane) const;
++    // Allocated length of a dequeued plane, including any data offset.
++    size_t getPlaneSize(size_t plane) const;
+     // Returns the data offset for |plane|.
+     size_t getPlaneDataOffset(size_t plane) const;
+     // This method can only be used with MMAP buffers. It will return a pointer to the data of the

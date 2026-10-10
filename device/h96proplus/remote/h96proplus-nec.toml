@@ -1,0 +1,83 @@
+# Карта штатного ИК-пульта H96 Pro Plus для ir-keytable / RC-core.
+#
+# Составлена из /system/etc/remote.conf установленной прошивки — то есть коды
+# не подобраны экспериментально, а взяты у vendor.
+#
+# Протокол и адрес оттуда же:
+#     factory_code = 0x40400001
+#         0x4040 — custom code (адрес устройства)
+#         0001   — индекс
+#     work_mode    = 0   (software mode)
+#     repeat_enable = 1, repeat_delay 130 мс, repeat_period 120 мс
+#
+# ⚠️ ПРОВЕРИТЬ НА УСТРОЙСТВЕ (Milestone 8):
+#   1. Полный scancode. Здесь принято 0x4040<код кнопки> — обычная схема для
+#      NEC-расширенного. Реальные значения покажет:
+#          ir-keytable -t
+#      Если адрес окажется иным, поправить старшие 16 бит у всех строк разом.
+#   2. Кнопки, помеченные ниже знаком вопроса: у vendor им назначены коды,
+#      которые в Linux означают не то, что написано в комментарии.
+#
+# Установка:
+#     cp h96proplus-nec.toml /lib/udev/rc_keymaps/
+#     ir-keytable -a /etc/rc_maps.cfg -s rc0
+# либо разово:
+#     ir-keytable -c -w h96proplus-nec.toml -s rc0
+
+[[protocols]]
+name = "h96proplus"
+protocol = "nec"
+variant = "nec32"
+
+[protocols.scancodes]
+
+# --- навигация: главное, без чего пультом пользоваться нельзя ---
+0x40400b = "KEY_UP"
+0x40400e = "KEY_DOWN"
+0x404010 = "KEY_LEFT"
+0x404011 = "KEY_RIGHT"
+0x40400d = "KEY_ENTER"          # у vendor код 97; для Android нужен именно ENTER/DPAD_CENTER
+
+# --- системные ---
+0x40404d = "KEY_POWER"
+0x404042 = "KEY_BACK"           # у vendor код 1 (ESC); для TV правильнее BACK
+0x404045 = "KEY_MENU"
+0x40401a = "KEY_HOME"
+0x404054 = "KEY_SETUP"          # «setting»
+
+# --- звук ---
+0x404043 = "KEY_MUTE"
+0x404018 = "KEY_VOLUMEUP"
+0x404017 = "KEY_VOLUMEDOWN"
+
+# --- воспроизведение ---
+0x404053 = "KEY_PLAYPAUSE"      # у vendor «media_pause»
+0x40401e = "KEY_NEXTSONG"
+0x40401f = "KEY_PREVIOUSSONG"
+0x40405d = "KEY_MEDIA"          # «MEDIAPLAY»
+
+# --- цифры ---
+0x404000 = "KEY_0"
+0x404001 = "KEY_1"
+0x404002 = "KEY_2"
+0x404003 = "KEY_3"
+0x404004 = "KEY_4"
+0x404005 = "KEY_5"
+0x404006 = "KEY_6"
+0x404007 = "KEY_7"
+0x404008 = "KEY_8"
+0x404009 = "KEY_9"
+
+# --- редактирование и поиск ---
+0x40400c = "KEY_BACKSPACE"      # «DEL»
+0x404066 = "KEY_SEARCH"
+0x404044 = "KEY_DOT"            # «period»
+
+# --- функциональные кнопки этого пульта ---
+# Названия у vendor описательные, поэтому назначены ближайшие по смыслу
+# стандартные коды. Что именно они делают — проверить на M8.
+0x40405c = "KEY_APPSELECT"      # «ALLAPP»
+0x40405e = "KEY_MEDIA"          # «KODI» — отдельной кнопки под Kodi в Linux нет
+0x404057 = "KEY_YELLOW"         # «PROG_YELLOW/EXPLORER»
+0x40405b = "KEY_BLUE"           # «PROG_BLUE/MUSIC»
+0x4040f1 = "KEY_F10"            # заводской тест — в обычной работе не нужен

@@ -1,0 +1,38 @@
+# Build outputs, device dumps and downloaded inputs never belong in git.
+/out/
+*.img
+*.bin
+*.raw
+*.apk
+*.jar
+!launcher/gradle/wrapper/gradle-wrapper.jar
+*.o
+*.ko
+.config
+.config.old
+
+# Firmware fetched by build/fetch-firmware.sh (redistributable, but not stored here)
+device/h96proplus/firmware/LICENSE.amlogic_vdec
+kernel/firmware/ath10k/QCA9377/hw1.0/LICENSE.QualcommAtheros_ath10k
+
+# Mesa/Panfrost, libdrm, libc++ are built locally; prebuilt .so files are not distributed
+device/h96proplus/mesa/lib64/
+
+# Your installer data identifies YOUR unit (eMMC CID): keep it private
+*.profile.json
+*.journal.json
+*.plan.json
+backup-manifest.json
+
+# Gradle / IDE / Python
+launcher/.gradle/
+launcher/**/build/
+launcher/local.properties
+tools/dectest/build/
+*.iml
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

@@ -1,0 +1,548 @@
+H96: userspace remote translator and clean Android POWER policy.
+
+Apply from the AOSP root after checking the matching framework patch.
+Requires RAW meson-ir and CONFIG_INPUT_UINPUT=y in the actual kernel.
+
+diff --git a/device/h96proplus/device.mk b/device/h96proplus/device.mk
+index 494a313..eb791cc 100644
+--- a/device/h96proplus/device.mk
++++ b/device/h96proplus/device.mk
+@@ -229,10 +229,12 @@ PRODUCT_PACKAGES += \
+ # с адресом 0x4040, а реальный шлёт 0x01. Приставки продаются с разными
+ # пультами — верить надо замеру, а не конфигурации из образа.
+ PRODUCT_PACKAGES += \
+-    irkeymap
++    irkeymap \
++    h96mouse
+ 
+ PRODUCT_COPY_FILES += \
+     $(LOCAL_PATH)/remote/h96-remote.map:$(TARGET_COPY_OUT_VENDOR)/etc/h96-remote.map \
++    $(LOCAL_PATH)/remote/meson-ir.kl:$(TARGET_COPY_OUT_VENDOR)/usr/keylayout/h96-remote.kl \
+     $(LOCAL_PATH)/remote/remote.conf:$(TARGET_COPY_OUT_VENDOR)/etc/remote.conf \
+     $(LOCAL_PATH)/apply-max-performance.sh:$(TARGET_COPY_OUT_VENDOR)/etc/apply-max-performance.sh
+ 
+@@ -354,7 +356,7 @@ PRODUCT_PACKAGES += \
+ PRODUCT_REQUIRES_INSECURE_EXECMEM_FOR_SWIFTSHADER := true
+ 
+ # 04.09.2026: Mali ВКЛЮЧЕНА (egl=mesa). UI на Mali-T820/Panfrost (GLES 3.1),
+-# загрузка ~90 с. Mesa/Panfrost на Midgard НЕ импортирует NV12-буферы декодера
++# загрузка ~90 с. В этой сборке не работал импорт NV12-буферов декодера
+ # в GPU-композицию, поэтому видео идёт аппаратным underlay-планом VD1, а НЕ
+ # через SkiaRenderEngine. Чтобы это заработало без чёрного видео и рестарта SF:
+ #   1) SkiaRenderEngine/GaneshBackendTexture — мягкий пропуск несъедобных
+@@ -364,7 +366,8 @@ PRODUCT_REQUIRES_INSECURE_EXECMEM_FOR_SWIFTSHADER := true
+ #      full-CRTC), только YUV-видео -> плоскость VD1; флаттенинг отключён,
+ #      иначе на паузе/статике видео-плоскость гасла и видео чернело.
+ # Откат: вернуть ro.hardware.egl=angle (библиотеки angle тоже в vendor).
+-# ⚠️ panfrost на GXM спамит в dmesg «power transition timeout» — косметика.
++# Panfrost power-transition timeouts требуют отдельной проверки runtime PM.
++# Не считать их косметикой без замера; см. docs/reports/2026-09-06-stability-fixes.md.
+ PRODUCT_VENDOR_PROPERTIES += \
+     ro.hardware.gralloc=minigbm \
+     ro.hardware.egl=mesa \
+diff --git a/device/h96proplus/h96mouse/Android.bp b/device/h96proplus/h96mouse/Android.bp
+index 99a248f..fc59ce6 100644
+--- a/device/h96proplus/h96mouse/Android.bp
++++ b/device/h96proplus/h96mouse/Android.bp
+@@ -2,6 +2,6 @@ cc_binary {
+     name: "h96mouse",
+     srcs: ["h96mouse.c"],
+     vendor: true,
+-    cflags: ["-Wall"],
++    cflags: ["-Wall", "-Wextra", "-Werror"],
+     init_rc: ["h96mouse.rc"],
+ }
+diff --git a/device/h96proplus/h96mouse/h96mouse.c b/device/h96proplus/h96mouse/h96mouse.c
+index 1163151..1201ae0 100644
+--- a/device/h96proplus/h96mouse/h96mouse.c
++++ b/device/h96proplus/h96mouse/h96mouse.c
+@@ -1,136 +1,153 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * h96mouse — режим мыши для ИК-пульта H96 Pro Plus (userspace).
+- *
+- * Приёмник meson-ir работает в RAW-режиме, поэтому мышь в драйвере ядра
+- * (ветка аппаратного декодера) не активируется. Переключать приёмник в
+- * HW-декод рискованно (может отвалиться весь пульт). Поэтому мышь делаем
+- * в userspace, НЕ трогая обычные клавиши:
+- *
+- *   - читаем /dev/input/event0 (meson-ir);
+- *   - кнопка мыши пульта = ИК-сканкод 0x100 (EV_MSC/MSC_SCAN, в keymap не
+- *     привязана) — по ней ВКЛючаем/ВЫКЛючаем режим мыши;
+- *   - в режиме мыши EVIOCGRAB захватывает пульт (D-pad больше НЕ навигирует),
+- *     стрелки двигают курсор (REL_X/REL_Y), OK = левый клик (BTN_LEFT);
+- *   - повторное нажатие кнопки мыши (или BACK) выключает режим и отпускает
+- *     захват — обычные клавиши снова работают.
+- *
+- * Курсор рисует сам Android: устройство uinput объявлено мышью
+- * (REL_X+REL_Y+BTN_LEFT => класс CURSOR), проверено sendevent-инъекцией.
++ * meson-ir (RAW NEC) -> virtual keyboard + virtual mouse.
++ * One exclusive reader, one toggle per key press, no event-number assumption.
++ * The measured 0x100 scan is mapped to KEY_F13 by h96-remote.map.
+  */
+ #include <errno.h>
+ #include <fcntl.h>
++#include <glob.h>
++#include <signal.h>
+ #include <stdint.h>
+ #include <stdio.h>
+-#include <string.h>
++#include <sys/ioctl.h>
+ #include <unistd.h>
+-#include <linux/input.h>
+ #include <linux/uinput.h>
+ 
+-#define IR_DEV       "/dev/input/event0"
+-#define MOUSE_SCAN   0x100     /* ИК-сканкод кнопки мыши (addr 0x01, cmd 0x00) */
+-#define STEP         28        /* пикселей за одно нажатие/повтор стрелки */
++#include "h96mouse_core.h"
+ 
+-static int emit(int fd, int type, int code, int val)
++#define KEY_BITS_BYTES ((KEY_CNT + 7) / 8)
++static volatile sig_atomic_t stopping;
++
++struct output_devices { int keyboard, mouse; bool failed; };
++
++static void stop_handler(int signo)
+ {
+-	struct input_event ev;
+-	memset(&ev, 0, sizeof(ev));
+-	ev.type = type; ev.code = code; ev.value = val;
+-	return write(fd, &ev, sizeof(ev)) == (ssize_t)sizeof(ev) ? 0 : -1;
++    (void)signo;
++    stopping = 1;
+ }
+ 
+-static void syn(int fd) { emit(fd, EV_SYN, SYN_REPORT, 0); }
++static bool key_bit(const uint8_t *bits, unsigned int key)
++{
++    return (bits[key / 8] & (1U << (key % 8))) != 0;
++}
+ 
+-static int make_uinput(void)
++static void output_event(void *opaque, enum h96_target target,
++                         int type, int code, int value)
+ {
+-	int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+-	if (fd < 0) { perror("open /dev/uinput"); return -1; }
++    struct output_devices *out = opaque;
++    struct input_event ev = {0};
++    ev.type = type;
++    ev.code = code;
++    ev.value = value;
++    const int fd = target == H96_KEYBOARD ? out->keyboard : out->mouse;
++    ssize_t n;
++    do {
++        n = write(fd, &ev, sizeof(ev));
++    } while (n < 0 && errno == EINTR && !stopping);
++    if (n != (ssize_t)sizeof(ev))
++        out->failed = true;
++}
+ 
+-	ioctl(fd, UI_SET_EVBIT, EV_KEY);
+-	ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
+-	ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
+-	ioctl(fd, UI_SET_EVBIT, EV_REL);
+-	ioctl(fd, UI_SET_RELBIT, REL_X);
+-	ioctl(fd, UI_SET_RELBIT, REL_Y);
++static int open_remote(uint8_t *keys)
++{
++    glob_t paths = {0};
++    int found = -1;
++    if (glob("/dev/input/event*", 0, NULL, &paths) != 0)
++        return -1;
++    for (size_t i = 0; i < paths.gl_pathc; ++i) {
++        int fd = open(paths.gl_pathv[i], O_RDONLY | O_CLOEXEC);
++        if (fd < 0)
++            continue;
++        char name[128] = {0};
++        memset(keys, 0, KEY_BITS_BYTES);
++        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0 &&
++            strcmp(name, "meson-ir") == 0 &&
++            ioctl(fd, EVIOCGBIT(EV_KEY, KEY_BITS_BYTES), keys) >= 0 &&
++            key_bit(keys, KEY_POWER) && key_bit(keys, KEY_UP) &&
++            key_bit(keys, H96_TOGGLE_KEY)) {
++            found = fd;
++            fprintf(stderr, "h96mouse: input %s (%s)\n", paths.gl_pathv[i], name);
++            break;
++        }
++        close(fd);
++    }
++    globfree(&paths);
++    return found;
++}
+ 
+-	struct uinput_setup us;
+-	memset(&us, 0, sizeof(us));
+-	us.id.bustype = BUS_VIRTUAL;
+-	us.id.vendor = 0x1996; us.id.product = 0x0001; us.id.version = 1;
+-	snprintf(us.name, sizeof(us.name), "h96 remote mouse");
+-	if (ioctl(fd, UI_DEV_SETUP, &us) < 0) { perror("UI_DEV_SETUP"); close(fd); return -1; }
+-	if (ioctl(fd, UI_DEV_CREATE) < 0)     { perror("UI_DEV_CREATE"); close(fd); return -1; }
+-	return fd;
++static int make_device(bool mouse, const uint8_t *keys)
++{
++    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
++    if (fd < 0)
++        return -1;
++    if (ioctl(fd, UI_SET_EVBIT, EV_KEY) < 0)
++        goto fail;
++    if (mouse) {
++        if (ioctl(fd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
++            ioctl(fd, UI_SET_EVBIT, EV_REL) < 0 ||
++            ioctl(fd, UI_SET_RELBIT, REL_X) < 0 ||
++            ioctl(fd, UI_SET_RELBIT, REL_Y) < 0)
++            goto fail;
++    } else {
++        for (unsigned int key = 1; key < KEY_CNT; ++key)
++            if (key != H96_TOGGLE_KEY && key_bit(keys, key) &&
++                ioctl(fd, UI_SET_KEYBIT, key) < 0)
++                goto fail;
++    }
++    struct uinput_setup setup = {0};
++    setup.id.bustype = BUS_VIRTUAL;
++    snprintf(setup.name, sizeof(setup.name), "%s",
++             mouse ? "h96-remote-mouse" : "h96-remote");
++    if (ioctl(fd, UI_DEV_SETUP, &setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0)
++        goto fail;
++    return fd;
++fail:
++    close(fd);
++    return -1;
+ }
+ 
+ int main(void)
+ {
+-	int uin = make_uinput();
+-	if (uin < 0) return 1;
+-
+-	int ir = open(IR_DEV, O_RDONLY);
+-	if (ir < 0) { perror("open " IR_DEV); return 1; }
+-
+-	int mouse_mode = 0;
+-	uint32_t last_scan = 0;
+-
+-	fprintf(stderr, "h96mouse: gotov, kknopka myshi scan=0x%x\n", MOUSE_SCAN);
+-
+-	struct input_event ev;
+-	while (read(ir, &ev, sizeof(ev)) == (ssize_t)sizeof(ev)) {
+-		if (ev.type == EV_MSC && ev.code == MSC_SCAN) {
+-			last_scan = ev.value;
+-			if (ev.value == MOUSE_SCAN) {
+-				mouse_mode = !mouse_mode;
+-				if (mouse_mode)
+-					ioctl(ir, EVIOCGRAB, 1);
+-				else
+-					ioctl(ir, EVIOCGRAB, 0);
+-				fprintf(stderr, "h96mouse: mouse_mode=%d\n", mouse_mode);
+-			}
+-			continue;
+-		}
+-
+-		if (!mouse_mode)
+-			continue;
+-
+-		if (ev.type == EV_KEY) {
+-			int down = (ev.value != 0);  /* 1=press, 2=repeat, 0=release */
+-			switch (ev.code) {
+-			case KEY_UP:
+-				if (down) { emit(uin, EV_REL, REL_Y, -STEP); syn(uin); }
+-				break;
+-			case KEY_DOWN:
+-				if (down) { emit(uin, EV_REL, REL_Y, STEP); syn(uin); }
+-				break;
+-			case KEY_LEFT:
+-				if (down) { emit(uin, EV_REL, REL_X, -STEP); syn(uin); }
+-				break;
+-			case KEY_RIGHT:
+-				if (down) { emit(uin, EV_REL, REL_X, STEP); syn(uin); }
+-				break;
+-			case KEY_ENTER:
+-			case KEY_SELECT:
+-			case KEY_KPENTER:
+-				/* OK -> левый клик (по фронту нажатия/отпускания) */
+-				if (ev.value == 1) { emit(uin, EV_KEY, BTN_LEFT, 1); syn(uin); }
+-				else if (ev.value == 0) { emit(uin, EV_KEY, BTN_LEFT, 0); syn(uin); }
+-				break;
+-			case KEY_BACK:
+-			case KEY_ESC:
+-				/* BACK выходит из режима мыши */
+-				if (ev.value == 1) {
+-					mouse_mode = 0;
+-					ioctl(ir, EVIOCGRAB, 0);
+-					fprintf(stderr, "h96mouse: mouse_mode=0 (back)\n");
+-				}
+-				break;
+-			default:
+-				break;
+-			}
+-		}
+-		(void)last_scan;
+-	}
+-
+-	return 0;
++    struct sigaction action = {0};
++    action.sa_handler = stop_handler;
++    sigemptyset(&action.sa_mask);
++    sigaction(SIGTERM, &action, NULL);
++    sigaction(SIGINT, &action, NULL);
++    uint8_t keys[KEY_BITS_BYTES];
++    int ir = open_remote(keys);
++    if (ir < 0) {
++        fprintf(stderr, "h96mouse: mapped meson-ir not ready; init will retry\n");
++        return 1;
++    }
++    struct output_devices out = { .keyboard = -1, .mouse = -1 };
++    out.keyboard = make_device(false, keys);
++    out.mouse = make_device(true, keys);
++    if (out.keyboard < 0 || out.mouse < 0 || ioctl(ir, EVIOCGRAB, 1) < 0) {
++        perror("h96mouse: uinput/EVIOCGRAB");
++        if (out.keyboard >= 0) close(out.keyboard);
++        if (out.mouse >= 0) close(out.mouse);
++        close(ir);
++        return 1;
++    }
++    struct h96_remote remote = { .emit = output_event, .opaque = &out };
++    while (!stopping && !out.failed) {
++        struct input_event ev;
++        ssize_t n = read(ir, &ev, sizeof(ev));
++        if (n < 0 && errno == EINTR)
++            continue;
++        if (n != (ssize_t)sizeof(ev)) {
++            out.failed = true;
++            break;
++        }
++        h96_process(&remote, &ev);
++    }
++    h96_release(&remote);
++    ioctl(ir, EVIOCGRAB, 0);
++    ioctl(out.mouse, UI_DEV_DESTROY);
++    ioctl(out.keyboard, UI_DEV_DESTROY);
++    close(out.mouse);
++    close(out.keyboard);
++    close(ir);
++    return out.failed ? 1 : 0;
+ }
+diff --git a/device/h96proplus/h96mouse/h96mouse.rc b/device/h96proplus/h96mouse/h96mouse.rc
+index cd7cfc7..5928629 100644
+--- a/device/h96proplus/h96mouse/h96mouse.rc
++++ b/device/h96proplus/h96mouse/h96mouse.rc
+@@ -2,4 +2,4 @@ service h96mouse /vendor/bin/h96mouse
+     class main
+     user root
+     group input
+-    seclabel u:r:vendor_init:s0
++    restart_period 5
+diff --git a/device/h96proplus/h96mouse/h96mouse_core.h b/device/h96proplus/h96mouse/h96mouse_core.h
+new file mode 100644
+index 0000000..da16828
+--- /dev/null
++++ b/device/h96proplus/h96mouse/h96mouse_core.h
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: GPL-2.0
++#ifndef H96MOUSE_CORE_H
++#define H96MOUSE_CORE_H
++
++#include <linux/input.h>
++#include <stdbool.h>
++#include <string.h>
++
++#define H96_TOGGLE_KEY KEY_F13
++#define H96_MOUSE_STEP 18
++
++enum h96_target { H96_KEYBOARD, H96_MOUSE };
++enum h96_route { H96_DROP, H96_KEY, H96_POINTER };
++typedef void (*h96_emit_fn)(void *, enum h96_target, int, int, int);
++
++struct h96_remote {
++    bool mouse_mode;
++    bool syncing;
++    bool left_down;
++    bool down[KEY_CNT];
++    unsigned char route[KEY_CNT];
++    h96_emit_fn emit;
++    void *opaque;
++};
++
++static inline void h96_emit(struct h96_remote *r, enum h96_target target,
++                            int type, int code, int value)
++{
++    r->emit(r->opaque, target, type, code, value);
++    r->emit(r->opaque, target, EV_SYN, SYN_REPORT, 0);
++}
++
++/* Release synthetic holds, but suppress physical repeats until key-up.
++ * Used on mode switches, SYN_DROPPED and daemon shutdown. */
++static inline void h96_release(struct h96_remote *r)
++{
++    for (unsigned int key = 0; key < KEY_CNT; ++key) {
++        if (r->route[key] == H96_KEY && r->down[key])
++            h96_emit(r, H96_KEYBOARD, EV_KEY, key, 0);
++        r->route[key] = H96_DROP;
++    }
++    if (r->left_down)
++        h96_emit(r, H96_MOUSE, EV_KEY, BTN_LEFT, 0);
++    r->left_down = false;
++}
++
++static inline bool h96_is_ok(unsigned int key)
++{
++    return key == KEY_ENTER || key == KEY_KPENTER ||
++           key == KEY_SELECT || key == KEY_RIGHTCTRL;
++}
++
++static inline bool h96_move(struct h96_remote *r, unsigned int key)
++{
++    switch (key) {
++    case KEY_UP:    h96_emit(r, H96_MOUSE, EV_REL, REL_Y, -H96_MOUSE_STEP); break;
++    case KEY_DOWN:  h96_emit(r, H96_MOUSE, EV_REL, REL_Y, H96_MOUSE_STEP); break;
++    case KEY_LEFT:  h96_emit(r, H96_MOUSE, EV_REL, REL_X, -H96_MOUSE_STEP); break;
++    case KEY_RIGHT: h96_emit(r, H96_MOUSE, EV_REL, REL_X, H96_MOUSE_STEP); break;
++    default: return false;
++    }
++    return true;
++}
++
++static inline void h96_process(struct h96_remote *r, const struct input_event *ev)
++{
++    if (ev->type == EV_SYN && ev->code == SYN_DROPPED) {
++        h96_release(r);
++        memset(r->down, 0, sizeof(r->down));
++        r->syncing = true;
++        return;
++    }
++    if (r->syncing) {
++        if (ev->type == EV_SYN && ev->code == SYN_REPORT)
++            r->syncing = false;
++        return;
++    }
++    if (ev->type != EV_KEY || ev->code >= KEY_CNT ||
++        ev->value < 0 || ev->value > 2)
++        return;
++
++    const unsigned int key = ev->code;
++    int value = ev->value;
++    if (value == 1 && r->down[key])
++        value = 2;
++    if (value == 2 && !r->down[key])
++        return;
++
++    if (key == H96_TOGGLE_KEY) {
++        if (value == 1) {
++            h96_release(r);
++            r->mouse_mode = !r->mouse_mode;
++        }
++        r->down[key] = value != 0;
++        return;
++    }
++
++    if (value == 0) {
++        if (r->route[key] == H96_KEY && r->down[key])
++            h96_emit(r, H96_KEYBOARD, EV_KEY, key, 0);
++        else if (r->route[key] == H96_POINTER && h96_is_ok(key) && r->left_down) {
++            h96_emit(r, H96_MOUSE, EV_KEY, BTN_LEFT, 0);
++            r->left_down = false;
++        }
++        r->down[key] = false;
++        r->route[key] = H96_DROP;
++        return;
++    }
++    if (value == 1) {
++        r->down[key] = true;
++        if (r->mouse_mode && h96_move(r, key)) {
++            r->route[key] = H96_POINTER;
++            return;
++        }
++        if (r->mouse_mode && h96_is_ok(key)) {
++            r->route[key] = H96_POINTER;
++            if (!r->left_down)
++                h96_emit(r, H96_MOUSE, EV_KEY, BTN_LEFT, 1);
++            r->left_down = true;
++            return;
++        }
++        /* POWER, HOME, BACK, volume and every other key remain usable. */
++        r->route[key] = H96_KEY;
++    }
++    if (r->route[key] == H96_KEY)
++        h96_emit(r, H96_KEYBOARD, EV_KEY, key, value);
++    else if (r->route[key] == H96_POINTER && r->mouse_mode)
++        h96_move(r, key);
++}
++#endif
+diff --git a/device/h96proplus/overlay/frameworks/base/core/res/res/values/config.xml b/device/h96proplus/overlay/frameworks/base/core/res/res/values/config.xml
+index cbfda35..aab21ee 100644
+--- a/device/h96proplus/overlay/frameworks/base/core/res/res/values/config.xml
++++ b/device/h96proplus/overlay/frameworks/base/core/res/res/values/config.xml
+@@ -7,6 +7,10 @@
+   действуют С ПЕРВОЙ СЕКУНДЫ и не зависят от состояния /data.
+ -->
+ <resources>
++    <!-- Device-specific value implemented by aosp-patches/0012.
++         Short POWER = Android ShutdownThread, no confirmation, not suspend.
++         The matching framework patch is mandatory; stock AOSP has no such value. -->
++    <integer name="config_shortPressOnPowerBehavior">100</integer>
+ 
+     <!-- ⛔ ЭКРАН БЛОКИРОВКИ ОТКЛЮЧЁН НАВСЕГДА.
+ 
+diff --git a/device/h96proplus/remote/README.md b/device/h96proplus/remote/README.md
+index fad6be9..b9fc6ca 100644
+--- a/device/h96proplus/remote/README.md
++++ b/device/h96proplus/remote/README.md
+@@ -106,3 +106,19 @@ Bluetooth пульт зависит от M7
+ 
+ Устройство при этом остаётся управляемым, так что провал по ИК не
+ блокирует проект.
++# Профиль 2026-09-06: RAW NEC + h96mouse
++
++Активная карта Android — `h96-remote.map`: измеренный пульт с адресом 0x01,
++кнопка мыши `0x100 -> KEY_F13 (183)`. TOML ниже — старый справочник другой
++партии, он не используется службой `h96-irkeymap`.
++
++`h96mouse` входит в PRODUCT_PACKAGES, создаёт `h96-remote` и
++`h96-remote-mouse`. Первая кнопка мыши включает режим, вторая выключает.
++Стрелки перемещают курсор, OK нажимает/отпускает левую кнопку. BACK, HOME,
++громкость и POWER остаются клавишами, режим мыши не выключают.
++
++Обязательно: RAW `amlogic,meson-gxbb-ir`, `CONFIG_INPUT_UINPUT=y`,
++карта с KEY_F13 и патч framework 0012. В HW-ветке ядра 0012/0019 перехватывают
++кнопки раньше userspace, поэтому два обработчика одновременно использовать нельзя.
++Холодное включение после poweroff обслуживает загрузчик/SCP, а не этот демон.
++
+diff --git a/device/h96proplus/remote/h96-remote.map b/device/h96proplus/remote/h96-remote.map
+index b5e65a2..dcc7328 100644
+--- a/device/h96proplus/remote/h96-remote.map
++++ b/device/h96proplus/remote/h96-remote.map
+@@ -30,6 +30,7 @@
+ 0x111 172    # домой          KEY_HOMEPAGE
+ 0x14c 139    # меню           KEY_MENU
+ 0x140 116    # выключение     KEY_POWER
++0x100 183    # мышь           KEY_F13; consumes press/release in h96mouse
+ 
+ # --- громкость ---
+ 0x118 115    # громкость +    KEY_VOLUMEUP
+diff --git a/device/h96proplus/sepolicy/file_contexts b/device/h96proplus/sepolicy/file_contexts
+index 895db5a..4fb7b69 100644
+--- a/device/h96proplus/sepolicy/file_contexts
++++ b/device/h96proplus/sepolicy/file_contexts
+@@ -33,6 +33,7 @@
+ # «File /vendor/bin/irkeymap has incorrect label or no domain transition».
+ # Домен объявлен в h96_setup.te.
+ /vendor/bin/irkeymap                                                     u:object_r:h96_setup_exec:s0
++/vendor/bin/h96mouse                                                     u:object_r:h96mouse_exec:s0
+ 
+ # Драйвер графики Mesa/panfrost лежит в /vendor/lib64/dri. Каталог egl рядом
+ # платформа метит сама, а dri — нет: без этой строки библиотека драйвера
+diff --git a/device/h96proplus/sepolicy/h96mouse.te b/device/h96proplus/sepolicy/h96mouse.te
+new file mode 100644
+index 0000000..5f865d7
+--- /dev/null
++++ b/device/h96proplus/sepolicy/h96mouse.te
+@@ -0,0 +1,8 @@
++# Native IR input translator. No shell, network, properties or power privileges.
++type h96mouse, domain;
++type h96mouse_exec, vendor_file_type, exec_type, file_type;
++init_daemon_domain(h96mouse)
++
++allow h96mouse input_device:dir r_dir_perms;
++allow h96mouse input_device:chr_file r_file_perms;
++allow h96mouse uinput_device:chr_file rw_file_perms;

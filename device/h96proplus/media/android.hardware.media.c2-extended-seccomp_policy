@@ -1,0 +1,9 @@
+# Дополнение к базовой seccomp-политике android.hardware.media.c2-default
+# (external/v4l2_codec2). Базовая писалась под ChromeOS/ARCVM и не знает
+# системных вызовов, которые дергает наш стек на GXM.
+#
+# eventfd2: libchrome MessagePump создаёт eventfd при старте потока
+# декодера; без разрешения minijail убивает сервис SIGSYS прямо в
+# MediaCodec::start (26.08, «blocked syscall: eventfd2», клиент видел
+# «Codec2 component died»).
+eventfd2: 1

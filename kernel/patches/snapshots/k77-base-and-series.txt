@@ -1,0 +1,57 @@
+kernel_base_commit=6c8eb7356c229d97989e5bc5ad04afc0852badbc
+kernel_describe=v7.1-4-g6c8eb7356-dirty
+kernelversion=7.1.0
+config_sha256=23fe702ec812ae0b1c0b43fcb00b040b8e2e3e480687239f9a62d2361e377298
+dts_sha256=e84b56b7aa5de78a2453dab18426134f1fa82fb377c2e891799bd0c7133a56a8
+patch_series_in_repo:
+0001-vdec-deferred-drain.patch
+0002-meson-gxbb-wdt-start-at-probe.patch
+0003-vdec-vp9-ref-lifecycle-and-seek.patch
+0004-vdec-hevc-vp9-single-dmabuf-chroma.patch
+0005-vdec-debug-frame-map-dump.patch
+0006-bt-kernel-configs.txt
+0007-vdec-seek-teardown-and-buffer-count.patch
+0008-vdec-srcchange-loop-and-vp9-noshow-reclaim.patch
+0009-vdec-remove-esparser-cancel-deadlock.patch
+0010-vdec-buffer-balance-and-4k-stride.patch
+0010-vdec-buffer-balance-start.patch
+0012-meson-ir-remote-mouse-mode.patch
+0013-meson-gx-deep-suspend-and-ir-wakeup.patch
+0014-meson-gx-suspend-gate-hdmi5v-fan-rail.patch
+0015-vdec-recycle-stall-recovery.patch
+0016-meson-ir-hw-decode-real-remote-mouse.patch
+0017-vdec-program-all-dpb-buffers-seek-fix.patch
+0018-vdec-h264-late-buf-topup-and-clamps.patch
+0019-meson-ir-power-key-full-poweroff.patch
+0020-vdec-gate-recycle-until-buf-output.patch
+0021-panfrost-gxm-forbid-runtime-pm.patch
+0022-vdec-clear-stopping-on-drc-resume.patch
+0023-meson-gx-pm-poweroff-sip-handshake.patch
+0024-meson-wdt-stop-on-shutdown.patch
+hevc
+vdec-cumulative-2026-09-05.diff
+tree_modified_files:
+ M arch/arm64/boot/dts/amlogic/Makefile
+ M drivers/firmware/meson/Kconfig
+ M drivers/firmware/meson/Makefile
+ M drivers/gpu/drm/drm_crtc.c
+ M drivers/gpu/drm/panfrost/panfrost_device.h
+ M drivers/gpu/drm/panfrost/panfrost_drv.c
+ M drivers/media/rc/meson-ir.c
+ M drivers/staging/media/meson/vdec/codec_h264.c
+ M drivers/staging/media/meson/vdec/codec_hevc.c
+ M drivers/staging/media/meson/vdec/codec_hevc_common.c
+ M drivers/staging/media/meson/vdec/codec_hevc_common.h
+ M drivers/staging/media/meson/vdec/codec_vp9.c
+ M drivers/staging/media/meson/vdec/esparser.c
+ M drivers/staging/media/meson/vdec/vdec.c
+ M drivers/staging/media/meson/vdec/vdec.h
+ M drivers/staging/media/meson/vdec/vdec_helpers.c
+ M drivers/staging/media/meson/vdec/vdec_helpers.h
+ M drivers/staging/media/meson/vdec/vdec_platform.c
+ M drivers/watchdog/meson_gxbb_wdt.c
+?? arch/arm64/boot/dts/amlogic/meson-gxm-h96proplus.dts
+?? arch/arm64/configs/h96bisect_defconfig
+?? arch/arm64/configs/h96proplus_defconfig
+?? drivers/firmware/meson/meson_gx_pm.c
+?? kernel-build.log

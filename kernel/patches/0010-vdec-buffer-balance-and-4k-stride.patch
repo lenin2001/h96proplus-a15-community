@@ -1,0 +1,58 @@
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 928e0287e..9c252a027 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -34,7 +34,15 @@ struct dummy_buf {
+ 
+ static u32 get_output_size(u32 width, u32 height)
+ {
+-	return ALIGN(width * height, SZ_64K);
++	/*
++	 * h96 04.09.2026: реальная раскладка люмы, как её пишет железо и
++	 * ожидает gralloc: stride=ALIGN(w,64), высота=ALIGN(h,32). Прежний
++	 * ALIGN(w*h,64K) на 4K давал 8323072 < истинных 3840*2176=8355840
++	 * (недобор 32768) -> payload меньше плоскости, хрома писалась мимо
++	 * раскладки буфера -> полосы/цвет на 4K VP9. Смещение хромы
++	 * (codec_hevc_common.h) = ALIGN(w,64)*ALIGN(h,32) теперь совпадает.
++	 */
++	return ALIGN(width, 64) * ALIGN(height, 32);
+ }
+ 
+ u32 amvdec_get_output_size(struct amvdec_session *sess)
+@@ -230,7 +294,18 @@ static void process_num_buffers(struct vb2_queue *q,
+ 	 * we need all of them to be queued into the driver
+ 	 */
+ 	sess->num_dst_bufs = q_num_bufs + *num_buffers;
+-	q->min_queued_buffers = max(fmt_out->min_buffers, sess->num_dst_bufs);
++	/*
++	 * h96 04.09.2026: старт декода развязан от ПОЛНОГО пула. Прошивка
++	 * пишет только в буфер, снятый через prepare_new_frame (v4l2_m2m_dst_
++	 * buf_remove), поэтому для старта достаточно DPB-набора (min_buf_capture);
++	 * остальные дотекают через buf_queue. Прежнее =num_dst_bufs требовало
++	 * QBUF'нуть ВСЕ буферы до start_streaming, а клиент часть держит под
++	 * reorder/rendering (maxDequeue) -> в m2m-очереди CAPTURE пусто ->
++	 * codec_hevc_prepare_new_frame ловит "No dst buffer available" -> abort,
++	 * видео НЕ стартует (HEVC/VP9 в SmartTube/Alfa). Канвас-список
++	 * (num_dst_bufs) программируется целиком - это не трогаем.
++	 */
++	q->min_queued_buffers = max(fmt_out->min_buffers, min_buf_capture);
+ }
+ 
+ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+@@ -580,11 +731,14 @@ vdec_try_fmt_common(struct amvdec_session *sess, u32 size,
+ 
+ 		memset(pfmt[1].reserved, 0, sizeof(pfmt[1].reserved));
+ 		if (pixmp->pixelformat == V4L2_PIX_FMT_NV12M) {
++			/* h96: страйд ALIGN(w,64) - как у железа (canvas) и
++			 * gralloc/minigbm (pitch=ALIGN(w,64)). Прежний ALIGN(w,32)
++			 * расходился при w%64!=0 (854,1366) -> полосы. */
+ 			pfmt[0].sizeimage = output_size;
+-			pfmt[0].bytesperline = ALIGN(pixmp->width, 32);
++			pfmt[0].bytesperline = ALIGN(pixmp->width, 64);
+ 
+ 			pfmt[1].sizeimage = output_size / 2;
+-			pfmt[1].bytesperline = ALIGN(pixmp->width, 32);
++			pfmt[1].bytesperline = ALIGN(pixmp->width, 64);
+ 			pixmp->num_planes = 2;
+ 		} else if (pixmp->pixelformat == V4L2_PIX_FMT_YUV420M) {
+ 			pfmt[0].sizeimage = output_size;

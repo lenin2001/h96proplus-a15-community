@@ -1,0 +1,30 @@
+# Files executed on Linux/Android or by the boot loader must have LF line endings:
+# a shell script with CRLF fails with "bad interpreter: /bin/sh^M", and mkimage packs
+# a U-Boot script byte for byte, \r included.
+*.sh            text eol=lf
+*.py            text eol=lf
+gradlew         text eol=lf
+rescue/initramfs/init  text eol=lf
+*.cmd           text eol=lf
+*.rc            text eol=lf
+*.kl            text eol=lf
+*.map           text eol=lf
+*.mk            text eol=lf
+*.bp            text eol=lf
+*.dts           text eol=lf
+*.dtsi          text eol=lf
+*.json          text eol=lf
+Makefile        text eol=lf
+*defconfig      text eol=lf
+# git am / git apply need LF patches
+*.patch         text eol=lf
+*.diff          text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+gradlew.bat     text eol=crlf
+
+*.jar           binary
+*.mp4           binary
+*.webm          binary
+*.png           binary
+*.jpg           binary

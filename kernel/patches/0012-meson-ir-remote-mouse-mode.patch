@@ -1,0 +1,117 @@
+diff --git a/drivers/media/rc/meson-ir.c b/drivers/media/rc/meson-ir.c
+index 272ebb0d9..6d6bcddc4 100644
+--- a/drivers/media/rc/meson-ir.c
++++ b/drivers/media/rc/meson-ir.c
+@@ -16,6 +16,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/regmap.h>
+ 
++#include <linux/input.h>
+ #include <media/rc-core.h>
+ 
+ #define DRIVER_NAME		"meson-ir"
+@@ -166,8 +167,36 @@ struct meson_ir {
+ 	struct regmap	*reg;
+ 	struct rc_dev	*rc;
+ 	spinlock_t	lock;
++	struct input_dev *mouse;
++	bool		mouse_mode;
++	u8		last_mouse_cmd;
+ };
+ 
++#define H96_FN		0x47
++#define H96_UP		0x0b
++#define H96_DOWN	0x0e
++#define H96_LEFT	0x10
++#define H96_RIGHT	0x11
++#define H96_OK		0x0d
++#define H96_MOUSE_STEP	18
++
++static bool h96_mouse_move(struct meson_ir *ir, u8 cmd)
++{
++	int dx = 0, dy = 0;
++
++	switch (cmd) {
++	case H96_UP:	dy = -H96_MOUSE_STEP; break;
++	case H96_DOWN:	dy =  H96_MOUSE_STEP; break;
++	case H96_LEFT:	dx = -H96_MOUSE_STEP; break;
++	case H96_RIGHT:	dx =  H96_MOUSE_STEP; break;
++	default:	return false;
++	}
++	input_report_rel(ir->mouse, REL_X, dx);
++	input_report_rel(ir->mouse, REL_Y, dy);
++	input_sync(ir->mouse);
++	return true;
++}
++
+ static struct regmap_config meson_ir_regmap_config = {
+ 	.reg_bits = 32,
+ 	.val_bits = 32,
+@@ -194,14 +223,43 @@ static void meson_ir_nec_handler(struct meson_ir *ir)
+ 	regmap_read(ir->reg, IR_DEC_STATUS, &status);
+ 
+ 	if (status & DEC_STATUS_REPEAT) {
++		if (ir->mouse && ir->mouse_mode && ir->last_mouse_cmd &&
++		    h96_mouse_move(ir, ir->last_mouse_cmd))
++			return;
+ 		rc_repeat(ir->rc);
+-	} else {
+-		regmap_read(ir->reg, IR_DEC_FRAME, &code);
++		return;
++	}
+ 
+-		code = ir_nec_bytes_to_scancode(code, code >> 8,
+-						code >> 16, code >> 24, &proto);
+-		rc_keydown(ir->rc, proto, code, 0);
++	regmap_read(ir->reg, IR_DEC_FRAME, &code);
++	code = ir_nec_bytes_to_scancode(code, code >> 8,
++					code >> 16, code >> 24, &proto);
++
++	if (ir->mouse) {
++		u8 cmd = code & 0xFF;
++
++		if (cmd == H96_FN) {
++			ir->mouse_mode = !ir->mouse_mode;
++			ir->last_mouse_cmd = 0;
++			return;
++		}
++		if (ir->mouse_mode) {
++			if (h96_mouse_move(ir, cmd)) {
++				ir->last_mouse_cmd = cmd;
++				return;
++			}
++			if (cmd == H96_OK) {
++				input_report_key(ir->mouse, BTN_LEFT, 1);
++				input_sync(ir->mouse);
++				input_report_key(ir->mouse, BTN_LEFT, 0);
++				input_sync(ir->mouse);
++				ir->last_mouse_cmd = 0;
++				return;
++			}
++			ir->mouse_mode = false;
++		}
+ 	}
++
++	rc_keydown(ir->rc, proto, code, 0);
+ }
+ 
+ static void meson_ir_hw_handler(struct meson_ir *ir)
+@@ -523,6 +581,18 @@ static int meson_ir_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	ir->mouse = devm_input_allocate_device(dev);
++	if (ir->mouse) {
++		ir->mouse->name = DRIVER_NAME " mouse";
++		ir->mouse->phys = DRIVER_NAME "/mouse0";
++		ir->mouse->id.bustype = BUS_HOST;
++		input_set_capability(ir->mouse, EV_REL, REL_X);
++		input_set_capability(ir->mouse, EV_REL, REL_Y);
++		input_set_capability(ir->mouse, EV_KEY, BTN_LEFT);
++		if (input_register_device(ir->mouse))
++			ir->mouse = NULL;
++	}
++
+ 	dev_info(dev, "receiver initialized\n");
+ 
+ 	return 0;

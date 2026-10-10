@@ -1,0 +1,58 @@
+From: H96 Pro Plus bring-up
+Subject: [PATCH] watchdog: meson_gxbb: опциональный запуск сторожа при probe
+
+Аппаратный сторож GXM умеет вытащить приставку из любого зависания
+userspace — но только если он запущен. Штатный драйвер включает его
+лишь тогда, когда сторож уже завёл загрузчик; Amlogic-загрузчик этого
+не делает, поэтому зависшая загрузка Android требовала физического
+передёргивания питания (а холодный старт стирает ramoops — теряется
+лог, ради которого всё и затевалось).
+
+Патч добавляет module_param start_at_probe. При start_at_probe=1
+драйвер стартует сторож и выставляет WDOG_HW_RUNNING, после чего ядро
+само «кормит» железо до тех пор, пока не истечёт watchdog.open_timeout.
+Если за это время userspace не откроет /dev/watchdog — SoC сбрасывается.
+
+Штатный Android открывает /dev/watchdog сервисом watchdogd, то есть
+успешная загрузка перехватывает сторож автоматически, а зависшая
+получает аппаратный сброс. Сброс тёплый: содержимое DRAM (ramoops)
+переживает его, в отличие от отключения питания.
+
+diff --git a/drivers/watchdog/meson_gxbb_wdt.c b/drivers/watchdog/meson_gxbb_wdt.c
+index a48622d11..b22368e59 100644
+--- a/drivers/watchdog/meson_gxbb_wdt.c
++++ b/drivers/watchdog/meson_gxbb_wdt.c
+@@ -38,6 +38,10 @@ module_param(timeout, uint, 0);
+ MODULE_PARM_DESC(timeout, "Watchdog heartbeat in seconds="
+ 		 __MODULE_STRING(DEFAULT_TIMEOUT) ")");
+ 
++static bool start_at_probe;
++module_param(start_at_probe, bool, 0);
++MODULE_PARM_DESC(start_at_probe, "Start watchdog at probe (default=0)");
++
+ struct meson_gxbb_wdt {
+ 	void __iomem *reg_base;
+ 	struct watchdog_device wdt_dev;
+@@ -201,6 +205,12 @@ static int meson_gxbb_wdt_probe(struct platform_device *pdev)
+ 		set_bit(WDOG_HW_RUNNING, &data->wdt_dev.status);
+ 		meson_gxbb_wdt_set_timeout(&data->wdt_dev,
+ 				GXBB_WDT_TCNT_SETUP_MASK / 1000);
++	} else if (start_at_probe) {
++		/* Bring-up: сторож не завёл загрузчик — заводим сами, чтобы
++		 * зависшая загрузка Android получила аппаратный сброс, если
++		 * userspace не откроет /dev/watchdog за watchdog.open_timeout.
++		 */
++		set_bit(WDOG_HW_RUNNING, &data->wdt_dev.status);
+ 	}
+ 
+ 	/* Setup with 1ms timebase */
+@@ -213,6 +223,9 @@ static int meson_gxbb_wdt_probe(struct platform_device *pdev)
+ 	writel(ctrl_reg, data->reg_base + GXBB_WDT_CTRL_REG);
+ 	meson_gxbb_wdt_set_timeout(&data->wdt_dev, data->wdt_dev.timeout);
+ 
++	if (start_at_probe)
++		meson_gxbb_wdt_start(&data->wdt_dev);
++
+ 	return devm_watchdog_register_device(dev, &data->wdt_dev);
+ }
+ 

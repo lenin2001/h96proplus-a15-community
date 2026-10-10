@@ -1,0 +1,40 @@
+diff --git a/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp b/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
+index a040c88..1ff16ee 100644
+--- a/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
+@@ -802,7 +802,17 @@ const PictureProfileHandle& OutputLayer::getPictureProfileHandle() const {
+ void OutputLayer::writeBufferStateToHWC(HWC2::Layer* hwcLayer,
+                                         const LayerFECompositionState& outputIndependentState,
+                                         bool skipLayer) {
+-    if (skipLayer && outputIndependentState.buffer == nullptr) {
++    if (outputIndependentState.buffer == nullptr) {
++        /* h96 (01.09.2026): sloj bez bufera dolzhen prosto propustit'
++         * setBuffer. Staryj gejt treboval eshche i skipLayer, i pri
++         * skipLayer=false kod nizhe razymenovyval nulevoj bufer
++         * (getId()) - SIGSEGV vsego surfaceflinger, perezapusk vsej
++         * grafiki na ~2 minuty (nablyudalos' vzhivuyu, tombstone_27:
++         * fault addr 0x70 v writeStateToHWC). */
++        if (!skipLayer) {
++            ALOGE("[%s] null buffer with non-skipped layer, skipping setBuffer",
++                  getLayerFE().getDebugName());
++        }
+         return;
+     }
+     auto supportedPerFrameMetadata =
+@@ -842,9 +852,14 @@ void OutputLayer::writeBufferStateToHWC(HWC2::Layer* hwcLayer,
+ 
+     if (auto error = hwcLayer->setBuffer(hwcSlotAndBuffer.slot, hwcSlotAndBuffer.buffer, hwcFence);
+         error != hal::Error::NONE) {
++        // The cache returns a null buffer on purpose when this buffer is already in that slot
++        // (see HwcBufferCache.h), so only the slot number goes to the HAL. Logging the failure
++        // must not assume a buffer is there: when setBuffer fails on a cached buffer -- which is
++        // what a display that has just gone away produces, BAD_DISPLAY -- dereferencing it here
++        // took SurfaceFlinger down with a null dereference instead of reporting the error.
+         ALOGE("[%s] Failed to set buffer %p: %s (%d)", getLayerFE().getDebugName(),
+-              hwcSlotAndBuffer.buffer->handle, to_string(error).c_str(),
+-              static_cast<int32_t>(error));
++              hwcSlotAndBuffer.buffer ? hwcSlotAndBuffer.buffer->handle : nullptr,
++              to_string(error).c_str(), static_cast<int32_t>(error));
+     }
+ }
+ 

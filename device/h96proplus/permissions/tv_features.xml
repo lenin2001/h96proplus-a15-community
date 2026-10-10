@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Фичи ТВ-устройства H96 Pro Plus.
+
+     Файла frameworks/native/data/etc/android.software.leanback.xml в AOSP
+     НЕ существует (сборка №8 упала именно на нём) — leanback объявляется
+     device-файлом, образец: device/google/atv/permissions/tv_core_hardware.xml.
+
+     Осознанно НЕ объявляем (ТЗ §14): location (провайдера нет),
+     live_tv (тюнера и TV Input нет), voice_recognizers (микрофона нет),
+     autofill, backup — не тянуть сервисы ради галочки. -->
+<permissions>
+    <feature name="android.hardware.audio.output" />
+    <feature name="android.hardware.screen.landscape" />
+    <feature name="android.hardware.type.television" />
+
+    <feature name="android.software.leanback" />
+    <feature name="android.software.leanback_only" />
+    <feature name="android.software.input_methods" />
+    <!-- ================== ТЕЛЕФОНИЯ ОБЪЯВЛЕНА ОТСУТСТВУЮЩЕЙ ==================
+         Мало не объявлять возможность — её нужно объявить именно отсутствующей,
+         иначе часть базовых профилей AOSP добавит её за нас. Разбирается это
+         в SystemConfig.java (ветка allowFeatures, там же, где обычные feature),
+         поэтому работает в любом permissions-файле раздела, а не только в
+         sysconfig. Образец — device/google/atv/permissions/tv_sdk_excluded_core_hardware.xml
+
+         Практический смысл: магазин и приложения видят приставку как
+         устройство без телефонии, не предлагают звонки и SMS, а системные
+         службы не поднимают телефонные подсистемы вхолостую.
+    -->
+    <unavailable-feature name="android.hardware.telephony" />
+    <unavailable-feature name="android.hardware.telephony.gsm" />
+    <unavailable-feature name="android.hardware.telephony.cdma" />
+    <unavailable-feature name="android.hardware.telephony.ims" />
+    <unavailable-feature name="android.hardware.telephony.subscription" />
+    <unavailable-feature name="android.hardware.telephony.calling" />
+    <unavailable-feature name="android.hardware.telephony.data" />
+    <unavailable-feature name="android.hardware.telephony.messaging" />
+    <unavailable-feature name="android.hardware.telephony.radio.access" />
+    <unavailable-feature name="android.hardware.telephony.euicc" />
+    <unavailable-feature name="android.software.telecom" />
+    <unavailable-feature name="android.software.connectionservice" />
+    <unavailable-feature name="android.software.sip" />
+    <unavailable-feature name="android.software.sip.voip" />
+</permissions>

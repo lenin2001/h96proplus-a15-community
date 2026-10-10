@@ -1,0 +1,223 @@
+Subject: [PATCH] v4l2_codec2: own the CSD bytes and clear the run at the session boundary
+
+Follow-up hardening of 0017, from the reviewer's 3C audit.
+
+1) Ownership. mCsdRun held a borrowed C2ConstLinearBlock. That pins the ALLOCATION but not
+   the CONTENTS: in MediaCodec array mode the same block is handed back to the client and
+   rewritten as soon as work->input.buffers is released, and V4L2Decoder only reads the bytes
+   at QBUF time, i.e. during the replay. Safe on the clear-AVC path we test, unsafe in
+   general (DRM / getInputBuffers). Now the CSD bytes are copied into owned storage and the
+   replay blocks are rebuilt from a pool the component owns.
+2) Session boundary. stopTask()/releaseTask() did not clear the run, so a stop taken after
+   CSD but before the first frame left the run OPEN and the next session's SPS was appended
+   to the previous run instead of replacing it. Cleared there now -- and never on a flush.
+3) flushTask() no longer clears the open flag: a flush landing between csd-0 and csd-1 used
+   to make csd-1 start a fresh run and drop the SPS, which is the original defect again.
+
+diff --git a/components/DecodeComponent.cpp b/components/DecodeComponent.cpp
+index 81051c1..71a1f27 100644
+--- a/components/DecodeComponent.cpp
++++ b/components/DecodeComponent.cpp
+@@ -11,6 +11,7 @@
+ #include <inttypes.h>
+ #include <linux/videodev2.h>
+ #include <stdint.h>
++#include <string.h>
+ 
+ #include <memory>
+ 
+@@ -237,6 +238,13 @@ void DecodeComponent::stopTask() {
+ 
+     reportAbandonedWorks();
+     mIsDraining = false;
++    /* h96 18.09: RUNNING -> STOPPED - это граница СЕССИИ. Seek-flush обязан
++     * сохранить серию (flushTask), stop - обязан её выбросить: CCodec
++     * переиспользует ЭТОТ ЖЕ объект между stop()/configure()/start()
++     * (CCodec.cpp:2266-2329 и 2157-2171). Если серия осталась "открытой"
++     * (stop сразу после CSD, до первого кадра), SPS следующей сессии
++     * допишется к старой серии вместо замены. */
++    clearCsdRun("stopTask");
+ 
+     releaseTask();
+ }
+@@ -273,6 +281,8 @@ void DecodeComponent::releaseTask() {
+ 
+     mWeakThisFactory.InvalidateWeakPtrs();
+     mDecoder = nullptr;
++    // release() приходит сюда МИМО stopTask() (см. DecodeComponent::release()).
++    clearCsdRun("releaseTask");
+ }
+ 
+ c2_status_t DecodeComponent::setListener_vb(const std::shared_ptr<C2Component::Listener>& listener,
+@@ -447,11 +457,7 @@ void DecodeComponent::processCSDWork(const int32_t bitstreamId, const C2Work* wo
+             mPendingColorAspectsChange = true;
+             mPendingColorAspectsChangeFrameIndex = work->input.ordinal.frameIndex.peeku();
+         }
+-        /* h96 16.09: новая серия CSD (после обычных кадров) заменяет старую;
+-         * внутри серии блоки копятся по порядку: SPS, PPS[, PPS...]. */
+-        if (!mCsdRunOpen) mCsdRun.clear();
+-        mCsdRunOpen = true;
+-        mCsdRun.push_back(linearBlock);
++        cacheCsd(linearBlock);
+     }
+ 
+     processWorkBuffer(bitstreamId, linearBlock);
+@@ -466,6 +472,77 @@ void DecodeComponent::processWork(const int32_t bitstreamId, const C2Work* work)
+     processWorkBuffer(bitstreamId, linearBlock);
+ }
+ 
++/* h96 18.09: копия БАЙТОВ CSD. Новая серия (после обычных кадров) заменяет
++ * старую; внутри серии блоки копятся по порядку: SPS, PPS[, PPS...]. */
++void DecodeComponent::cacheCsd(const C2ConstLinearBlock& linearBlock) {
++    ALOG_ASSERT(mDecoderTaskRunner->RunsTasksInCurrentSequence());
++
++    C2ReadView view = linearBlock.map().get();
++    if (view.error() != C2_OK || view.capacity() == 0u) {
++        ALOGE("h96: cannot map CSD block (err=%d, cap=%u), CSD run not updated", view.error(),
++              view.capacity());
++        return;
++    }
++
++    if (!mCsdRunOpen) {
++        mCsdRunBytes.clear();
++        mCsdRunBlocks.clear();
++    }
++    mCsdRunOpen = true;
++    mCsdRunBytes.emplace_back(view.data(), view.data() + view.capacity());
++    mCsdRunBlocks.clear();  // собрать заново вместе с новым элементом
++    buildCsdBlocks();       // заранее, чтобы seek не платил за аллокацию
++    ALOGI("h96: CSD cached, run=%zu blocks, last=%u bytes", mCsdRunBytes.size(), view.capacity());
++}
++
++/* Пересобирает |mCsdRunBlocks| из |mCsdRunBytes| в BASIC_LINEAR-пуле, которым
++ * владеем мы. V4L2Decoder всё равно копирует байты в MMAP-буфер драйвера
++ * (V4L2Decoder.cpp:532-544), так что любая линейная аллокация подходит. */
++bool DecodeComponent::buildCsdBlocks() {
++    if (mCsdRunBlocks.size() == mCsdRunBytes.size()) return true;
++
++    if (!mCsdBlockPool) {
++        c2_status_t status = GetCodec2BlockPool(C2BlockPool::BASIC_LINEAR, nullptr, &mCsdBlockPool);
++        if (status != C2_OK || !mCsdBlockPool) {
++            ALOGE("h96: no BASIC_LINEAR pool for CSD replay: %d", status);
++            mCsdBlockPool = nullptr;
++            return false;
++        }
++    }
++
++    mCsdRunBlocks.clear();
++    C2MemoryUsage usage{C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE};
++    for (const std::vector<uint8_t>& csd : mCsdRunBytes) {
++        std::shared_ptr<C2LinearBlock> block;
++        c2_status_t status = mCsdBlockPool->fetchLinearBlock(csd.size(), usage, &block);
++        if (status != C2_OK || !block) {
++            ALOGE("h96: fetchLinearBlock(%zu) for CSD replay failed: %d", csd.size(), status);
++            mCsdRunBlocks.clear();
++            return false;
++        }
++        C2WriteView wView = block->map().get();
++        if (wView.error() != C2_OK) {
++            ALOGE("h96: cannot map CSD replay block: %d", wView.error());
++            mCsdRunBlocks.clear();
++            return false;
++        }
++        memcpy(wView.data(), csd.data(), csd.size());
++        mCsdRunBlocks.push_back(block->share(0u, csd.size(), C2Fence()));
++    }
++    return true;
++}
++
++void DecodeComponent::clearCsdRun(const char* reason) {
++    if (!mCsdRunBytes.empty() || mCsdRunOpen) {
++        ALOGI("h96: CSD run cleared at session boundary (%s): %zu blocks dropped", reason,
++              mCsdRunBytes.size());
++    }
++    mCsdRunBytes.clear();
++    mCsdRunBlocks.clear();
++    mCsdRunOpen = false;
++    mCsdBlockPool = nullptr;
++}
++
+ void DecodeComponent::processWorkBuffer(const int32_t bitstreamId,
+                                         const C2ConstLinearBlock& linearBlock) {
+     std::unique_ptr<ConstBitstreamBuffer> buffer = std::make_unique<ConstBitstreamBuffer>(
+@@ -714,21 +791,23 @@ void DecodeComponent::flushTask() {
+      * SPS/PPS теряются), а CCodec пересылает CSD только из flushedWork, которого мы не
+      * даём. Для DASH avc1/hvc1 (YouTube AVC) после seek приходили одни слайсы - ни
+      * кадров, ни SOURCE_CHANGE. Повторяем последний CSD первым же буфером. */
+-    if (!mCsdRun.empty() && (mIntfImpl->getVideoCodec() == VideoCodec::H264 ||
+-                            mIntfImpl->getVideoCodec() == VideoCodec::HEVC)) {
++    if (!mCsdRunBytes.empty() && (mIntfImpl->getVideoCodec() == VideoCodec::H264 ||
++                                  mIntfImpl->getVideoCodec() == VideoCodec::HEVC)) {
+         /* h96 16.09: повторяем ВСЮ серию CSD (SPS, потом PPS[, ...]) в исходном
+          * порядке. id = -2, -3, ... - отрицательные, никогда не совпадут с
+          * frameIndex настоящих AU. Это ровно стартовая последовательность,
+          * которую firmware принимает (два CSD-work -> src_change за ~5 мс). */
++        if (!buildCsdBlocks()) {
++            ALOGE("h96: CSD replay skipped, %zu blocks unavailable", mCsdRunBytes.size());
++        }
+         int32_t replayId = -2;
+-        for (const C2ConstLinearBlock& csd : mCsdRun) {
++        for (const C2ConstLinearBlock& csd : mCsdRunBlocks) {
+             mDecoder->decode(std::make_unique<ConstBitstreamBuffer>(replayId, csd,
+                                                                     csd.offset(), csd.size()),
+                              ::base::BindOnce([](VideoDecoder::DecodeStatus) {}));
+             ALOGV("h96: CSD replayed after flush id=%d size=%zu", replayId, csd.size());
+             --replayId;
+         }
+-        mCsdRunOpen = false;
+     }
+ 
+     // Pending EOS work will be abandoned here due to component flush if any.
+diff --git a/components/include/v4l2_codec2/components/DecodeComponent.h b/components/include/v4l2_codec2/components/DecodeComponent.h
+index 273b529..51d582b 100644
+--- a/components/include/v4l2_codec2/components/DecodeComponent.h
++++ b/components/include/v4l2_codec2/components/DecodeComponent.h
+@@ -8,6 +8,8 @@
+ #include <atomic>
+ #include <memory>
+ #include <optional>
++#include <cstdint>
++#include <vector>
+ 
+ #include <C2Component.h>
+ #include <C2ComponentFactory.h>
+@@ -70,6 +72,14 @@ protected:
+     void processWork(const int32_t bitstreamId, const C2Work* work);
+     void processWorkBuffer(const int32_t bitstreamId, const C2ConstLinearBlock& linearBlock);
+ 
++    /* h96 18.09: CSD-кэш. cacheCsd() копирует БАЙТЫ (не ссылку) из клиентского
++     * блока; buildCsdBlocks() пересобирает блоки для повтора в НАШЕМ пуле;
++     * clearCsdRun() вызывается ТОЛЬКО на границе сессии (stopTask/releaseTask),
++     * никогда на flush. */
++    void cacheCsd(const C2ConstLinearBlock& linearBlock);
++    bool buildCsdBlocks();
++    void clearCsdRun(const char* reason);
++
+     // Get the buffer pool.
+     std::unique_ptr<VideoFramePool> getVideoFramePool(const ui::Size& size,
+                                                       HalPixelFormat pixelFormat,
+@@ -107,10 +117,20 @@ protected:
+     /* h96 16.09: ВСЕ CSD-блоки текущей серии. avc1 в DASH/MP4 доставляет SPS и PPS
+      * ДВУМЯ отдельными CODEC_CONFIG-работами (csd-0, csd-1); hvc1 - одним блоком.
+      * meson-vdec на STREAMOFF CAPTURE сбрасывает прошивку вместе с параметрами,
+-     * поэтому после flush повторяем серию целиком, в исходном порядке. Раньше
+-     * хранился только последний блок (mLastCsd) => после seek в firmware уходил
+-     * один PPS, без SPS не поднимался CMD_SRC_CHANGE, декодер молчал ~20 с. */
+-    std::vector<C2ConstLinearBlock> mCsdRun;
++     * поэтому после flush повторяем серию целиком, в исходном порядке.
++     *
++     * h96 18.09: храним СОБСТВЕННЫЕ байты, а не C2ConstLinearBlock клиента.
++     * C2ConstLinearBlock - только ссылка на аллокацию входного пула CCodec
++     * (C2Buffer.h:1236); в array-режиме MediaCodec тот же самый C2LinearBlock
++     * выдаётся клиенту обратно и перезаписывается сразу после того, как мы
++     * отпускаем work->input.buffers (CCodecBuffers.cpp:772-791 +
++     * CCodecBufferChannel.cpp:2383), а V4L2Decoder читает байты только в момент
++     * QBUF (V4L2Decoder.cpp:532-544), т.е. уже при повторе. Плюс каждая ссылка
++     * держала до 1 МиБ входного пула (CCodecBuffers.h:40). */
++    std::vector<std::vector<uint8_t>> mCsdRunBytes;
++    // Блоки для повтора, собранные из |mCsdRunBytes| в нашем пуле.
++    std::vector<C2ConstLinearBlock> mCsdRunBlocks;
++    std::shared_ptr<C2BlockPool> mCsdBlockPool;
+     bool mCsdRunOpen = false;  // true, пока приходят подряд идущие CSD-работы
+     // The queue of works that haven't processed and sent to |mDecoder|.
+     std::queue<std::unique_ptr<C2Work>> mPendingWorks;

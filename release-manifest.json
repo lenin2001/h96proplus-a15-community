@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "status": "source-only-developer-preview",
+  "release_id": "source-2026-10-10",
+  "public_source_commit": "see the git tag source-2026-10-10; a file cannot contain the hash of the commit that contains it",
+  "supported_boards": [
+    "h96proplus-czs32v3"
+  ],
+  "android": {
+    "version": "Android 15 (AOSP release tag android-15.0.0_r36, BP1A.250505.005.D1)",
+    "sdk": 35,
+    "manifest_url": "https://android.googlesource.com/platform/manifest",
+    "manifest_tag": "android-15.0.0_r36",
+    "manifest_commit": "a0601d2912a6cedcaf97e1372173f8704a2715b0",
+    "manifest_status": "verified 2026-10-10: all 1030 checked-out projects of the maintainer's build tree are exactly at this tag",
+    "lunch_target": "h96proplus-trunk_staging-userdebug",
+    "build_fingerprint_of_maintainer_build": "Amlogic/h96proplus/h96proplus:Baklava/BP1A.250505.005.D1/eng.root:userdebug/test-keys",
+    "fingerprint_note": "codename Baklava comes from the trunk_staging release config, not from a development branch",
+    "changes_file": "aosp-patches/series.json"
+  },
+  "kernel": {
+    "upstream_url": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+    "upstream_tag": "v7.1",
+    "upstream_commit": "8cd9520d35a6c38db6567e97dd93b1f11f185dc6",
+    "patch_series_file": "kernel/patches/series.json",
+    "config_file": "kernel/config/h96proplus_defconfig",
+    "config_sha256": "09821e47c8016dded892829527efd1bf31b74347a54da25af82dada7af0ce215",
+    "toolchain_used_for_verification": "aarch64-linux-gnu-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "equality_with_installed_build_112": "verified 2026-10-10: all 30 source files changed by the series, the DTS and the full .config are byte-identical to the #112 build tree; the DTB compiled from the published DTS equals the installed one. The kernel Image is not expected to be bit-identical: the version string carries build user, host and time.",
+    "dts_file": "dt/meson-gxm-h96proplus.dts",
+    "installed_dtb_sha256": "26f81f595d10487f92674e681f9809a763a7aed3d66ba4ff09f6d30205a3ffc9"
+  },
+  "supported_hardware": [
+    {
+      "board": "H96 Pro Plus CZ-S32-V3",
+      "soc": "Amlogic S912 (Meson GXM)",
+      "ram": "2 GiB (label says 3G)",
+      "emmc": "16 GB class",
+      "ethernet_phy": "RTL8211F",
+      "wifi_bt": "QCA9377 (SDIO/UART)",
+      "tested_units": 1
+    }
+  ],
+  "artifacts": [],
+  "installer": {
+    "path": "installer/h96install.py",
+    "version": "0.1.0",
+    "board_profile": "installer/boards/h96proplus-czs32v3.json",
+    "dry_run_command": "python3 installer/h96install.py discover --target <rescue-ip>; then plan ... --out <plan>",
+    "install_command": "python3 installer/h96install.py install --plan <plan> --plan-sha256 <sha> ... (see installer/README.md)",
+    "partition_plan": "computed from the board definition and YOUR unit's MPT; no fixed offsets outside installer/boards",
+    "read_back_verification": true,
+    "tested": "31 host tests against a simulated eMMC; never run on hardware"
+  },
+  "data_policy": {
+    "owner_userdata_included": false,
+    "first_install_wipes_data": "only with --first-install --wipe-data and a typed WIPE-<cid suffix> confirmation",
+    "upgrade_preserves_data": true,
+    "explicit_wipe_consent_required": true
+  },
+  "security": {
+    "build_type": "userdebug",
+    "selinux": "permissive (androidboot.selinux=permissive); no enforcing policy validated",
+    "adb_network_default": "enabled on TCP 5555 (the only ADB path on this board)",
+    "adb_authentication": "required (ro.adb.secure=1) - public-release change, not hardware-tested",
+    "signing_profile": "public AOSP test-keys",
+    "private_keys_included": false,
+    "gms_included": false,
+    "gms_certification_claimed": false,
+    "rescue_environment": "unauthenticated root telnet while running - use a direct cable or an isolated network"
+  },
+  "verification": {
+    "clean_build": "kernel: prepared from v7.1 and built in a fresh directory (kernel/README.md); Mesa: recipe run on the build host; AOSP: full build not run (blocker)",
+    "clean_install": "not run (no images); installer exercised against a simulation only",
+    "privacy_review": "automated denylist and pattern scan plus manual review of every hit; repeated on the published clone (PRIVACY.md)",
+    "hardware_tests_file": null
+  },
+  "rollback": {
+    "instructions_file": "installer/README.md",
+    "method": "installer restore from the verified pre-install backup",
+    "verified": false
+  },
+  "licenses": {
+    "inventory_file": "LICENSES.md",
+    "unresolved_components": []
+  },
+  "known_issues_file": "STATUS.md",
+  "mesa": {
+    "recipe": "build/build-mesa.sh",
+    "sources": "external/mesa3d (Mesa 24.3.0-devel) and external/libdrm (2.4.124) of android-15.0.0_r36, unmodified",
+    "toolchain": "Android NDK r27c (27.2.12479018), API 34",
+    "binaries_included": false,
+    "verification": "2026-10-10 on the build host: the recipe built all libraries; libglapi and libc++_shared are byte-identical to the maintainer's, the others export the same symbols (the maintainer's copies carry a build-tree RUNPATH and SONAMEs set by hand). The final recipe step (meson install, RUNPATH check) is re-run after publication; see the git log."
+  }
+}

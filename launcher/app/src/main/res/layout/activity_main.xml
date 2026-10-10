@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Главный экран. Тёмный фон и сетка плиток — как требует ТЗ §12.
+
+    Обои хранятся локально (@drawable/wallpaper), из сети ничего не грузится
+    и фонового видео нет (ТЗ §33).
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/wallpaper">
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/app_grid"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:paddingStart="48dp"
+        android:paddingEnd="48dp"
+        android:paddingTop="40dp"
+        android:paddingBottom="40dp"
+        android:clipToPadding="false"
+        android:descendantFocusability="afterDescendants"
+        android:focusable="false" />
+
+</FrameLayout>

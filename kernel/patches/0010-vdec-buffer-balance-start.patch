@@ -1,0 +1,24 @@
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 928e0287e..9d2ebc5c2 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -230,7 +286,18 @@ static void process_num_buffers(struct vb2_queue *q,
+ 	 * we need all of them to be queued into the driver
+ 	 */
+ 	sess->num_dst_bufs = q_num_bufs + *num_buffers;
+-	q->min_queued_buffers = max(fmt_out->min_buffers, sess->num_dst_bufs);
++	/*
++	 * h96 04.09.2026: старт декода развязан от ПОЛНОГО пула. Прошивка
++	 * пишет только в буфер, снятый через prepare_new_frame (v4l2_m2m_dst_
++	 * buf_remove), поэтому для старта достаточно DPB-набора (min_buf_capture);
++	 * остальные дотекают через buf_queue. Прежнее =num_dst_bufs требовало
++	 * QBUF'нуть ВСЕ буферы до start_streaming, а клиент часть держит под
++	 * reorder/rendering (maxDequeue) -> в m2m-очереди CAPTURE пусто ->
++	 * codec_hevc_prepare_new_frame ловит "No dst buffer available" -> abort,
++	 * видео НЕ стартует (HEVC/VP9 в SmartTube/Alfa). Канвас-список
++	 * (num_dst_bufs) программируется целиком - это не трогаем.
++	 */
++	q->min_queued_buffers = max(fmt_out->min_buffers, min_buf_capture);
+ }
+ 
+ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,

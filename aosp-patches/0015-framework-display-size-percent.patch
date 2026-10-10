@@ -1,0 +1,357 @@
+diff --git a/services/core/java/com/android/server/display/DisplayManagerService.java b/services/core/java/com/android/server/display/DisplayManagerService.java
+index 452dc5f97..203402530 100644
+--- a/services/core/java/com/android/server/display/DisplayManagerService.java
++++ b/services/core/java/com/android/server/display/DisplayManagerService.java
+@@ -834,6 +834,13 @@ public final class DisplayManagerService extends SystemService {
+             recordTopInsetLocked(mLogicalDisplayMapper.getDisplayLocked(Display.DEFAULT_DISPLAY));
+ 
+             updateMinimalPostProcessingAllowedSettingLocked();
++            // Nothing is being adjusted across a boot, so whatever preview was persisted is
++            // ignored: the confirmed size is applied first, and only then is the stale key
++            // cleaned up. (The earlier order -- post the clear, then run an update that removed
++            // that very callback -- cancelled the clear before it could run.)
++            applyScreenSizeLocked(/* allowPreview= */ false);
++            mScreenSizeBootApplied = true;
++            mHandler.post(mClearScreenSizePreview);
+             updateUserDisabledHdrTypesFromSettingsLocked();
+             updateUserPreferredDisplayModeSettingsLocked();
+             if (mIsHdrOutputControlEnabled) {
+@@ -1184,6 +1191,79 @@ public final class DisplayManagerService extends SystemService {
+         }
+     }
+ 
++    /**
++     * Secure setting: the share of the panel, in percent, the whole picture is scaled into.
++     * Written by Settings, read here. Absent means 100, that is, fill the panel.
++     */
++    static final String SCREEN_SIZE_PERCENT = "screen_size_percent";
++
++    /**
++     * Secure setting: a size being tried out, which wins over the confirmed one while it is
++     * there. Zero or absent means there is none. Settings has to keep rewriting it; if it stops,
++     * the watchdog below drops it, so a Settings that dies mid adjustment cannot leave the
++     * picture the wrong size.
++     */
++    static final String SCREEN_SIZE_PERCENT_PREVIEW = "screen_size_percent_preview";
++
++    /**
++     * Secure setting: the preview's lease. Settings writes a new, different value here every
++     * few seconds while a preview is being tried out. It has to be a changing value: the settings
++     * provider notifies observers only when a value actually changes (Setting.update() returns
++     * false for an identical write, and PUT_SECURE does not force a notification), so rewriting
++     * the same percentage would never reach this service. Each change re-arms the watchdog
++     * below; when the writes stop -- Settings died, or the owner left -- the preview is dropped.
++     */
++    static final String SCREEN_SIZE_PREVIEW_LEASE = "screen_size_preview_lease";
++
++    /** Longer than the interval at which Settings renews the lease, shorter than its dialog. */
++    private static final long SCREEN_SIZE_PREVIEW_TIMEOUT_MS = 20000L;
++
++    /** Set once system-ready has applied the confirmed size; previews are ignored before that. */
++    private boolean mScreenSizeBootApplied;
++
++    /**
++     * A method reference rather than a lambda over {@code mContext}: a field initialiser runs
++     * before the constructor assigns it, so capturing it here would not compile.
++     */
++    private final Runnable mClearScreenSizePreview = this::clearScreenSizePreviewSetting;
++
++    /**
++     * The validated confirmed size, kept in memory so the watchdog can restore it without a
++     * provider read that might throw.
++     */
++    private int mScreenSizeConfirmed = LogicalDisplay.DISPLAY_SIZE_PERCENT_DEFAULT;
++    /** The live preview percent while a session is active; 0 when there is none. */
++    private int mScreenSizePreview;
++    /** True between a lease renewal and the watchdog firing (or boot). */
++    private boolean mScreenSizePreviewActive;
++    /**
++     * The lease value that last started or renewed the session. Only a CHANGE to it is a renewal:
++     * a confirmed-size write or a hotplug carries the same lease and must neither re-arm the
++     * watchdog nor revive a preview whose lease has not moved.
++     */
++    private int mScreenSizeLeaseSeen;
++
++    private void clearScreenSizePreviewSetting() {
++        synchronized (mSyncRoot) {
++            // Mark the session dead FIRST, in memory: the persisted preview and its unchanged
++            // lease are now invalid and must not be applied again until the lease value changes.
++            endScreenSizePreviewSessionLocked();
++            // Restore the confirmed size from memory, not from a provider read that might throw.
++            projectScreenSizeLocked(mScreenSizeConfirmed);
++        }
++        // Best-effort cleanup of the persisted preview key. A failure -- an exception or a false
++        // return -- is harmless: the picture is already right and the in-memory invalidation keeps
++        // the stale key from ever being applied.
++        try {
++            if (!Settings.Secure.putIntForUser(mContext.getContentResolver(),
++                    SCREEN_SIZE_PERCENT_PREVIEW, 0, UserHandle.USER_CURRENT)) {
++                Slog.w(TAG, "could not clear the screen-size preview (write refused)");
++            }
++        } catch (RuntimeException e) {
++            Slog.w(TAG, "could not clear the screen-size preview", e);
++        }
++    }
++
+     private class SettingsObserver extends ContentObserver {
+         SettingsObserver() {
+             super(mHandler);
+@@ -1192,6 +1272,18 @@ public final class DisplayManagerService extends SystemService {
+                     Settings.Secure.getUriFor(
+                         Settings.Secure.MINIMAL_POST_PROCESSING_ALLOWED), false, this);
+ 
++            mContext.getContentResolver().registerContentObserver(
++                    Settings.Secure.getUriFor(SCREEN_SIZE_PERCENT), false, this,
++                    UserHandle.USER_ALL);
++
++            mContext.getContentResolver().registerContentObserver(
++                    Settings.Secure.getUriFor(SCREEN_SIZE_PERCENT_PREVIEW), false, this,
++                    UserHandle.USER_ALL);
++
++            mContext.getContentResolver().registerContentObserver(
++                    Settings.Secure.getUriFor(SCREEN_SIZE_PREVIEW_LEASE), false, this,
++                    UserHandle.USER_ALL);
++
+             if (mFlags.isDisplayContentModeManagementEnabled()) {
+                 mContext.getContentResolver().registerContentObserver(
+                         Settings.Secure.getUriFor(
+@@ -1207,6 +1299,15 @@ public final class DisplayManagerService extends SystemService {
+                 return;
+             }
+ 
++            if (Settings.Secure.getUriFor(SCREEN_SIZE_PERCENT).equals(uri)
++                    || Settings.Secure.getUriFor(SCREEN_SIZE_PERCENT_PREVIEW).equals(uri)
++                    || Settings.Secure.getUriFor(SCREEN_SIZE_PREVIEW_LEASE).equals(uri)) {
++                synchronized (mSyncRoot) {
++                    updateScreenSizePercentSettingLocked();
++                }
++                return;
++            }
++
+             if (Settings.Secure.getUriFor(MIRROR_BUILT_IN_DISPLAY).equals(uri)) {
+                 if (mFlags.isDisplayContentModeManagementEnabled()) {
+                     updateMirrorBuiltInDisplaySettingLocked();
+@@ -1223,6 +1324,119 @@ public final class DisplayManagerService extends SystemService {
+         }
+     }
+ 
++    /**
++     * Reads the screen-size setting and, when it differs from what the default display is
++     * already projecting, schedules the traversal that pushes the new projection down.
++     */
++    private void updateScreenSizePercentSettingLocked() {
++        applyScreenSizeLocked(/* allowPreview= */ mScreenSizeBootApplied);
++    }
++
++    /**
++     * Reads both settings, validates them with the one shared rule, and pushes the result into
++     * the default display.
++     *
++     * <p>A confirmed value outside 80..100, or unreadable, is a full-size picture. A preview
++     * outside that range is no preview at all, so it can never displace a valid confirmed size.
++     * A preview is only honoured while Settings keeps renewing its lease; each renewal re-arms
++     * the watchdog, and the watchdog puts the confirmed size back on its own authority.
++     *
++     * @param allowPreview false at boot and from the watchdog: the persisted preview is ignored
++     *                     outright, whatever it says.
++     */
++    private void applyScreenSizeLocked(boolean allowPreview) {
++        int confirmed;
++        int preview;
++        int lease;
++        try {
++            confirmed = Settings.Secure.getIntForUser(mContext.getContentResolver(),
++                    SCREEN_SIZE_PERCENT, LogicalDisplay.DISPLAY_SIZE_PERCENT_DEFAULT,
++                    UserHandle.USER_CURRENT);
++            preview = allowPreview
++                    ? Settings.Secure.getIntForUser(mContext.getContentResolver(),
++                            SCREEN_SIZE_PERCENT_PREVIEW, 0, UserHandle.USER_CURRENT)
++                    : 0;
++            lease = Settings.Secure.getIntForUser(mContext.getContentResolver(),
++                    SCREEN_SIZE_PREVIEW_LEASE, 0, UserHandle.USER_CURRENT);
++        } catch (RuntimeException e) {
++            // Same reasoning as clearScreenSizePreviewSetting(): a size that cannot be read is a
++            // full-size picture, not a reason to lose the display service.
++            Slog.w(TAG, "could not read the screen size, leaving the picture as it is", e);
++            return;
++        }
++        if (!LogicalDisplay.isValidDisplaySizePercent(confirmed)) {
++            confirmed = LogicalDisplay.DISPLAY_SIZE_PERCENT_DEFAULT;
++        }
++        if (!LogicalDisplay.isValidDisplaySizePercent(preview)) {
++            preview = 0;
++        }
++
++        // Keep the confirmed size in memory; the watchdog restores it from here, never from a
++        // re-read that might throw.
++        mScreenSizeConfirmed = confirmed;
++
++        if (!allowPreview) {
++            // Boot or the watchdog: no persisted preview may be applied, whatever it says. Record
++            // the persisted lease as already seen so the first later notification carrying it is
++            // not mistaken for a renewal, and end any session.
++            mScreenSizeLeaseSeen = lease;
++            endScreenSizePreviewSessionLocked();
++            projectScreenSizeLocked(confirmed);
++            return;
++        }
++
++        if (preview <= 0) {
++            // Cancellation. A preview of zero, a deleted key or an out-of-range value all mean
++            // "there is no trial any more" -- which is exactly what Settings writes on revert(),
++            // on BACK/onStop and when the confirmation window closes. End the session here and
++            // now: waiting for the watchdog would leave the trial size on screen for up to
++            // SCREEN_SIZE_PREVIEW_TIMEOUT_MS after the owner cancelled. The observed lease is
++            // consumed in the same breath so a queued stale notification carrying it cannot be
++            // mistaken for a renewal and revive the cancelled preview.
++            mScreenSizeLeaseSeen = lease;
++            endScreenSizePreviewSessionLocked();
++            projectScreenSizeLocked(confirmed);
++            return;
++        }
++
++        if (lease != mScreenSizeLeaseSeen) {
++            // A renewal: Settings wrote a new lease value, so the preview is genuinely live.
++            // This is the only path that (re-)arms the watchdog.
++            mScreenSizeLeaseSeen = lease;
++            mScreenSizePreview = preview;
++            mScreenSizePreviewActive = true;
++            mHandler.removeCallbacks(mClearScreenSizePreview);
++            mHandler.postDelayed(mClearScreenSizePreview, SCREEN_SIZE_PREVIEW_TIMEOUT_MS);
++            projectScreenSizeLocked(preview);
++            return;
++        }
++
++        // Not a renewal: a confirmed-size change, a hotplug, or a stale persisted preview whose
++        // lease has not moved. Do not re-arm or extend anything; reapply the currently accepted
++        // projection -- the live preview if a session is still active, otherwise the confirmed
++        // size.
++        projectScreenSizeLocked(mScreenSizePreviewActive ? mScreenSizePreview : confirmed);
++    }
++
++    /**
++     * Ends the live preview session: no trial value, no watchdog, nothing left that a later
++     * notification could reapply. The caller decides what to project afterwards.
++     */
++    private void endScreenSizePreviewSessionLocked() {
++        mScreenSizePreviewActive = false;
++        mScreenSizePreview = 0;
++        mHandler.removeCallbacks(mClearScreenSizePreview);
++    }
++
++    /** Pushes {@code percent} into the default display and schedules the traversal if it changed. */
++    private void projectScreenSizeLocked(int percent) {
++        final LogicalDisplay display =
++                mLogicalDisplayMapper.getDisplayLocked(Display.DEFAULT_DISPLAY);
++        if (display != null && display.setDisplaySizePercentLocked(percent)) {
++            scheduleTraversalLocked(false);
++        }
++    }
++
+     private void updateMinimalPostProcessingAllowedSettingLocked() {
+         setMinimalPostProcessingAllowed(Settings.Secure.getIntForUser(
+                 mContext.getContentResolver(), Settings.Secure.MINIMAL_POST_PROCESSING_ALLOWED,
+@@ -2361,6 +2575,12 @@ public final class DisplayManagerService extends SystemService {
+             mSyncRoot.notifyAll();
+         }
+ 
++        // A display that has just appeared projects at full size, so put the owner's
++        // calibration back: the picture keeps its size across an HDMI reconnect.
++        if (isDefault && mSystemReady) {
++            updateScreenSizePercentSettingLocked();
++        }
++
+         sendDisplayEventIfEnabledLocked(display, DisplayManagerGlobal.EVENT_DISPLAY_ADDED);
+ 
+         updateLogicalDisplayState(display);
+diff --git a/services/core/java/com/android/server/display/LogicalDisplay.java b/services/core/java/com/android/server/display/LogicalDisplay.java
+index 1de9c9589..9a8c6d3bf 100644
+--- a/services/core/java/com/android/server/display/LogicalDisplay.java
++++ b/services/core/java/com/android/server/display/LogicalDisplay.java
+@@ -136,6 +136,21 @@ final class LogicalDisplay {
+      */
+     private boolean mDisplayScalingDisabled;
+ 
++    /** The smallest share of the panel the picture may be scaled into. */
++    public static final int DISPLAY_SIZE_PERCENT_MIN = 80;
++
++    /** The picture fills the panel. */
++    public static final int DISPLAY_SIZE_PERCENT_DEFAULT = 100;
++
++    /**
++     * The share of the panel, in percent, that the whole picture is scaled into. A television
++     * which overscans cuts the edges off; pulling this below 100 insets the picture on all four
++     * sides until the edges are visible again. It is applied to the display projection, so it
++     * moves everything the display carries: windows, the planes the hardware composer drives
++     * itself (the video overlay) and the pointer.
++     */
++    private int mDisplaySizePercent = DISPLAY_SIZE_PERCENT_DEFAULT;
++
+     // Temporary rectangle used when needed.
+     private final Rect mTempLayerStackRect = new Rect();
+     private final Rect mTempDisplayRect = new Rect();
+@@ -775,6 +790,19 @@ final class LogicalDisplay {
+         // Now add back the offset for the masked area.
+         mTempDisplayRect.offset(maskingInsets.left, maskingInsets.top);
+ 
++        // Pull the picture in for a television that overscans. Because this is the display
++        // projection rather than a window transform, SurfaceFlinger applies it to every layer
++        // the display carries, the hardware composer's own planes included.
++        if (mDisplaySizePercent < DISPLAY_SIZE_PERCENT_DEFAULT) {
++            final int centerX = mTempDisplayRect.centerX();
++            final int centerY = mTempDisplayRect.centerY();
++            final int scaledWidth = mTempDisplayRect.width() * mDisplaySizePercent / 100;
++            final int scaledHeight = mTempDisplayRect.height() * mDisplaySizePercent / 100;
++            final int left = centerX - scaledWidth / 2;
++            final int top = centerY - scaledHeight / 2;
++            mTempDisplayRect.set(left, top, left + scaledWidth, top + scaledHeight);
++        }
++
+         if (orientation == Surface.ROTATION_0) {
+             mTempDisplayRect.offset(mDisplayOffsetX, mDisplayOffsetY);
+         } else if (orientation == Surface.ROTATION_90) {
+@@ -896,6 +924,36 @@ final class LogicalDisplay {
+         mDisplayScalingDisabled = disableScaling;
+     }
+ 
++    /**
++     * Scales the whole picture into a centred share of the panel.
++     *
++     * @param percent between {@link #DISPLAY_SIZE_PERCENT_MIN} and
++     * {@link #DISPLAY_SIZE_PERCENT_DEFAULT}; values outside that range are clamped.
++     * @return {@code true} if the value changed, so the caller must schedule a traversal.
++     */
++    public boolean setDisplaySizePercentLocked(int percent) {
++        // Out of range is invalid, not "nearest valid": a stored 1 must mean "no calibration",
++        // which is a full-size picture, on this side exactly as on the Settings side.
++        if (!isValidDisplaySizePercent(percent)) {
++            percent = DISPLAY_SIZE_PERCENT_DEFAULT;
++        }
++        if (mDisplaySizePercent == percent) {
++            return false;
++        }
++        mDisplaySizePercent = percent;
++        return true;
++    }
++
++    /** @return the share of the panel, in percent, the picture is currently scaled into. */
++    public int getDisplaySizePercentLocked() {
++        return mDisplaySizePercent;
++    }
++
++    /** The one validation rule, shared with DisplayManagerService and mirrored in Settings. */
++    public static boolean isValidDisplaySizePercent(int percent) {
++        return percent >= DISPLAY_SIZE_PERCENT_MIN && percent <= DISPLAY_SIZE_PERCENT_DEFAULT;
++    }
++
+     public void setUserDisabledHdrTypes(@NonNull int[] userDisabledHdrTypes) {
+         if (mUserDisabledHdrTypes != userDisabledHdrTypes) {
+             mUserDisabledHdrTypes = userDisabledHdrTypes;
+@@ -1081,6 +1139,7 @@ final class LogicalDisplay {
+         pw.println("mRequestedColorMode=" + mRequestedColorMode);
+         pw.println("mDisplayOffset=(" + mDisplayOffsetX + ", " + mDisplayOffsetY + ")");
+         pw.println("mDisplayScalingDisabled=" + mDisplayScalingDisabled);
++        pw.println("mDisplaySizePercent=" + mDisplaySizePercent);
+         pw.println("mBaseDisplayInfo=" + mBaseDisplayInfo);
+         pw.println("mOverrideDisplayInfo=" + mOverrideDisplayInfo);
+         pw.println("mRequestedMinimalPostProcessing=" + mRequestedMinimalPostProcessing);

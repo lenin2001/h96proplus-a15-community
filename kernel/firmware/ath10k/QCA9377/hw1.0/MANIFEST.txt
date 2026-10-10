@@ -1,0 +1,9 @@
+QCA9377 hw1.0 SDIO firmware for mainline ath10k (CONFIG_ATH10K_SDIO), fetched 2026-09-09
+Source: linux-firmware.git (git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git), path ath10k/QCA9377/hw1.0/
+Driver requests (drivers/net/wireless/ath/ath10k/core.c ath10k_core_get_fw_name, SDIO bus): firmware-sdio-N.bin, N=6..2; board-2.bin (API2), then board.bin
+Licence: Qualcomm Atheros redistributable, see notice_ath10k_firmware-sdio-5.txt (WHENCE: "Licence: Redistributable")
+sha256:
+017b4ae7bdb5821ecb439fbf96d198421a57926918f2513db5fbd6d9c01debe6  firmware-sdio-5.bin  (WHENCE Version: WLAN.TF.1.1.1-00061-QCATFSWPZ-1, 617852 B)
+0fdcc7838f478da81704de88f7b33e28862110c6d5decf7818543f8e37e6cd98  board-2.bin (304308 B)
+127d35d82edb46278f30c448cbca664d755ff0d5fed57b649959cdbc4208c768  board.bin (8124 B)
+Verified on device 2026-09-09: ath10k_sdio mmc2:0001:1 qca9377 hw1.1 sdio, "firmware ver WLAN.TF.1.1.1-00061-QCATFSWPZ-1 api 5", board_file api 1 (board-2 has no entry for subsystem 0000:0000), cal otp -> phy + wlan0 created.

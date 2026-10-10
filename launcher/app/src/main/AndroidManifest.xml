@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        Лаунчер для TV-приставки. Управление — D-pad с пульта, поэтому
+        сенсорный экран объявлен необязательным, а leanback — требуемым
+        (ТЗ §12, §34).
+    -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="true" />
+
+    <!-- Нужно, чтобы видеть установленные приложения и строить из них сетку.
+         Начиная с Android 11 без этого PackageManager отдаёт лишь часть. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <!--
+        Разрешения не запрашиваются намеренно:
+          INTERNET       не нужен — обои локальные, сеть лаунчер не трогает
+          STORAGE        не нужен — ничего не читаем с диска
+          QUERY_ALL_PACKAGES  не нужен — хватает <queries> выше
+        Чем меньше разрешений, тем меньше поводов у системы будить процесс.
+    -->
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.MovieLauncher"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize"
+            android:theme="@style/Theme.MovieLauncher">
+
+            <!-- HOME + DEFAULT делают приложение лаунчером.
+                 LEANBACK_LAUNCHER — чтобы оно было видно как TV-приложение. -->
+            <intent-filter android:priority="1">
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>

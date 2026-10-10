@@ -1,0 +1,27 @@
+Включение аппаратного NEC-декода IR + реальные коды пульта для режима мыши.
+
+Проблема (05.09.2026): кнопка мыши на пульте не работает. Причина: приёмник
+meson-ir на H96 (compatible amlogic,meson-gxbb-ir -> meson8b_ir_param,
+support_hw_decoder=false) поднимается как RC_DRIVER_IR_RAW; NEC декодит
+rc-core, а вся логика мыши (patch 0012) живёт в ветке RC_DRIVER_SCANCODE
+(meson_ir_nec_handler), которая при RAW НЕ исполняется -> обработчик мёртв.
+Плюс зашитые коды были от СТОКОВОГО пульта (addr 0x4040), а реальный пульт
+владельца — addr 0x01 (снято getevent 05.09).
+
+Правки (drivers/media/rc/meson-ir.c):
+ - H96_FN 0x47->0x00 (кнопка мыши, scan 0x100), H96_UP 0x0b->0x16,
+   H96_DOWN 0x0e->0x1a, H96_LEFT 0x10->0x51, H96_RIGHT 0x11->0x50,
+   H96_OK 0x0d->0x13.
+ - meson_gxm_ir_param { support_hw_decoder=true; max_register=IR_DEC_FRAME1 }
+   + of_match "amlogic,meson-gxm-ir".
+DTS (meson-gxm-h96proplus.dts): &ir { compatible = "amlogic,meson-gxm-ir"; };
+-> приёмник в RC_DRIVER_SCANCODE, meson_ir_nec_handler исполняется, режим
+мыши работает.
+
+БЕЗОПАСНОСТЬ КЛАВИШ: keymap (h96proplus-nec.toml) грузится в rc0->rc_map
+независимо (ir-keytable), а handler зовёт rc_keydown с тем же scancode ->
+обычные клавиши не ломаются. РИСК: если HW-декод на GXM не выдаёт валидные
+кадры — пульт отвалится; откат = вернуть kernel #61 (KERN.BAK на p1) через adb.
+
+Android-сторона мыши исправна (event1 "meson-ir mouse" класс CURSOR, курсор
+двигается от sendevent REL — проверено).

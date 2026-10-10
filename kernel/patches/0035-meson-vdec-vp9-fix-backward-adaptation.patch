@@ -1,0 +1,56 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0035] meson-vdec: fix VP9 backward probability adaptation (the "four columns")
+
+THIS is the owner's VP9 corruption: four vertical garbage columns on heavy
+YouTube VP9. Upstream bug, present as of Linux 7.1.
+
+In adapt_coef_probs() the binary mode/mv merge loop walks the count buffer two
+counts at a time; an if/else-if chain maps the START of each count group to the
+start of its probability group, and for every other position the running
+coef_node_start must simply keep incrementing. The last branch was a bare
+"else", which reset coef_node_start to VP9_MV_CLASS0_HP_0_START on EVERY
+non-start position - so intra/inter, comp/single ref, tx and skip probabilities
+were adapted into the wrong slots (the mv class0_hp ones) and the right slots
+kept stale values.
+
+Backward adaptation only happens when frame_parallel_decoding_mode = 0. Light
+YouTube encodes use parallel mode (no adaptation) and decoded bit-exact; heavy
+ones (e.g. psQ8Jfkhyp8 itag 248, peak 16 Mbit/s - the owner's class of stream)
+do not. Frame 1 decodes from a context adapted after the KEY frame (coef only,
+unaffected) and is right; frame 2 is the first to use a context adapted after
+an INTER frame and is wrong, and the error rides every inter frame to the next
+key frame. Each tile column's entropy decoding goes off the rails at its own
+point: the capture hook's dump of frame 2 shows exactly four columns split at
+x = 448 / 960 / 1408 (tile_cols_log2 = 2 read from the bitstream), correct at
+the top, smooth prediction smear below.
+
+Measured 23.09: dectest, 20 s of that stream, HW vs c2.android.vp9.decoder:
+kernel #93 587/600 frames wrong, kernel #94 (this patch) 0/600 wrong in Y, U
+and V. Live SmartTube on #95: 2457 frames, every one bit-exact to libvpx,
+through 149 park/resume events and 10 seeks.
+
+---
+diff -ruN s34/drivers/staging/media/meson/vdec/codec_vp9.c s35/drivers/staging/media/meson/vdec/codec_vp9.c
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -2105,7 +2105,19 @@
+ 			else if (coef_count_node_start ==
+ 					VP9_MV_BITS_1_COUNT_START)
+ 				coef_node_start = VP9_MV_BITS_1_START;
+-			else /* node_start == VP9_MV_CLASS0_HP_0_COUNT_START */
++			/*
++			 * h96 0035 (23.09.2026): this was a bare "else" (upstream too,
++			 * as of Linux 7.1). Every count pair that is NOT the start of a
++			 * group must keep the running coef_node_start; the bare else
++			 * reset it to the MV class0_hp probabilities on every such pair,
++			 * so intra/inter, comp/single ref, tx and skip probabilities were
++			 * adapted into the wrong slots. Only streams with
++			 * frame_parallel_decoding_mode = 0 use backward adaptation, so
++			 * light YouTube VP9 was fine and heavy 1080p VP9 came out as four
++			 * garbage tile columns from the second inter frame on.
++			 */
++			else if (coef_count_node_start ==
++					VP9_MV_CLASS0_HP_0_COUNT_START)
+ 				coef_node_start = VP9_MV_CLASS0_HP_0_START;
+ 
+ 			den = count[coef_count_node_start] +

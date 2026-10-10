@@ -1,0 +1,106 @@
+diff --git a/drivers/staging/media/meson/vdec/codec_vp9.c b/drivers/staging/media/meson/vdec/codec_vp9.c
+index 12c3bcd86..257e21afb 100644
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -2146,20 +2303,72 @@ static irqreturn_t codec_vp9_threaded_isr(struct amvdec_session *sess)
+ 
+ 	codec_vp9_fetch_rpm(sess);
+ 	if (codec_vp9_process_rpm(vp9)) {
+-		amvdec_src_change(sess, vp9->width, vp9->height, 16,
+-				  vp9->is_10bit ? 10 : 8);
++		u32 w = vp9->width, h = vp9->height;
++		u32 bd = vp9->is_10bit ? 10 : 8;
+ 
+ 		/* No frame is actually processed */
+ 		vp9->cur_frame = NULL;
+ 
+-		/* Show the remaining frame */
+-		codec_vp9_show_frame(sess);
++		/*
++		 * h96 04.09.2026: pri smene razresheniya (seek na 4K VP9) nuzhno
++		 * ne prosto vydat' show-kadry, no I VERNUT' noshow (alt-ref)
++		 * bufery v ochered'. codec_vp9_show_frame() noshow ostavlyaet v
++		 * ref_frames_list - oni derzhat CAPTURE-bufery, kotorye my nizhe
++		 * vse ravno brosaem (ref_frame_map -> -1). Cherez neskol'ko seek
++		 * bufery zakanchivayutsya, codec_vp9_get_new_frame() vozvrashchaet
++		 * NULL -> process_frame tiho vyhodit -> dekoder zависает (vremya
++		 * idet, kadrov net). Tut - polnyj reklejm, kak v flush_output().
++		 */
++		{
++			struct vp9_frame *ftmp, *fn;
++
++			list_for_each_entry_safe(ftmp, fn,
++						 &vp9->ref_frames_list, list) {
++				if (!ftmp->done) {
++					if (ftmp->show)
++						amvdec_dst_buf_done(sess,
++							ftmp->vbuf,
++							V4L2_FIELD_NONE);
++					else
++						v4l2_m2m_buf_queue(
++							sess->m2m_ctx,
++							ftmp->vbuf);
++					vp9->frames_num--;
++				}
++				list_del(&ftmp->list);
++				kfree(ftmp);
++			}
++		}
+ 
+ 		/* FIXME: Save refs for resized frame */
+ 		if (vp9->frames_num)
+ 			codec_vp9_save_refs(vp9);
+ 
+-		goto unlock;
++		/*
++		 * 01.09.2026: codec_vp9_save_refs() nichego ne perenosit - eto
++		 * zaglushka s pr_warn "would need to save ref". Znachit posle
++		 * smeny razresheniya karty obyazany stat' pustymi, inache
++		 * sleduyushchij inter-kadr ishchet indeksy uzhe osvobozhdennyh
++		 * kadrov i my snova poluchaem "couldn't find VP9 ref N".
++		 */
++		memset(vp9->ref_frame_map, -1, sizeof(vp9->ref_frame_map));
++		memset(vp9->next_ref_frame_map, -1,
++		       sizeof(vp9->next_ref_frame_map));
++		for (i = 0; i < REFS_PER_FRAME; ++i)
++			vp9->frame_refs[i] = NULL;
++		vp9->prev_frame = NULL;
++
++		/*
++		 * I glavnoe: amvdec_src_change() SINHRONNO zovet
++		 * codec_ops->resume() (vdec_helpers.c:494), a codec_vp9_resume()
++		 * beret vot etot samyj vp9->lock. Ran'she vyzov shel iz-pod
++		 * zazhatogo loka - tred preryvaniya blokiroval sam sebya
++		 * namertvo. Otpuskaem lok DO vyzova; nizhe metki unlock nichego
++		 * krome mutex_unlock net, poetomu vyhodim srazu.
++		 */
++		mutex_unlock(&vp9->lock);
++		amvdec_src_change(sess, w, h, 16, bd);
++		return IRQ_HANDLED;
+ 	}
+ 
+ 	codec_vp9_process_lf(vp9);
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index e504e5aea..c8f4cbf1b 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -467,6 +561,19 @@ void amvdec_src_change(struct amvdec_session *sess, u32 width,
+ 	    sess->height == height &&
+ 	    dpb_size <= sess->num_dst_bufs) {
+ 		sess->fmt_out->codec_ops->resume(sess);
++		/*
++		 * h96 04.09.2026: geometriya NE izmenilas' i CAPTURE-ochered'
++		 * uzhe nastroena - tiho prodolzhaem dekod na tekh zhe buferah.
++		 * NEL'ZYA slat' V4L2_EVENT_SOURCE_CHANGE (nizhe): CCodec po
++		 * kontraktu stateful-dekodera gasit CAPTURE (STREAMOFF ->
++		 * polnyj teardown vdec_stop_streaming), rekonfiguriruet, snova
++		 * STREAMON -> proshivka perechityvaet SPS -> snova CMD_SRC_CHANGE
++		 * -> samopodderzhivayushchayasya petlya teardown/reconfigure kazhdye
++		 * 3-5 s, konvejer stoit, na odnoj iz iteracij poweroff lovit gonku
++		 * s mailbox-IRQ i storozh perezagruzhaet SoC (Alfa H264 1920x1036).
++		 * V mainline posle resume() byl imenno return.
++		 */
++		return;
+ 	} else {
+ 		sess->status = STATUS_NEEDS_RESUME;
+ 		sess->changed_format = 0;

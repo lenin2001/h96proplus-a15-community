@@ -1,0 +1,6 @@
+# Правила ueventd для H96 Pro Plus.
+#
+# meson-vdec (/dev/video0): сервис v4l2_codec2 работает под user media
+# (см. его .rc), а дефолтная метка AOSP отдаёт /dev/video* группе
+# camera — камеры на приставке нет, узел принадлежит декодеру.
+/dev/video0   0660   media   media

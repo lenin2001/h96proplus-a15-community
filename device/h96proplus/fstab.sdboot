@@ -1,0 +1,37 @@
+# fstab.sdboot — первая загрузка Android целиком с SD-карты (M6)
+#
+# eMMC не трогаем вообще: вся система живёт на карте. Выбирается через
+# androidboot.fstab_suffix=sdboot в bootargs из aml_autoscript
+# (см. docs/m6-boot.md).
+#
+# Устройство детерминировано: в mainline meson-gx.dtsi есть aliases
+# mmc0 = &sd_emmc_b (SD), mmc1 = &sd_emmc_c (eMMC) — SD всегда mmcblk0,
+# путаницы «кто из них mmcblk0» (как в bring-up-initramfs) здесь нет.
+#
+# Разметка карты — MBR (стоковый U-Boot 2018 читает FAT только с MBR;
+# GPT не проверялся, не рискуем):
+#   p1  FAT32   aml_autoscript + Image + dtb + ramdisk.img  (≥128 МиБ)
+#   p2  ext4    ← system.img                                (4 ГиБ)
+#   p3  ext4    ← vendor.img                                (512 МиБ)
+#   p4  ext4    data, чистый                                (остаток)
+#
+# ⛔ errors=remount-ro, А НЕ panic (31.08.2026).
+# С errors=panic приставка после выключения из розетки встала в вечный
+# цикл: раздел монтируется, сеть поднимается, первая же ошибка журнала —
+# паника ядра и сброс, каждые две минуты. Ни отладки, ни спасательного
+# режима: до них загрузка не доживала. Теперь при ошибке раздел просто
+# уходит в режим только для чтения — система грузится, и файловую систему
+# можно проверить и починить по сети.
+
+# ⚠️ Шифрование /data на bring-up НЕ включаем — минимум движущихся частей.
+# Включение позже потребует переформатирования data (это только SD, не жалко).
+#
+#<src>                <mnt_point>  <type>  <mnt_flags>                        <fs_mgr_flags>
+
+# EROFS, а не ext4: см. BoardConfig.mk — стоковый Android не должен уметь
+# монтировать эти разделы, иначе он перекрашивает на них SELinux-метки.
+/dev/block/mmcblk0p2  /system      erofs   ro                                 wait,first_stage_mount
+/dev/block/mmcblk0p3  /vendor      erofs   ro                                 wait,first_stage_mount
+/dev/block/mmcblk0p4  /data        ext4    noatime,nosuid,nodev,errors=remount-ro  wait,check,formattable
+
+/dev/block/zram0      none         swap    defaults                           zramsize=1073741824

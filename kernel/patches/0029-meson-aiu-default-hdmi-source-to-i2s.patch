@@ -1,0 +1,86 @@
+From: h96 work order 2026-09-14
+Subject: [PATCH] ASoC: meson: aiu: default the HDMI source mux to I2S
+
+Measured on the box with audio playing: pcm0p is RUNNING, S16_LE stereo 48 kHz, the hardware
+pointer advances and there is not a single XRUN - yet every widget from the I2S FIFO to HDMITX TX
+is Off, so nothing reaches the sink.
+
+    AIU I2S FIFO Playback      Off  in 1 out 0
+    AIU I2S Encoder Playback   Off  in 1 out 0
+    AIU HDMI I2S IN Playback   Off  in 1 out 0     <- no output
+    AIU HDMI CTRL SRC          Off  in 0 out 1     <- no input
+    HDMITX I2S Playback / TX   Off
+
+The chain is broken at exactly one point, the "AIU HDMI CTRL SRC" mux. Its enum reads
+CTRL_DATA_SEL of AIU_HDMI_CLK_DATA_CTRL, which is zero after reset - "DISABLED" - and nothing
+sets it. This image carries neither tinymix nor alsa_ctl, and the AIDL audio HAL does not apply
+mixer path files, so the control is never touched.
+
+Setting it to I2S from userspace powered the whole chain in one step, which is what establishes
+the diagnosis rather than inferring it:
+
+    AIU I2S Encoder Playback   Off -> On       AIU HDMI CTRL SRC     Off -> On
+    AIU I2S FIFO Playback      Off -> On       AIU HDMI OUT Capture  Off -> On
+    AIU HDMI I2S IN Playback   Off -> On       HDMITX I2S Playback   Off -> On
+    be.dai-link-4-playback     Off -> On       HDMITX TX             Off -> On
+
+That setting is lost on the next boot, which also explains the owner's report that HDMI sound
+used to work and then stopped.
+
+Initialise the field at component probe, writing the same two fields and the same value that the
+mux's own put handler writes for I2S. Userspace can still change the control afterwards; this
+replaces the reset default only.
+
+Scope, stated plainly: this changes the default for every board using this driver, not only this
+one. It is correct for a board whose sole audio output is HDMI, which is the case here; a board
+wired to the analogue codec still selects ACODEC at runtime as before.
+
+Audibility itself is not claimed here - the DAPM graph and the PCM state are what was measured.
+
+--- a/sound/soc/meson/aiu-codec-ctrl.c
++++ b/sound/soc/meson/aiu-codec-ctrl.c
+@@ -20,6 +20,9 @@
+ 	"DISABLED", "PCM", "I2S",
+ };
+ 
++/* h96 0029: indeks "I2S" v aiu_codec_ctrl_mux_texts - on zhe znachenie polya */
++#define AIU_HDMI_CTRL_SRC_I2S	2
++
+ static int aiu_codec_ctrl_mux_put_enum(struct snd_kcontrol *kcontrol,
+ 				       struct snd_ctl_elem_value *ucontrol)
+ {
+@@ -129,8 +132,34 @@
+ 	return aiu_of_xlate_dai_name(component, args, dai_name, AIU_HDMI);
+ }
+ 
++/*
++ * h96 0029 (14.09.2026): vybrat' I2S kak istochnik HDMI-zvuka po umolchaniyu.
++ *
++ * Posle sbrosa pole CTRL_DATA_SEL registra AIU_HDMI_CLK_DATA_CTRL ravno nulyu,
++ * to est' mux stoit v "DISABLED", i ves' put' ot AIU I2S FIFO do HDMITX TX
++ * ostaetsya obestochennym: PCM igraet, ukazatel' idet, a zvuka net. Vystavlyat'
++ * etot kontrol nekomu - v obraze net ni tinymix, ni alsa_ctl, a shtatnyj AIDL-HAL
++ * fajly mikshera ne primenyaet.
++ *
++ * Pishem te zhe dva polya i to zhe znachenie, chto i sobstvennyj .put muxa dlya
++ * I2S. Userspace po-prezhnemu mozhet pereklyuchit' kontrol - my tol'ko menyaem
++ * znachenie po umolchaniyu, a ne zapreshchaem vybor.
++ */
++static int aiu_hdmi_ctrl_component_probe(struct snd_soc_component *component)
++{
++	unsigned int i2s = AIU_HDMI_CTRL_SRC_I2S;
++
++	snd_soc_component_update_bits(component, AIU_HDMI_CLK_DATA_CTRL,
++				      CTRL_CLK_SEL | CTRL_DATA_SEL,
++				      FIELD_PREP(CTRL_CLK_SEL, i2s) |
++				      FIELD_PREP(CTRL_DATA_SEL, i2s));
++
++	return 0;
++}
++
+ static const struct snd_soc_component_driver aiu_hdmi_ctrl_component = {
+ 	.name			= "AIU HDMI Codec Control",
++	.probe			= aiu_hdmi_ctrl_component_probe,
+ 	.dapm_widgets		= aiu_hdmi_ctrl_widgets,
+ 	.num_dapm_widgets	= ARRAY_SIZE(aiu_hdmi_ctrl_widgets),
+ 	.dapm_routes		= aiu_hdmi_ctrl_routes,

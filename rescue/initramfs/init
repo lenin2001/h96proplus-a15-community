@@ -1,0 +1,134 @@
+#!/bin/busybox sh
+# ═══════════════════════════════════════════════════════════════════════════
+# H96 Pro Plus — SD rescue environment (rescue.img), public version
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Purpose: a minimal Linux booted from the SD card, so that nothing on the
+# internal eMMC is in use and installer/h96-install.py can read and write it.
+# This environment NEVER writes the eMMC by itself and never runs anything it
+# finds on the card or on the network. All writes come from the installer,
+# which verifies hashes before and after.
+#
+# ⚠️ SECURITY: while it runs, ANYONE who can reach the box over the network
+# gets a ROOT SHELL WITHOUT A PASSWORD (busybox telnetd, TCP port 23).
+# Use it only with a cable directly between your PC and the box, or on an
+# isolated network, and disarm the card / power off when you are done.
+#
+# Network configuration (optional) — file h96-rescue.conf on the card's FAT
+# partition, plain KEY=VALUE lines, nothing else is interpreted:
+#     RESCUE_IP=192.0.2.202
+#     RESCUE_NETMASK=255.255.255.0
+#     RESCUE_GW=192.0.2.1            (optional)
+# Without the file the rescue asks a DHCP server (busybox udhcpc). The address
+# in use is written to RESCUE.LOG on the card and to the kernel log/console.
+#
+# Derived from the maintainer's SD-era rescue. Removed for the public version:
+# automatic image installation/rollback from the card (unverified gzip|dd),
+# HTTP server exporting the whole filesystem, and a second root shell on
+# port 24. Public-release change, not yet tested on hardware.
+
+SD=/dev/mmcblk0          # SD card: mmc0 = sd_emmc_b (aliases in meson-gx.dtsi)
+CONF=/sd/h96-rescue.conf
+
+/bin/busybox --install -s /bin 2>/dev/null
+
+mkdir -p /proc /sys /dev /tmp /sd /mnt /etc
+mount -t proc     proc     /proc 2>/dev/null
+mount -t sysfs    sysfs    /sys  2>/dev/null
+mount -t devtmpfs devtmpfs /dev  2>/dev/null
+mount -t tmpfs    tmpfs    /tmp  2>/dev/null
+# Pseudo-terminals: without them busybox telnetd silently refuses to start.
+mkdir -p /dev/pts
+mount -t devpts   devpts   /dev/pts 2>/dev/null
+
+log() { echo "RESCUE: $*" > /dev/kmsg 2>/dev/null; echo "RESCUE: $*" > /dev/console 2>/dev/null; }
+log "start"
+
+# ── hardware watchdog ─────────────────────────────────────────────────────
+# Android boots with meson_gxbb_wdt.start_at_probe=1; if the watchdog runs
+# here as well, keep feeding it or it resets the box within a minute.
+pet_watchdog() {
+    [ -c /dev/watchdog ] || return
+    while : ; do echo 1 > /dev/watchdog 2>/dev/null; sleep 15; done &
+}
+pet_watchdog
+
+# ── SD card (FAT partition 1) ─────────────────────────────────────────────
+n=0
+while [ ! -b ${SD}p1 ] && [ $n -lt 30 ]; do sleep 1; n=$((n+1)); done
+mount -t vfat ${SD}p1 /sd 2>/dev/null && log "card mounted"
+
+# ── network ───────────────────────────────────────────────────────────────
+# Accept only dotted-quad values for the three known keys; ignore the rest.
+conf_get() { # <key>
+    [ -f "$CONF" ] || return 0
+    tr -d '\r' < "$CONF" | grep -E "^$1=[0-9]{1,3}(\.[0-9]{1,3}){3}$" | tail -1 | cut -d= -f2
+}
+ifconfig lo 127.0.0.1 up 2>/dev/null
+n=0
+while [ ! -e /sys/class/net/eth0 ] && [ $n -lt 25 ]; do sleep 1; n=$((n+1)); done
+
+IP=$(conf_get RESCUE_IP)
+MASK=$(conf_get RESCUE_NETMASK)
+GW=$(conf_get RESCUE_GW)
+if [ -n "$IP" ]; then
+    ifconfig eth0 "$IP" netmask "${MASK:-255.255.255.0}" up 2>/dev/null
+    [ -n "$GW" ] && route add default gw "$GW" dev eth0 2>/dev/null
+    NETMODE="static from h96-rescue.conf"
+else
+    cat > /tmp/udhcpc.script <<'EOF'
+#!/bin/sh
+case "$1" in
+    bound|renew)
+        ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" up
+        if [ -n "$router" ]; then
+            route del default 2>/dev/null
+            for r in $router; do route add default gw "$r" dev "$interface"; break; done
+        fi
+        ;;
+    deconfig) ifconfig "$interface" 0.0.0.0 ;;
+esac
+EOF
+    chmod 755 /tmp/udhcpc.script
+    ifconfig eth0 up 2>/dev/null
+    # The RTL8211F link comes up a few seconds after the interface: retry.
+    udhcpc -i eth0 -s /tmp/udhcpc.script -t 15 -T 3 -n -q >/tmp/udhcpc.log 2>&1
+    NETMODE="DHCP"
+fi
+ADDR=$(ifconfig eth0 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
+log "network: ${ADDR:-NO ADDRESS} ($NETMODE)"
+
+# ── report on the card ────────────────────────────────────────────────────
+{
+    echo "=== H96 rescue $(date) ==="
+    echo "network: ${ADDR:-NO ADDRESS} ($NETMODE)"
+    ifconfig eth0 2>/dev/null | head -3
+    echo "--- partitions:"; cat /proc/partitions
+    echo "--- eMMC identity:"
+    for d in /sys/block/mmcblk*; do
+        [ -f "$d/device/type" ] || continue
+        echo "$(basename "$d"): type=$(cat "$d/device/type") name=$(cat "$d/device/name" 2>/dev/null) sectors=$(cat "$d/size")"
+    done
+    echo "--- kernel messages (mmc/ext4/errors):"
+    dmesg | grep -iE "mmc|ext4|error|crc|timeout" | tail -40
+} > /sd/RESCUE.LOG 2>&1
+sync
+
+# ── console for the installer ─────────────────────────────────────────────
+# telnetd is kept in a loop: once it died silently and left no console.
+( while : ; do
+    telnetd -F -l /bin/sh >>/tmp/telnetd.log 2>&1
+    echo "telnetd exited rc=$? uptime=$(cut -d' ' -f1 /proc/uptime)" >> /tmp/telnetd.log
+    sleep 2
+  done ) &
+log "telnet console up on ${ADDR:-?}:23 (no password, see SECURITY above)"
+echo "RESCUE-READY" > /tmp/STATUS
+
+# ── idle ──────────────────────────────────────────────────────────────────
+n=0
+while : ; do
+    n=$((n + 1))
+    echo "RESCUE-ALIVE ${n}" > /tmp/STATUS
+    [ $((n % 30)) -eq 0 ] && { echo "alive $(date)" >> /sd/RESCUE.LOG; sync; }
+    sleep 10
+done

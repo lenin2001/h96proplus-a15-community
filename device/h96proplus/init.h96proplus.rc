@@ -1,0 +1,254 @@
+# init.h96proplus.rc — device-специфичный init.
+#
+# ⛔ Этот файл ОБЯЗАТЕЛЕН: first-stage init монтирует только system/vendor,
+# а /data монтирует mount_all отсюда. Без него /data не монтируется вообще:
+# keystore2 паникует (нет /data/misc/keystore), tombstoned выходит с кодом 1,
+# загрузка вечно стоит «на пингвинах» (ramoops попытки №5, 19.08).
+#
+# mount_all без аргументов сам выбирает fstab с учётом
+# androidboot.fstab_suffix (sdboot → /vendor/etc/fstab.sdboot).
+
+# ⛔ /metadata как tmpfs — обязателен для кодеков, см. BoardConfig.mk.
+# Именно early-init: системный init.rc уже на «on init» делает
+# mkdir /metadata/vold и прочие, а штатный aconfigd.rc на «on post-fs»
+# создаёт /metadata/aconfig/* и запускает заполнение карт флагов — к обоим
+# моментам точка обязана быть смонтирована и записываема.
+on early-init
+    mount tmpfs tmpfs /metadata rw nosuid nodev noexec
+
+
+on fs
+    mount_all
+
+    # ⛔ ПОДКАЧКА ВКЛЮЧАЕТСЯ ВРУЧНУЮ, А НЕ ЧЕРЕЗ swapon_all.
+    #
+    # Приставке она необходима: памяти 1,74 ГиБ, а с сервисами Google
+    # свободного оставалось бы совсем мало. Запись про zram во fstab
+    # (zramsize=536870912) сама по себе НИЧЕГО не включает — swap
+    # поднимает отдельный builtin, которого в штатном
+    # system/core/rootdir/init.rc нет ни разу (у Amlogic это
+    # init.yukawa.rc:18).
+    #
+    # ⛔ Но и штатный `swapon_all` на нашем ядре НЕ РАБОТАЕТ. Проверено
+    # на живой приставке 22.08, в логе загрузки:
+    #     E init: [libfs_mgr] Unable to open zram conf comp device
+    #                         /sys/block/zram0/max_comp_streams
+    #     I init: Command 'swapon_all' ... failed: fs_mgr_swapon_all() failed
+    # Причина в fs_mgr.cpp:2038 — `if (entry.max_comp_streams >= 0)`, а
+    # значение по умолчанию РОВНО 0 (подтверждено тестом самого AOSP:
+    # fs_mgr_test.cpp:539 `EXPECT_EQ(0, entry->max_comp_streams)`).
+    # То есть fs_mgr ВСЕГДА лезет в этот файл, а в mainline-ядре его нет:
+    # атрибут устарел и удалён (в списке /sys/block/zram0/ его нет,
+    # CONFIG_ZRAM_MULTI_COMP не задан). Не найдя файл, fs_mgr делает
+    # `continue` и бросает настройку целиком — disksize остаётся 0.
+    # Это несовместимость AOSP с современными ядрами, а не наша ошибка,
+    # и обойти её через fstab нельзя: отрицательное значение туда не
+    # передать.
+    #
+    # Делаем то же самое сами. mkswap и swapon есть в toybox.
+    write /sys/block/zram0/disksize 536870912
+    exec - root root -- /system/bin/mkswap /dev/block/zram0
+    exec - root root -- /system/bin/swapon /dev/block/zram0
+    # Android рекомендует поднимать swappiness при наличии zram: выгрузка
+    # в сжатую память дешевле, чем убийство процесса.
+    write /proc/sys/vm/swappiness 100
+
+on post-fs
+    # ---------------------------------------------------------------------
+    # ИК-ПУЛЬТ. Должен настраиваться ЗДЕСЬ, до запуска зиготы.
+    #
+    # ⛔ Порядок критичен: Android опрашивает возможности устройства ввода
+    # ОДИН РАЗ при старте. Если таблицу кнопок загрузить позже, система
+    # так и будет считать приёмник «клавиатурой без клавиш» — проверено
+    # 23.08: до перезапуска оболочки пульт не работал вовсе, после —
+    # заработал сразу (Classes сменились с KEYBOARD на KEYBOARD|DPAD).
+    #
+    # ⛔ Приёмник по умолчанию в «сыром» режиме [lirc] и НИЧЕГО не
+    # расшифровывает — сначала протокол, потом таблица.
+    write /sys/class/rc/rc0/protocols nec
+
+    # ⛔ Таблицу грузит своя программа: в Linux это делает ir-keytable,
+    # которого в Android НЕТ (см. scripts/remote/irkeymap.c).
+    # Коды в таблице ИЗМЕРЕНЫ на живом пульте владельца и НЕ совпадают с
+    # /system/etc/remote.conf прошивки «Франкенштейн» — там описан другой
+    # пульт (адрес 0x4040 против реального 0x01).
+    #
+    # ⚠️ Именно СЛУЖБА, а не `exec`: команда `exec` здесь молча не
+    # отрабатывала (23.08 — протокол выставлялся, а таблица нет).
+    # Служба ещё и переживает ожидание: узлы /dev/input создаёт ueventd
+    # асинхронно, программа ждёт появления приёмника до 30 секунд.
+    start h96-irkeymap
+
+    # Developer preview: ADB over the network on port 5555. On mainline the
+    # board's USB OTG port is unusable (dr_mode = "host" in the DTS), so this
+    # is the only ADB path. Authentication is REQUIRED (ro.adb.secure=1 in
+    # device.mk): accept your host key on the TV prompt, or build your own
+    # image with H96_ADB_PUBKEY=/path/to/adbkey.pub. Ethernet/Wi-Fi
+    # configuration itself belongs to Android.
+    setprop service.adb.tcp.port 5555
+
+    # ⛔ Диагностика зависаний: init блокируется в post-fs-data на
+    # `exec_start wait_for_keymaster`, и после этого не выполняется НИЧЕГО —
+    # ни наши команды, ни apexd, ни adbd. Поэтому логгер стартует ЗДЕСЬ,
+    # на предыдущей фазе, и пишет на /data (уже смонтирован в `on fs`).
+    # Файл читается со стока: он монтирует ext4-раздел data с карты.
+    # Public builds: this logger records ALL log buffers, so it starts only
+    # on request — see the androidboot.h96.bootlog trigger at the end.
+
+    # ⛔ BLUETOOTH: hci_qca (=y) пробует загрузить rampatch на 2-й секунде,
+    # когда /vendor ещё не смонтирован, и остаётся без прошивки (03.09).
+    # Здесь vendor уже есть — перепривязка драйвера повторяет пробу, чип
+    # инициализируется штатно («QCA setup on UART is completed»).
+    start h96-btfix
+
+    # KeyMint нужен vold/keystore2 уже в post-fs-data, а class_start early_hal
+    # случается только на late-fs. Стартуем явно и заранее.
+    start vendor.keymint-default
+
+    # ⛔ BRING-UP: сторож зависшей загрузки. Без него зависшую систему
+    # можно вернуть только физическим передёргиванием питания — а это
+    # выбивает ramoops (холодный старт) и стопорит цикл отладки.
+    # Через 10 минут без sys.boot_completed уходим в перезагрузку: команда
+    # update в misc одноразовая, поэтому загрузчик возьмёт СТОК из eMMC,
+    # где доступны adb, ramoops прошлой сессии и /data/bootlog.txt с карты.
+    # Перезагрузка тёплая — ramoops переживает. Убрать перед релизом.
+    start bootwatchdog
+
+on post-fs-data
+    # ---------------------------------------------------------------------
+    # Wi-Fi: рабочий каталог AIDL-supplicant'а.
+    #
+    # ⛔ Эти каталоги не создаёт НИКТО. В AOSP init.rc есть только
+    # /data/misc/wifi/* и /data/vendor/tombstones/wifi, а vendor-раздел у нас
+    # свой, и в нём до сих пор не было ни одной wifi-записи. Без каталога
+    # /data/vendor/wifi/wpa/sockets supplicant не создаст управляющий сокет
+    # и служба умирает сразу после старта.
+    # Владелец wifi:wifi — под этим пользователем работает
+    # /vendor/bin/hw/wpa_supplicant (device.mk, PRODUCT_PACKAGES).
+    mkdir /data/vendor/wifi 0770 wifi wifi
+    mkdir /data/vendor/wifi/wpa 0770 wifi wifi
+    mkdir /data/vendor/wifi/wpa/sockets 0770 wifi wifi
+
+# Логика — в отдельном файле: парсер init ненадёжно разбирает
+# экранированные кавычки внутри `sh -c "..."`.
+service bootwatchdog /system/bin/sh /vendor/etc/bootwatchdog.sh
+    class core
+    user root
+    group root system
+    seclabel u:r:h96_setup:s0
+    oneshot
+    disabled
+
+# ⛔ РОТАЦИЯ ОБЯЗАТЕЛЬНА (31.08.2026): без -r/-n этот файл съел раздел
+# данных (953 МБ) и загнал приставку в вечный цикл перезагрузок.
+# ⛔ seclabel ОБЯЗАТЕЛЕН (03.09.2026): при добавлении ротации он потерялся,
+# и с того момента служба МОЛЧА не стартовала (см. блок про seclabel ниже) —
+# все зависания 01–02.09 прошли без логов. bootlog.txt так и лежал пустым.
+service bootlogcat /system/bin/logcat -b all -v threadtime -r 4096 -n 4 -f /data/bootlog.txt
+    class core
+    user root
+    group root log readproc system
+    seclabel u:r:h96_setup:s0
+    disabled
+
+# adbd живёт в APEX com.android.adbd: его service-описание появляется
+# только после активации APEX. «start adbd» на post-fs-data (попытка №6)
+# молча промахивался — сервис ещё не был определён.
+on property:apexd.status=activated
+    start adbd
+
+on property:apexd.status=ready
+    start adbd
+
+# Настройки производительности применяются ПОСЛЕ загрузки: часть из них
+# (анимации, частота экрана) идёт через `settings`, а это требует живого
+# system_server. Обоснование каждого значения — в самом скрипте
+# scripts/performance/apply-max-performance.sh.
+# ⚠️ Тоже служба, а не `exec` — по той же причине, что и у пульта.
+on property:sys.boot_completed=1
+    # h96 04.09.2026: panfrost runtime-PM молотит переходы питания домена
+    # (l2/shader/tiler «power transition timeout», сотни в секунду под нагрузкой,
+    # засоряет консоль и совпадает с зависаниями) — держим GPU включённым.
+    write /sys/devices/platform/soc/d0000000.apb/d00c0000.gpu/power/control on
+    start h96-perf
+
+# ⛔⛔ `seclabel` ОБЯЗАТЕЛЕН для обеих служб.
+# Без него init отказывается их запускать ДАЖЕ В РАЗРЕШАЮЩЕМ РЕЖИМЕ:
+#     E init: Could not ctl.start for 'h96-perf':
+#             File /system/bin/sh (labeled "u:object_r:shell_exec:s0")
+#             has incorrect label or no domain transition from u:r:init:s0
+# Метка на файле сама по себе не помогает — нужен ОПРЕДЕЛЁННЫЙ переход
+# домена, а его задаёт sepolicy, пересборка которой требует полной сборки.
+# Явный seclabel эту необходимость снимает: init просто выставляет
+# контекст, ничего не выводя. Тот же приём уже применён в watchdogd.rc.
+#
+# 💡 По этой же причине НИКОГДА не работала служба bootwatchdog (ниже) —
+# сторож зависшей загрузки все эти попытки был мёртв, просто не понадобился.
+service h96-irkeymap /vendor/bin/irkeymap auto /vendor/etc/h96-remote.map
+    class core
+    user root
+    group root
+    seclabel u:r:h96_setup:s0
+    oneshot
+    disabled
+
+service h96-perf /system/bin/sh /vendor/etc/apply-max-performance.sh
+    class late_start
+    user root
+    group root system
+    seclabel u:r:h96_setup:s0
+    oneshot
+    disabled
+
+# Перепривязка BT-драйвера после монтирования vendor (см. post-fs выше).
+# Логика — в отдельном файле: парсер init ненадёжно разбирает кавычки
+# внутри `sh -c "..."` (та же причина, что у bootwatchdog).
+service h96-btfix /system/bin/sh /vendor/etc/h96-btfix.sh
+    class core
+    user root
+    group root system
+    seclabel u:r:h96_setup:s0
+    oneshot
+    disabled
+
+# Remote standby (25.09.2026): releases h96-no-suspend ONLY when the kernel can be
+# woken by the remote (meson_gx_pm.ir_wake_key present and non-zero). With an older
+# kernel the wake lock stays and POWER keeps its old screen-off behaviour.
+service h96-standby /system/bin/sh /vendor/etc/h96-standby.sh
+    class core
+    user root
+    group root system
+    seclabel u:r:h96_setup:s0
+    oneshot
+    disabled
+
+on boot
+    start adbd
+
+    # ⛔ ЗАПРЕТ ЗАСЫПАНИЯ. Попытка №23 (первая успешная загрузка!) через
+    # 3,7 минуты ушла в s2idle: «PM: suspend entry (s2idle)» — и больше не
+    # вернулась. Приставке сон не нужен в принципе (она питается от сети),
+    # а на mainline-ядре Amlogic GXM пробуждение не настроено: нет
+    # источников wakeup ни от ИК-пульта, ни от сети.
+    # Ядерный wakelock держится вечно и не зависит от настроек Android.
+    # 25.09.2026: с ядром, умеющим будиться пультом (meson_gx_pm.ir_wake_key),
+    # его снимает служба h96-standby — тогда POWER даёт глубокий сон.
+    write /sys/power/wake_lock h96-no-suspend
+    start h96-standby
+
+    # Аппаратный сторож перехватывает watchdogd — его служба объявлена
+    # в /system/etc/init/watchdogd.rc (в AOSP бинарь есть, а описания
+    # службы нет ни в одном rc; без неё ядро кормит сторож лишь
+    # watchdog.open_timeout=600 с и потом СБРАСЫВАЕТ SoC — так оборвалась
+    # попытка №23 уже ПОСЛЕ успешной загрузки). Он в классе core и
+    # стартует сам, отдельная команда start не нужна.
+
+# Optional boot diagnostics: all log buffers to /data/bootlog.txt (4 x 4 MiB,
+# rotated). Off unless the boot loader passes androidboot.h96.bootlog=1.
+on post-fs && property:ro.boot.h96.bootlog=1
+    start bootlogcat
+
+# Optional emergency static Ethernet, legacy SD bring-up profile only.
+# Off unless the boot loader passes androidboot.h96.static_ip=<IPv4> (/24).
+on post-fs && property:ro.boot.fstab_suffix=sdboot && property:ro.boot.h96.static_ip=*
+    exec - root root -- /system/bin/ifconfig eth0 ${ro.boot.h96.static_ip} netmask 255.255.255.0 up

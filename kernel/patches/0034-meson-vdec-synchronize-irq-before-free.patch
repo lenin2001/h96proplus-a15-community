@@ -1,0 +1,95 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0034] meson-vdec: synchronize_irq() before a codec frees its state at stop
+
+__vdec_hevc_stop() and __vdec_1_stop() mask the decoder interrupt and then call
+codec_ops->stop(), which frees the codec workspace (and vdec_1 powers the block
+off). The mask stops NEW interrupts, but a threaded handler that was already
+scheduled still runs afterwards - on freed DMA memory. Reproduced 23.09 by
+slowing the client (the capture hook's per-frame destination CRC) so ExoPlayer
+flushed every ~2 s during VP9 playback; kernel #90 died after ~20 flushes:
+
+  Unable to handle kernel paging request at virtual address ffff80009989d806
+  pc : codec_vp9_threaded_isr+0x130  (codec_vp9_fetch_rpm, codec_vp9.c:1763)
+  Comm: irq/23-vdec ... Kernel panic - not syncing: Oops: Fatal exception
+
+The IRQ number is now kept in amvdec_core and both stop paths wait for any
+in-flight handler after masking. Nothing that calls vdec_ops->stop() runs in the
+IRQ thread (vdec_poweroff() and the start error paths only), so this cannot
+self-deadlock. With the patch (#91) the same forced-flush run lasted 3 min /
+59 flushes / 1962 frames with no oops, every frame bit-exact.
+
+---
+diff -ruN s33/drivers/staging/media/meson/vdec/vdec.c s34/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -1584,6 +1584,7 @@
+ 					"vdec", core);
+ 	if (ret)
+ 		return ret;
++	core->irq = irq;
+ 
+ 	ret = esparser_init(pdev, core);
+ 	if (ret)
+diff -ruN s33/drivers/staging/media/meson/vdec/vdec.h s34/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -70,6 +70,7 @@
+  * @lock: video device lock
+  */
+ struct amvdec_core {
++	int irq;	/* h96 0034: vdec IRQ, for synchronize_irq() at stop */
+ 	void __iomem *dos_base;
+ 	void __iomem *esparser_base;
+ 	struct regmap *regmap_ao;
+diff -ruN s33/drivers/staging/media/meson/vdec/vdec_1.c s34/drivers/staging/media/meson/vdec/vdec_1.c
+--- a/drivers/staging/media/meson/vdec/vdec_1.c
++++ b/drivers/staging/media/meson/vdec/vdec_1.c
+@@ -7,6 +7,7 @@
+  * MPEG 1/2/4, H.263, H.264, MJPEG, VC1
+  */
+ 
++#include <linux/interrupt.h>
+ #include <linux/firmware.h>
+ #include <linux/clk.h>
+ 
+@@ -137,6 +138,14 @@
+ 	amvdec_write_dos(core, MPSR, 0);
+ 	amvdec_write_dos(core, CPSR, 0);
+ 	amvdec_write_dos(core, ASSIST_MBOX1_MASK, 0);
++	/*
++	 * h96 0034 (23.09.2026): the mask stops NEW interrupts, but a threaded
++	 * handler already scheduled still runs - after codec_ops->stop() has
++	 * freed the VP9 workspace it read freed DMA memory: Oops in
++	 * codec_vp9_fetch_rpm() from irq/23-vdec right after an ExoPlayer
++	 * flush, kernel #90. Wait for it before anything is freed or powered off.
++	 */
++	synchronize_irq(core->irq);
+ 
+ 	amvdec_write_dos(core, DOS_SW_RESET0, BIT(12) | BIT(11));
+ 	amvdec_write_dos(core, DOS_SW_RESET0, 0);
+diff -ruN s33/drivers/staging/media/meson/vdec/vdec_hevc.c s34/drivers/staging/media/meson/vdec/vdec_hevc.c
+--- a/drivers/staging/media/meson/vdec/vdec_hevc.c
++++ b/drivers/staging/media/meson/vdec/vdec_hevc.c
+@@ -6,6 +6,7 @@
+  * HEVC, VP9
+  */
+ 
++#include <linux/interrupt.h>
+ #include <linux/firmware.h>
+ #include <linux/clk.h>
+ 
+@@ -119,6 +120,14 @@
+ 	amvdec_write_dos(core, HEVC_ASSIST_MBOX1_MASK, 0);
+ 	/* Disable firmware processor */
+ 	amvdec_write_dos(core, HEVC_MPSR, 0);
++	/*
++	 * h96 0034 (23.09.2026): the mask stops NEW interrupts, but a threaded
++	 * handler already scheduled still runs - after codec_ops->stop() has
++	 * freed the VP9 workspace it read freed DMA memory: Oops in
++	 * codec_vp9_fetch_rpm() from irq/23-vdec right after an ExoPlayer
++	 * flush, kernel #90. Wait for it before anything is freed or powered off.
++	 */
++	synchronize_irq(core->irq);
+ 
+ 	if (sess->priv)
+ 		codec_ops->stop(sess);

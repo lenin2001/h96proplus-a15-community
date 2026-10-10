@@ -1,0 +1,99 @@
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 928e0287e..2073c8660 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -446,28 +515,91 @@ static void vdec_stop_streaming(struct vb2_queue *q)
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct amvdec_core *core = sess->core;
+ 
+-	cancel_delayed_work_sync(&sess->drain_work);
+ 	struct vb2_v4l2_buffer *buf;
+ 
++	cancel_delayed_work_sync(&sess->drain_work);
++	/*
++	 * h96 04.09.2026: stopping vystavlyaem SRAZU, do vsego. Kormilku
++	 * esparser NEL'ZYA gasit' cherez cancel_work_sync() otsyuda: eta
++	 * funktsiya vyzyvaetsya POD sess->lock (vb2 queue lock == sess->lock),
++	 * a sam vorker esparser_queue_all_src pervym delom beret sess->lock ->
++	 * cancel_work_sync zhdet vorkera, vorker zhdet lok -> AB-BA DEDLOK
++	 * (DecodeComponent v __flush_work + kworker v esparser_queue_all_src,
++	 * oba v D, /dev/video0 mertv, plejer "format ne podderzhivaetsya").
++	 * Zashchita ot dostupa k regsitram posle poweroff uzhe est': flag
++	 * sess->stopping (rannij return v esparser_queue_all_src pod lokom) i
++	 * "if(!stopping) schedule_work" v dst_buf_done. Lyuboj uzhe
++	 * zaplanirovannyj vorker, poluchiv lok POSLE vozvrata stop_streaming,
++	 * uvidit stopping=1 i vyjdet, ne trogaya regsitry i priv.
++	 */
++	sess->stopping = 1;
++
+ 	if (sess->status == STATUS_RUNNING ||
+ 	    sess->status == STATUS_INIT ||
+ 	    (sess->status == STATUS_NEEDS_RESUME &&
+ 	     (!sess->streamon_out || !sess->streamon_cap))) {
+-		if (vdec_codec_needs_recycle(sess))
++		/*
++		 * Ne po vdec_codec_needs_recycle(): ono chitaet TEKUSHCHIJ
++		 * fmt_out, a on mog smenit'sya cherez S_FMT - togda potok
++		 * ostavalsya zhit' sirotoj.
++		 */
++		if (sess->recycle_thread) {
+ 			kthread_stop(sess->recycle_thread);
++			sess->recycle_thread = NULL;
++		}
+ 
++		/* h96 03.09 (H4): drain() внутри poweroff перевзводит esparser-работу
++		 * через dst_buf_done; блокирует "if(!stopping) schedule_work" +
++		 * stopping=1 (выставлен в начале stop_streaming). cancel_work_sync
++		 * здесь УБРАН - он под sess->lock давал AB-BA дедлок (см. выше). */
+ 		vdec_poweroff(sess);
+ 		vdec_free_canvas(sess);
+ 		dma_free_coherent(sess->core->dev, sess->vififo_size,
+ 				  sess->vififo_vaddr, sess->vififo_paddr);
+ 		vdec_reset_timestamps(sess);
+ 		vdec_reset_bufs_recycle(sess);
++
++		/*
++		 * Poryadok vazhen: snachala ubiraem sessiyu iz core->cur_sess,
++		 * i tol'ko potom osvobozhdaem priv. Ran'she bylo naoborot, i
++		 * tred preryvaniya uspeval vzyat' eshche nenulevoj cur_sess i
++		 * obratit'sya k uzhe osvobozhdennoj pamyati.
++		 */
++		core->cur_sess = NULL;
+ 		kfree(sess->priv);
+ 		sess->priv = NULL;
+-		core->cur_sess = NULL;
+ 		sess->status = STATUS_STOPPED;
++
++		sess->keyframe_found = 0;
++		sess->last_offset = 0;
++		sess->wrap_count = 0;
++		sess->sequence_cap = 0;
++		sess->sequence_out = 0;
++		atomic_set(&sess->esparser_queued_bufs, 0);
+ 	}
+ 
++	/*
++	 * Sbrasyvaem TOL'KO flagi konca potoka, i tol'ko ih.
++	 *
++	 * 01.09.2026, proverено na zheleze: snachala zdes' stoyal "polnyj
++	 * sbros konvejera" - vmeste so smeshcheniyami i vyzovom
++	 * vdec_reset_timestamps(). Eto slomalo vosproizvedenie nasovsem.
++	 * Prichina: stop_streaming vyzyvaetsya dlya KAZHDOJ ocheredi otdel'no,
++	 * i pri obychnoj peremotke plejer gasit tol'ko CAPTURE, a OUTPUT
++	 * prodolzhaet rabotat'. Stirat' pri etom spisok metok vremeni nel'zya:
++	 * posle etogo KAZHDYJ dekodirovannyj kadr uezzhaet s nesopostavlennoj
++	 * metkoj ("Buffer N done but can't match offset"), plejer schitaet ego
++	 * ustarevshim i vybrasyvaet - ekran ostaetsya chernym.
++	 *
++	 * Smeshcheniya, schetchiki i metki ochishchayutsya vyshe, v bloke
++	 * polnoj ostanovki, gde eto bezopasno.
++	 */
++	sess->should_stop = 0;
++	sess->eos_queued = 0;
++	/* h96 03.09 (H5): m2m has_stopped иначе переживает flush и каждый QBUF CAPTURE
++	 * до start_streaming возвращается пустышкой с LAST (v4l2-mem2mem force_last_buf_done). */
++	v4l2_m2m_clear_state(sess->m2m_ctx);
++
+ 	if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+ 		while ((buf = v4l2_m2m_src_buf_remove(sess->m2m_ctx)))
+ 			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);

@@ -1,0 +1,177 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0032] meson-vdec: match a picture to the packet whose payload
+ extends past its reported offset
+
+Found on 23.09.2026 while testing Alfa (not the failing VP9 route): Alfa's
+internal player died 1.5 s into every HLS episode (H.264 1280x640).
+
+  DecodeComponent: Work with bitstreamId=1 not found, already abandoned?
+  DecodeComponent: reportError(error=14)
+  ExoPlayerImplInternal: Playback error ... Decoder failed: c2.v4l2.avc.decoder
+
+Works 0 and 1 are CSD (SPS and PPS arrive as two blocks); they produce no
+picture, so their timestamp records stay at the head of sess->timestamps.
+With dynamic debug on esparser_queue and dst_buf_done the reproduction shows
+packets padded to ESPARSER_MIN_PACKET_SIZE (payloads of ~40 bytes at offsets
+0x1000 apart) and one P frame coming out with the PPS record's timestamp:
+the firmware reported its picture offset before the start of its own packet,
+i.e. inside the previous packet's zero padding (Annex B allows zero bytes in
+front of a start code). "Last record <= offset" then fell back to the stale
+CSD record. The first run showed the same thing one step earlier: frame 32
+took record 31 and frame 31 took the PPS record.
+
+A picture now belongs to the first packet whose payload END lies past the
+reported offset. For packets of 4 KiB and more there is no padding and this
+is exactly the old rule; for small padded packets the padding counts towards
+the next picture instead of the previous one. A record starting more than one
+minimum packet beyond the offset is refused. The records store their payload
+size for this. ts_match_end=0 (module parameter) restores the old rule, and a
+"ts match" dev_dbg prints the offset, the record and the distance, so the
+actual displacement is measured rather than assumed.
+
+---
+diff -ruN s1/drivers/staging/media/meson/vdec/esparser.c s2/drivers/staging/media/meson/vdec/esparser.c
+--- a/drivers/staging/media/meson/vdec/esparser.c
++++ b/drivers/staging/media/meson/vdec/esparser.c
+@@ -328,7 +328,8 @@
+ 
+ 	offset = esparser_get_offset(sess);
+ 
+-	ret = amvdec_add_ts(sess, vb->timestamp, vbuf->timecode, offset, vbuf->flags);
++	ret = amvdec_add_ts(sess, vb->timestamp, vbuf->timecode, offset,
++			    payload_size, vbuf->flags);
+ 	if (ret) {
+ 		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
+ 		return ret;
+diff -ruN s1/drivers/staging/media/meson/vdec/vdec.h s2/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -34,6 +34,7 @@
+  * @offset: offset in the VIFIFO where the associated packet was written
+  * @flags: flags from the v4l2 buffer
+  * @used_count: times this timestamp was checked for a match with a dst buffer
++ * @size: payload bytes of the packet (h96 0032: padding excluded)
+  */
+ struct amvdec_timestamp {
+ 	struct list_head list;
+@@ -42,6 +43,7 @@
+ 	u32 offset;
+ 	u32 flags;
+ 	u32 used_count;
++	u32 size;
+ };
+ 
+ struct amvdec_session;
+diff -ruN s1/drivers/staging/media/meson/vdec/vdec_helpers.c s2/drivers/staging/media/meson/vdec/vdec_helpers.c
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -10,6 +10,7 @@
+ #include <media/videobuf2-dma-contig.h>
+ 
+ #include "vdec_helpers.h"
++#include "esparser.h"
+ 
+ #include <linux/moduleparam.h>
+ 
+@@ -19,6 +20,12 @@
+ module_param(h96_dump, int, 0644);
+ MODULE_PARM_DESC(h96_dump, "dump N decoded frames (luma+chroma bytes)");
+ 
++/* h96 0032: match a picture to the packet whose payload extends past its
++ * reported offset (see amvdec_dst_buf_done_offset); 0 = the old rule */
++static bool ts_match_end = true;
++module_param(ts_match_end, bool, 0644);
++MODULE_PARM_DESC(ts_match_end, "match picture offsets against packet payload ends");
++
+ #define NUM_CANVAS_NV12 2
+ #define NUM_CANVAS_YUV420 3
+ 
+@@ -392,7 +399,7 @@
+ EXPORT_SYMBOL_GPL(amvdec_reprogram_canvas_slot);
+ 
+ int amvdec_add_ts(struct amvdec_session *sess, u64 ts,
+-		  struct v4l2_timecode tc, u32 offset, u32 vbuf_flags)
++		  struct v4l2_timecode tc, u32 offset, u32 size, u32 vbuf_flags)
+ {
+ 	struct amvdec_timestamp *new_ts;
+ 	unsigned long flags;
+@@ -404,6 +411,7 @@
+ 	new_ts->ts = ts;
+ 	new_ts->tc = tc;
+ 	new_ts->offset = offset;
++	new_ts->size = size;
+ 	new_ts->flags = vbuf_flags;
+ 
+ 	spin_lock_irqsave(&sess->ts_spinlock, flags);
+@@ -603,8 +611,45 @@
+ 
+ 	spin_lock_irqsave(&sess->ts_spinlock, flags);
+ 
++	/*
++	 * h96 0032 (23.09.2026): a picture can be reported at an offset BEFORE
++	 * the start of the packet that carried it. esparser pads every packet
++	 * shorter than ESPARSER_MIN_PACKET_SIZE with zeros, and Annex B allows
++	 * zero bytes in front of a start code, so the firmware may place the
++	 * picture at the end of the previous packet's payload. With the strict
++	 * "last record <= offset" rule such a picture took the previous packet's
++	 * record, or - once that was consumed - an older stale one: CSD-only
++	 * packets (SPS, PPS) produce no picture, and their records sit at the
++	 * head of the list for ever. Measured on Alfa's HLS H.264 (1280x640,
++	 * 40-byte P frames padded to 4 KiB): a P frame came out labelled with
++	 * the PPS work's timestamp; userspace had long finished that work,
++	 * reported "Work with bitstreamId=1 not found", and the player died
++	 * 1.5 s into every episode.
++	 *
++	 * So a picture belongs to the first packet whose PAYLOAD extends past
++	 * the reported offset. For packets of 4 KiB and more there is no padding
++	 * and this is exactly the old rule; for small padded packets the padding
++	 * now counts towards the next picture, not the previous one. A record
++	 * starting more than one minimum packet beyond the offset is not this
++	 * picture's. ts_match_end=0 restores the old rule.
++	 */
++
+ 	/* Look for our vififo offset to get the corresponding timestamp. */
+ 	list_for_each_entry_safe(tmp, n, &sess->timestamps, list) {
++		u32 end = tmp->offset + max_t(u32, tmp->size, 1);
++
++		if (ts_match_end) {
++			if (end <= offset)
++				continue;	/* wholly before the picture */
++			if (tmp->offset <= offset + ESPARSER_MIN_PACKET_SIZE)
++				match = tmp;
++			else if (tmp->used_count++ >= 32) {
++				list_del(&tmp->list);
++				kfree(tmp);
++			}
++			break;
++		}
++
+ 		if (tmp->offset > offset) {
+ 			/*
+ 			 * Delete any record that remained unused for 32 match
+@@ -624,6 +669,9 @@
+ 		dev_err(dev, "Buffer %u done but can't match offset (%08X)\n",
+ 			vbuf->vb2_buf.index, offset);
+ 	} else {
++		dev_dbg(dev, "ts match: buf %u offset %08X record %08X+%u delta %d ts %llu\n",
++			vbuf->vb2_buf.index, offset, match->offset, match->size,
++			(int)(offset - match->offset), match->ts);
+ 		timestamp = match->ts;
+ 		timecode = match->tc;
+ 		vbuf_flags = match->flags;
+diff -ruN s1/drivers/staging/media/meson/vdec/vdec_helpers.h s2/drivers/staging/media/meson/vdec/vdec_helpers.h
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h
+@@ -63,10 +63,11 @@
+  * @ts: timestamp to add
+  * @tc: timecode to add
+  * @offset: offset in the VIFIFO where the associated packet was written
++ * @size: payload bytes written at @offset, padding excluded
+  * @flags: the vb2_v4l2_buffer flags
+  */
+ int amvdec_add_ts(struct amvdec_session *sess, u64 ts,
+-		  struct v4l2_timecode tc, u32 offset, u32 flags);
++		  struct v4l2_timecode tc, u32 offset, u32 size, u32 flags);
+ void amvdec_remove_ts(struct amvdec_session *sess, u64 ts);
+ 
+ /**

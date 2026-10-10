@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+    Конфигурация аудиополитики H96 Pro Plus.
+
+    Это ТВ-профиль AOSP (audio_policy_configuration_generic_tv.xml) плюс
+    ОБЯЗАТЕЛЬНЫЙ bluetooth-модуль.
+
+    ⛔ ПРАВИЛО, найденное по коду (frameworks/av/media/libaudiohal/impl/
+    DevicesFactoryHalAidl.cpp:154): getDeviceNames() перебирает ВСЕ
+    инстансы IModule, ОБЪЯВЛЕННЫЕ В VINTF, через
+    AServiceManager_forEachDeclaredInstance — независимо от этого файла.
+    Затем openDevice() для каждого делает waitForDeclaredService, то есть
+    ждёт ВЕЧНО. А регистрирует модули HAL только по данному файлу.
+
+    Значит здесь обязаны быть перечислены все пять инстансов, которые
+    объявляет манифест APEX (android.hardware.audio.service-aidl.xml):
+        IModule/default, /usb, /r_submix, /bluetooth, /stub
+    Пропустишь один — audioserver зависнет на нём навсегда, за ним
+    намертво встанет system_server (AudioService.<init> →
+    isCallScreeningModeSupported → ожидание IAudioPolicyService), и его
+    добьёт сторож Android («Blocked in handler on main thread for 68s»).
+    Попытка №22 умерла именно так, в логе бесконечно повторялось:
+        Waited one second for android.hardware.audio.core.IModule/bluetooth
+
+    Имена модулей должны совпадать с Module::typeFromString в
+    hardware/interfaces/audio/aidl/default/Module.cpp: default, r_submix,
+    stub, usb, bluetooth. «primary» из файлов AOSP конвертер сам
+    переименовывает в «default» (AudioPolicyConfigXmlConverter.cpp:186).
+
+    ⚠️ ИСПРАВЛЕНО 23.08.2026. Раньше здесь стояло «это ЗАГЛУШЕЧНЫЙ звук,
+    настоящий вывод — задача M9: свой audio.primary поверх tinyalsa, как
+    в device/amlogic/yukawa». Это НЕВЕРНО, своего HAL писать не нужно:
+
+      * StreamPrimary НАСЛЕДУЕТСЯ ОТ StreamAlsa
+        (hardware/interfaces/audio/aidl/default/primary/StreamPrimary.cpp:43)
+        — то есть штатный AIDL-HAL умеет играть в настоящую карту ALSA;
+      * заглушкой он становится ТОЛЬКО если порт объявлен как
+        CONNECTION_BUS либо выставлено ro.boot.audio.tinyalsa.ignore_output
+        (там же, useStubStream(), строка ~195). У нас ни того, ни другого:
+        порты Speaker=OUT_SPEAKER и Out Aux Digital=OUT_AUX_DIGITAL;
+      * карта и устройство берутся из АДРЕСА порта по образцу
+        "CARD_<n>_DEV_<m>" (getCardAndDeviceId(), строка 177), а если
+        адреса нет — берётся kDefaultCardAndDeviceId = карта 0,
+        устройство 0 (StreamPrimary.h:61 → PrimaryMixer::kAlsaCard/Device).
+
+    Значит HAL уже сейчас открывает card 0 / device 0. Со стороны ядра
+    всё тоже на месте: CONFIG_SND_MESON_AIU=y, CONFIG_SND_MESON_GX_SOUND_CARD=y,
+    CONFIG_SND_SOC_MESON_T9015=y, а узел sound с HDMI-линками приходит из
+    meson-gx-p23x-q20x.dtsi (проверено — в собранном dtb он есть).
+
+    ⚠️ ЧТО НЕ ПРОВЕРЕНО: идёт ли звук на самом деле. Приставка недоступна.
+    Если не пойдёт — сначала снять `cat /proc/asound/cards` и `tinyplay`,
+    и при необходимости прописать порту address="CARD_0_DEV_0" (или тот
+    номер, что окажется у HDMI), а НЕ писать свой HAL.
+-->
+<audioPolicyConfiguration version="1.0" xmlns:xi="http://www.w3.org/2001/XInclude">
+
+    <globalConfiguration speaker_drc_enabled="false"/>
+
+    <modules>
+        <!-- Primary Audio HAL (ТВ-вариант: HDMI/аналог) -->
+        <xi:include href="primary_audio_policy_configuration_tv.xml"/>
+
+        <!-- USB Audio HAL -->
+        <xi:include href="usb_audio_policy_configuration.xml"/>
+
+        <!-- Remote Submix Audio HAL -->
+        <xi:include href="r_submix_audio_policy_configuration.xml"/>
+
+        <!-- Bluetooth Audio HAL — без него APM ждёт IModule/bluetooth вечно -->
+        <xi:include href="bluetooth_audio_policy_configuration_7_0.xml"/>
+
+        <!-- Stub Audio HAL — по той же причине: объявлен в VINTF APEX -->
+        <xi:include href="stub_audio_policy_configuration.xml"/>
+    </modules>
+
+    <xi:include href="audio_policy_volumes.xml"/>
+    <xi:include href="default_volume_tables.xml"/>
+
+    <xi:include href="surround_sound_configuration_5_0.xml"/>
+
+</audioPolicyConfiguration>

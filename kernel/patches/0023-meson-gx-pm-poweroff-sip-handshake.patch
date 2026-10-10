@@ -1,0 +1,83 @@
+meson_gx_pm: prepare vendor poweroff before PSCI SYSTEM_OFF
+
+The vendor GXBB/GXM driver sends SiP 0x82000042(1) before SYSTEM_OFF.
+Mirror that sequence in POWER_OFF_PREPARE; poweroff_sip=0 permits an A/B test.
+Use managed registration and check its integer error return. The raw API
+returns ERR_PTR on failure, so testing it for NULL silently misses errors.
+
+This patch records the project-side source change. Deploy the canonical
+kernel/meson_gx_pm.c using the existing kernel integration, not both copies.
+A successful SiP return is not proof that the board is powered off. Verify
+rails, no automatic restart, and physical IR wake. No bootloader is flashed.
+
+diff --git a/kernel/meson_gx_pm.c b/kernel/meson_gx_pm.c
+--- a/kernel/meson_gx_pm.c
++++ b/kernel/meson_gx_pm.c
+@@ -22,10 +22,44 @@
+ #include <linux/pm.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/arm-smccc.h>
++#include <linux/reboot.h>
++#include <linux/notifier.h>
+ #include <uapi/linux/psci.h>
+ #include <asm/suspend.h>
+ 
+ #define MESON_SUSPEND_PARAM 0x0010000
++
++/*
++ * h96 0023 (08.09.2026): vendor-podgotovka vyklyucheniya. Stokovyj GXBB/GXM
++ * drajver "aml, restart" (drivers/amlogic/reset/gxbb_poweroff.c) v
++ * do_aml_poweroff() PERED PSCI SYSTEM_OFF (0x84000008) zovet Amlogic SiP-SMC
++ * 0x82000042 s argumentom 1 - "suspend_reason = poweroff". Imenno etot
++ * vyzov soobshchaet BL31/SCP (BL301 pwr_ctrl: suspend_from == SYS_POWEROFF),
++ * chto nado gasit VCCK/VDDEE/HDMI_5V i zhdat IR/power-key, a ne perezagruzhatsya.
++ * A reboot after shutdown alone does not identify which stage failed.
++ * Follow the vendor sequence and verify power rails and IR wake on this board.
++ * Zdes dobavlyaem tot zhe
++ * SMC kak POWER_OFF_PREPARE, shtatnyj psci_sys_poweroff idet posle nas.
++ * Otklyuchaetsya modparam poweroff_sip=0 dlya A/B.
++ */
++#define MESON_SIP_SUSPEND_REASON	0x82000042
++#define MESON_SUSPEND_REASON_POWEROFF	1
++
++static bool poweroff_sip = true;
++module_param(poweroff_sip, bool, 0644);
++MODULE_PARM_DESC(poweroff_sip, "send Amlogic SiP 0x82000042(1) before SYSTEM_OFF (stock poweroff handshake)");
++
++static int meson_gx_poweroff_prepare(struct sys_off_data *data)
++{
++	struct arm_smccc_res res;
++
++	if (!poweroff_sip)
++		return NOTIFY_DONE;
++	arm_smccc_smc(MESON_SIP_SUSPEND_REASON, MESON_SUSPEND_REASON_POWEROFF,
++		      0, 0, 0, 0, 0, 0, &res);
++	pr_info("h96 pm: poweroff prepare SMC 0x82000042(1) -> a0=0x%lx\n", res.a0);
++	return NOTIFY_DONE;
++}
+ 
+ /* GPIO периферийного питания (HDMI_5V / вентилятор). NULL, если нет в DT. */
+ static struct gpio_desc *meson_gx_periph_pwr;
+@@ -84,6 +118,8 @@
+ 
+ static int meson_gx_pm_probe(struct platform_device *pdev)
+ {
++	int ret;
++
+ 	/* В работе рельса включена (пин высокий). Опционально: если gpio в DT
+ 	 * нет — periph_pwr = NULL, гашение рельсы просто не делается. */
+ 	meson_gx_periph_pwr = devm_gpiod_get_optional(&pdev->dev,
+@@ -96,6 +132,13 @@
+ 		meson_gx_periph_pwr = NULL;
+ 	}
+ 
++	ret = devm_register_sys_off_handler(&pdev->dev,
++					   SYS_OFF_MODE_POWER_OFF_PREPARE,
++					   SYS_OFF_PRIO_DEFAULT,
++					   meson_gx_poweroff_prepare, NULL);
++	if (ret)
++		return dev_err_probe(&pdev->dev, ret,
++				     "h96: poweroff-prepare registration failed\n");
+ 	suspend_set_ops(&meson_gx_pm_ops);
+ 	dev_info(&pdev->dev,
+ 		 "h96: deep suspend-to-RAM enabled (CPU_SUSPEND 0x10000)%s\n",

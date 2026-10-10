@@ -1,0 +1,50 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0044] meson-ir: dump decoder registers at suspend/resume (dynamic debug)
+
+Diagnostic only (dev_dbg, off by default): LDR/BIT0/REG0/REG1/REG2 at suspend and
+before/after re-initialisation in resume. FRAME/STATUS are not read (may clear on read).
+Showed on 25.09 that BL301 leaves REG0 FILTER=3 (boot value 7) after deep suspend.
+
+---
+diff -ruN a/drivers/media/rc/meson-ir.c b/drivers/media/rc/meson-ir.c
+--- a/drivers/media/rc/meson-ir.c
++++ b/drivers/media/rc/meson-ir.c
+@@ -658,15 +658,30 @@
+ 	spin_unlock_irqrestore(&ir->lock, flags);
+ }
+ 
++/* h96 0044: diagnostic register dump (dynamic debug; LDR..REG2, no FRAME/STATUS reads) */
++static void meson_ir_dump_regs(struct meson_ir *ir, const char *when)
++{
++	u32 v[9] = {};
++	int i;
++
++	for (i = 0; i < 9; i++)
++		if (i != 5 && i != 6)	/* 0x14 FRAME, 0x18 STATUS may be read-to-clear */
++			regmap_read(ir->reg, i * 4, &v[i]);
++	dev_dbg(ir->rc->dev.parent, "regs %s: ldr_act %08x ldr_idle %08x ldr_rep %08x bit0 %08x reg0 %08x reg1 %08x reg2 %08x\n",
++		when, v[0], v[1], v[2], v[3], v[4], v[7], v[8]);
++}
++
+ static __maybe_unused int meson_ir_resume(struct device *dev)
+ {
+ 	struct meson_ir *ir = dev_get_drvdata(dev);
+ 
++	meson_ir_dump_regs(ir, "resume-before");
+ 	if (ir->param->support_hw_decoder)
+ 		meson_ir_hw_decoder_init(ir->rc, &ir->rc->enabled_protocols);
+ 	else
+ 		meson_ir_sw_decoder_init(ir->rc);
+ 
++	meson_ir_dump_regs(ir, "resume-after");
+ 	return 0;
+ }
+ 
+@@ -675,6 +690,7 @@
+ 	struct meson_ir *ir = dev_get_drvdata(dev);
+ 	unsigned long flags;
+ 
++	meson_ir_dump_regs(ir, "suspend");
+ 	spin_lock_irqsave(&ir->lock, flags);
+ 	regmap_update_bits(ir->reg, IR_DEC_REG1, IR_DEC_REG1_ENABLE, 0);
+ 	spin_unlock_irqrestore(&ir->lock, flags);

@@ -1,0 +1,29 @@
+// Модули сборки, специфичные для H96 Pro Plus.
+//
+// ⚠️ Здесь НЕ НАДО определять `hidl_defaults`: он уже есть в
+// hardware/interfaces/Android.bp:36 (обычный cc_defaults с -Wall -Werror).
+// Попытка добавить свой 23.08 уронила сборку за 55 секунд:
+//     error: hardware/interfaces/Android.bp:36:1:
+//            module "hidl_defaults" already defined
+// Причина, по которой не собирается служба аппаратного декодера,
+// в другом месте — ищется отдельно.
+
+// Загрузчик таблицы кнопок ИК-пульта.
+//
+// В Linux это делает `ir-keytable`, которого в Android НЕТ. Без загрузки
+// таблицы ядро шлёт только «сырые» события MSC_SCAN, Android их
+// игнорирует, и пульт не работает вообще (проверено 23.08).
+//
+// ⚠️ Запускается из init на фазе post-fs — ДО старта зиготы: Android
+// опрашивает возможности устройства ввода ОДИН РАЗ, и если таблицы тогда
+// не было, приёмник навсегда останется «клавиатурой без клавиш».
+// Метка SELinux — в sepolicy/file_contexts, домен — в sepolicy/h96_setup.te.
+cc_binary {
+    name: "irkeymap",
+    srcs: ["remote/irkeymap.c"],
+    vendor: true,
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}

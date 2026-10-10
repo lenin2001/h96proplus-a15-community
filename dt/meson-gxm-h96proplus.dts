@@ -1,0 +1,403 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * H96 Pro Plus (плата CZ-S32-V3), Amlogic S912 / Meson GXM
+ *
+ * ⚠️ ЧЕРНОВИК — Milestone 3. НЕ ПРОВЕРЕН НА ЖЕЛЕЗЕ.
+ *
+ * ┌────────────────────────────────────────────────────────────────────────┐
+ * │ ⚠️ БАЗА — q200, НЕ q201, хотя vendor называет плату «q201»              │
+ * │                                                                        │
+ * │ Multi-DTB установленной прошивки помечает варианты как gxm/q201/{1,2,3}g│
+ * │ — казалось бы, брать за основу надо mainline meson-gxm-q201.dts. Но там│
+ * │ прямым текстом сказано «Q201 has only internal PHY port», и узел такой:│
+ * │                                                                        │
+ * │     &ethmac { phy-mode = "rmii"; phy-handle = <&internal_phy>; };      │
+ * │                                                                        │
+ * │ То есть mainline-овский q201 — это плата со ВНУТРЕННИМ 100-мегабитным  │
+ * │ PHY. У нас же физически распаян внешний RTL8211F (видно на фото).      │
+ * │                                                                        │
+ * │ ✅ ЗАКРЫТО 2026-08-16 по DTB, вынутому из раздела `reserved` самого     │
+ * │ устройства: во всех трёх вариантах DDR стоит                           │
+ * │     phy-mode = "rgmii";  internal_phy = <0x00>;                        │
+ * │     pinctrl-names = "external_eth_pins";                               │
+ * │ Имя «q201» у vendor — просто ярлык платформы, к разводке PHY отношения │
+ * │ не имеющий.                                                            │
+ * │                                                                        │
+ * │ Возьми мы q201 за основу — получили бы 100 Мбит вместо гигабита.       │
+ * │ Поэтому база именно q200, и это осознанный выбор, а не невнимательность│
+ * └────────────────────────────────────────────────────────────────────────┘
+ *
+ * Совпадения с q200, подтверждённые по фотографиям (см. docs/hardware.md)
+ * и по стоковому DTS:
+ *
+ *   - Ethernet PHY Realtek RTL8211F  → в q200.dts уже настроен именно он
+ *   - Wi-Fi по SDIO на sd_emmc_a     → у нас модуль Fn-Link 8223A-SR
+ *   - eMMC на sd_emmc_c              → Samsung KLMAG2GEAC-B001, 16 GB
+ *   - SD-карта на sd_emmc_b          → полноразмерный слот есть
+ *   - HDMI, CVBS (AV), S/PDIF, IR    → все разъёмы на плате присутствуют
+ *
+ * КАЖДОЕ значение ниже, помеченное TODO, обязано быть сверено со стоковым
+ * DTS (dt/stock.dts), снятым с устройства на Milestone 1. Мастер-инструкция
+ * §5 прямо запрещает сочинять device tree до разбора оригинального.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/input/input.h>
+
+#include "meson-gxm.dtsi"
+#include "meson-gx-p23x-q20x.dtsi"
+
+/ {
+	compatible = "h96,pro-plus", "amlogic,s912", "amlogic,meson-gxm";
+	model = "H96 Pro Plus (CZ-S32-V3)";
+
+	/* h96 05.09.2026: глубокий сон-в-RAM (meson_gx_pm драйвер) */
+	meson_gx_pm: pm {
+		compatible = "amlogic,meson-gx-pm";
+	};
+
+	/*
+	 * ✅ ПОДТВЕРЖДЕНО стоковым DTS (2026-08-16, до подключения устройства).
+	 *
+	 * Прошивка Франкенштейн содержит multi-DTB с тремя вариантами —
+	 * gxm/q201/1g, /2g и /3g. В варианте 3g:
+	 *
+	 *     linux,usable-memory = <0x00 0x100000 0x00 0xbff00000>;
+	 *
+	 * то есть 0xbff00000 = 3 070 MiB, начиная с 1 MiB. Тогда это выглядело
+	 * подтверждением наклейки «CZ 3G+16G» — но загрузка (M3) показала
+	 * обратное: реальной памяти 2 GiB, «3g»-вариант просто лежит в
+	 * multi-DTB про запас. Исходное ТЗ с его «2 GB» было право.
+	 *
+	 * Здесь оставлен полный диапазон 0xC0000000: mainline рассчитывает
+	 * зарезервированные области сам через reserved-memory, а сток отрезает
+	 * первый мегабайт вручную.
+	 *
+	 * ⚠️ Поправка по факту загрузки (M3): физически на плате 2 GiB — и сток,
+	 * и наше ядро видят Memory: .../2092032K. Вариант «3g» в прошивке
+	 * Франкенштейна описывает другую комплектацию платы. Узел не трогаем:
+	 * U-Boot при загрузке подставляет реальный размер сам.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0xC0000000>;	/* U-Boot урежет до реальных 2 GiB */
+	};
+
+	/*
+	 * CMA 512 MiB вместо 256 MiB из meson-gx.dtsi.
+	 *
+	 * Прогон 12 (2026-08-17): с 256 MiB 4K-декодирование падало на
+	 * STREAMON(CAPTURE) — `dma alloc of size 8323072 failed` (DPB 16+2
+	 * буферов NV12M по 12,45 MiB + рабочие буферы + фрагментация).
+	 * 384 MiB хватило 8-битному 4K (прогоны 13-24), но 10-битный HEVC
+	 * 4K (сжатые опорные кадры FBC поверх NV12M) снова упёрся (прогон
+	 * 24: WARN на streamon при «свободных» 366 МБ — фрагментация).
+	 * 512 MiB: CMA-страницы переиспользуются movable-аллокациями, для
+	 * Android это не мёртвый груз.
+	 */
+	reserved-memory {
+		/*
+		 * ramoops — предсмертный лог ядра без UART. Регион ТОТ ЖЕ, что
+		 * резервирует сток (0x7300000, 1 MiB, сразу за secmon_alt):
+		 * после паники нашего ядра сток монтирует /sys/fs/pstore и
+		 * отдаёт console-ramoops прошлой сессии. Размеры записей — как
+		 * у стока (record 0x8000, console 0x4000), иначе регион
+		 * прочитается мусором.
+		 */
+		ramoops@7300000 {
+			compatible = "ramoops";
+			reg = <0x0 0x7300000 0x0 0x100000>;
+			record-size = <0x8000>;
+			console-size = <0x4000>;
+			pmsg-size = <0x4000>;
+		};
+
+		linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x0 0x40000000>;
+			alignment = <0x0 0x400000>;
+			linux,cma-default;
+		};
+	};
+
+	/*
+	 * Кнопка на плате (жёлтая тактовая у AV/DC). На Q200 она заведена через
+	 * SARADC как "Update" — вход в upgrade mode.
+	 * TODO(M1): проверить, та же ли схема у нас, и не спрятана ли кнопка
+	 * внутри AV-джека (типично для H96 Pro+, см. docs/recovery.md §3).
+	 */
+	adc-keys {
+		compatible = "adc-keys";
+		io-channels = <&saradc 0>;
+		io-channel-names = "buttons";
+		keyup-threshold-microvolt = <1710000>;
+
+		button-function {
+			label = "Update";
+			linux,code = <KEY_VENDOR>;
+			press-threshold-microvolt = <10000>;
+		};
+	};
+
+	/*
+	 * Кнопка питания. Взята из meson-gxm-q200.dts как есть — наша плата
+	 * производная от Q200, поэтому GPIOAO_2 наиболее вероятен.
+	 *
+	 * TODO(M1): подтвердить по stock.dts. Если у нас кнопка одна и она
+	 * спрятана в AV-джеке (типично для H96 Pro+, см. docs/recovery.md §3),
+	 * то она может быть той же самой, что и adc-keys "Update" выше —
+	 * тогда этот узел лишний и его надо убрать.
+	 *
+	 * Без него не работает ТЗ §23 (short/long press, wake, sleep, shutdown),
+	 * поэтому лучше иметь с пометкой, чем не иметь вовсе.
+	 */
+	gpio-keys-polled {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+
+		button {
+			label = "power";
+			linux,code = <KEY_POWER>;
+			gpios = <&gpio_ao GPIOAO_2 GPIO_ACTIVE_LOW>;	/* TODO(M1) */
+		};
+	};
+
+	/*
+	 * Светодиод питания — ✅ ВЗЯТ ИЗ СТОКОВОГО DTS, не угадан.
+	 *
+	 * В стоке он описан двумя вендорскими узлами:
+	 *
+	 *     sysled {
+	 *         compatible = "amlogic, sysled";
+	 *         led_gpio = <0x32 0x09 0x00>;
+	 *         led_active_low = <0x01>;
+	 *     };
+	 *     ledlight { led_name = "power_led"; led_type = "R&G"; }
+	 *
+	 * phandle 0x32 разрешается в `ao-bank@c1108030`, то есть банк AO,
+	 * индекс 9 → GPIOAO_9. В mainline это последний вывод банка
+	 * (BANK("AO", GPIOAO_0, GPIOAO_9, ...) в pinctrl-meson-gxl.c),
+	 * так что значение допустимое.
+	 *
+	 * ⚠️ Зачем он нужен здесь и сейчас: UART не подключён, а первая
+	 * попытка загрузки (2026-08-16) не дала НИКАКИХ признаков того,
+	 * загрузилось ядро или нет. Я тогда принял мигание светодиода за
+	 * работу своего init — ошибочно, потому что узла leds в этом файле
+	 * не было вовсе и /sys/class/leds был пуст.
+	 *
+	 * С этим узлом светодиод становится настоящим каналом обратной связи:
+	 * init гасит его при старте и зажигает после записи отчёта.
+	 *
+	 * led_type = "R&G" в стоке означает двухцветный индикатор; вероятно
+	 * GPIOAO_9 переключает цвет, а не включает питание светодиода.
+	 * Проверяется наблюдением при первой удачной загрузке.
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		led-power {
+			label = "h96:power";
+			/*
+			 * ⚠️ ACTIVE_HIGH — подобрано ЭКСПЕРИМЕНТОМ, вопреки стоку.
+			 * Вендорский sysled говорит led_active_low = <1>, но с
+			 * ACTIVE_LOW и brightness=1 светодиод на первой удачной
+			 * загрузке (2026-08-16, попытка 4) остался ТЁМНЫМ.
+			 * Либо вендорская семантика поля обратная, либо GPIOAO_9
+			 * переключает цвет двухцветного R&G-индикатора.
+			 * Проверяется следующей загрузкой.
+			 */
+			gpios = <&gpio_ao GPIOAO_9 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+	};
+};
+
+/*
+ * Ethernet — ✅ СВЕРЕНО СО СТОКОВЫМ DTS, совпало полностью.
+ *
+ * PHY подтверждён по фотографии как RTL8211F, рядом гигабитные magnetics
+ * Pulse H5007NL.
+ *
+ * ✅ 2026-08-16: источником стал не разбор чужого образа, а САМО УСТРОЙСТВО —
+ * multi-DTB вынут из раздела `reserved` (offset 0x400000, контейнер AML_
+ * версии 2, три варианта DDR), см. out/dtb-from-reserved/. Проверены все
+ * три варианта, 1g/2g/3g: во ВСЕХ `phy-mode = "rgmii"` и `internal_phy = <0>`.
+ * Загружается вариант 2g. Узел описан так:
+ *
+ *     compatible   = "amlogic, gxbb-rgmii-dwmac";
+ *     phy-mode     = "rgmii";
+ *     internal_phy = <0x00>;              ← внешний PHY, как у нас
+ *     rst_pin-gpios = <&gpio 0x0e 0x00>;  ← GPIO 14 банка Z = GPIOZ_14
+ *     mc_val       = <0x1621>;
+ *     cali_val     = <0x20000>;
+ *
+ * Что это даёт:
+ *
+ *  1. `rst_pin-gpios` = GPIOZ_14 — ровно то, что стоит в mainline
+ *     meson-gxm-q200.dts. Совпадение точное.
+ *
+ *  2. `mc_val = 0x1621` — это содержимое регистра PRG_ETH0, куда vendor
+ *     пишет задержки напрямую. Разбор: биты [6:5] = 1, а драйвер
+ *     dwmac-meson8b кладёт туда `tx-delay-ns / 2`. Значит tx-delay-ns = 2 —
+ *     опять же ровно как в mainline q200.dts.
+ *
+ * То есть блок ниже, взятый из q200, подтверждён вендорским DTS по обоим
+ * параметрам, на которых обычно и ломается гигабит у Amlogic + RTL8211F.
+ *
+ * ⚠️ Линия прерывания MAC_INTR в стоковом DTS не описана — vendor-драйвер
+ * её не использует. Значение из q200 оставлено как есть; если линк будет
+ * подниматься, но трафик не пойдёт, проверять в первую очередь именно её.
+ */
+&ethmac {
+	pinctrl-0 = <&eth_pins>;
+	pinctrl-names = "default";
+
+	phy-handle = <&external_phy>;
+	amlogic,tx-delay-ns = <2>;	/* ✅ = mc_val 0x1621, биты [6:5] */
+	phy-mode = "rgmii";		/* ✅ сток: phy-mode = "rgmii" */
+};
+
+&external_mdio {
+	external_phy: ethernet-phy@0 {
+		/* Realtek RTL8211F (0x001cc916) */
+		reg = <0>;
+		max-speed = <1000>;
+
+		reset-assert-us = <10000>;
+		reset-deassert-us = <80000>;
+		reset-gpios = <&gpio GPIOZ_14 GPIO_ACTIVE_LOW>;	/* ✅ сток: rst_pin-gpios 0x0e */
+
+		interrupt-parent = <&gpio_intc>;
+		/* MAC_INTR на GPIOZ_15 — в стоке не описан, значение из q200 */
+		interrupts = <25 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+/*
+ * Wi-Fi / Bluetooth — Fn-Link 8223A-SR по SDIO.
+ *
+ * ⚠️ Chipset НЕ ОПРЕДЕЛЁН. Узел ниже только объявляет наличие устройства на
+ * шине; конкретный compatible добавляется ПОСЛЕ того, как с устройства снят
+ * SDIO vendor/device ID (scripts/collect, файл sdio-ids.txt).
+ *
+ * Подбирать драйвер по названию модуля запрещено: Fn-Link — сборщик модулей,
+ * один и тот же номер встречается с разной начинкой.
+ * См. docs/hardware.md §5 и docs/feasibility.md §6.
+ */
+&sd_emmc_a {
+	sdio: wifi@1 {
+		reg = <1>;
+		/* TODO(M1): compatible по SDIO ID */
+	};
+};
+
+/*
+ * ── Что берётся из meson-gx-p23x-q20x.dtsi без изменений ────────────────
+ *
+ * Проверено: этот dtsi уже включает всё, что нам нужно, и включает как
+ * "okay" — то есть отдельно поднимать не требуется.
+ *
+ *   &ir        IR-приёмник (remote_input_ao_pins)
+ *              ⚠️ Важно: это опровергает сводку linux-meson.com, где
+ *              "Infrared Decoder" помечен как неподдерживаемый. Для
+ *              GXM-плат IR в mainline включён. Проверить на M8.
+ *   &hdmi_tx   HDMI + &cec_AO (CEC)
+ *   &aiu       аудио, &acodec — кодек
+ *   spdif-dit  S/PDIF — у нас оптический TOSLINK на плате есть
+ *   &cvbs_vdac_port  композит (жёлтый AV-джек)
+ *   &sd_emmc_b SD-карта, cd-gpios = CARD_6
+ *   &sd_emmc_c eMMC, bus-width 8
+ *   &usb       USB
+ *   &uart_AO   отладочная консоль — пятаки G/T/R, см. docs/uart.md
+ *   &saradc    АЦП для кнопки
+ *
+ * ── Чего в этом файле ПОКА НЕТ и почему ─────────────────────────────────
+ *
+ *   Вентилятор     ✅ вопрос закрыт: в стоковом DTS нет ни gpio-fan, ни
+ *                  pwm-fan. Прошивка вентилятором не управляет — он либо
+ *                  запитан постоянно, либо на линии, которой vendor не
+ *                  управляет. Узел не добавляем.
+ *
+ *   CPU/GPU OPP    берутся из meson-gxm.dtsi. Вендорские значения известны
+ *                  (GPU до 666 МГц, есть заготовка на 800; CPU разогнан до
+ *                  2016 МГц) — см. docs/tuning-baseline.md. Менять только
+ *                  на M11, по замерам, а не наугад (ТЗ §9).
+ *
+ *   Thermal        ⚠️ у vendor критический порог выставлен на 260 °C, то
+ *                  есть аварийное отключение фактически отключено. В нашей
+ *                  сборке нужен реальный порог ~100–105 °C.
+ *                  Подробности — docs/tuning-baseline.md §3.
+ *
+ *   MAC-адреса     ⚠️ хранятся НЕ в прошивке, а в отдельном key-хранилище
+ *                  (efuse): ключи mac / mac_bt / mac_wifi / usid.
+ *                  Обязательно сохранить при backup на M2, иначе устройство
+ *                  получит случайные адреса. docs/tuning-baseline.md §6.
+ *
+ *   SATA-разъём    на плате есть (docs/hardware.md §7a), но у S912 нет
+ *                  нативного SATA. Пока не ясно, что это — узел не пишем.
+ */
+
+/*
+ * USB — режим host, как у TV-боксов в mainline (x96-max, odroid-c2).
+ *
+ * p23x-q20x.dtsi ставит dr_mode = "otg", и на первой загрузке (2026-08-17)
+ * это дало картину:
+ *
+ *   dwc2 c9100000.usb: dwc2_core_reset: HANG! Soft Reset timeout   ← OTG мёртв
+ *   hub 1-3:1.0: USB hub found                                     ← хост ЖИВ
+ *
+ * Хост-сторона (dwc3/xhci) работала сразу — бортовой хаб GL850G
+ * перечислился. Ломался только dwc2, контроллер режима «устройство»:
+ * в otg-мультиплексе его PHY не получает тактирование, и probe виснет
+ * на программном сбросе.
+ *
+ * Медиаприставке peripheral-режим не нужен (adb по сети, прошивка через
+ * BootROM, который живёт ниже любого DT). Поэтому: глю — host, dwc2 —
+ * выключен, чтобы не висел в логе с ошибкой -16.
+ */
+&usb {
+	dr_mode = "host";
+};
+
+&dwc2 {
+	status = "disabled";
+};
+
+/*
+ * Bluetooth: QCA9377 (тот же чип, что WiFi на sd_emmc_a) сидит на uart_A.
+ * Разведка 01.09.2026 по стоковому DTS (dt/stock-frank-3g.dts):
+ *   bt-dev.gpio_reset = <банк periphs, 96, 0>  ->  96 = GPIOX_17
+ *   (нумерация совпадает с mainline meson-gxl-gpio.h; проверка: wifi
+ *    power_on_pin 85 = GPIOX_6 и interrupt 86 = GPIOX_7 точь-в-точь
+ *    референс p212, из которого p23x-q20x.dtsi и растёт).
+ * 32 кГц для сна берётся из wifi32k (pwm-clock в p23x-q20x.dtsi).
+ * Прошивки: /vendor/firmware/qca/rampatch_XXXXXXXX.bin + nvm_XXXXXXXX.bin (версию ROM чип сообщает сам; в /vendor/firmware/qca лежат все 4 пары 00130300/00130302/00230302/00440302)
+ * (firmware_class.path=/vendor/firmware в cmdline).
+ * Драйвер hci_qca (serdev) сам грузит прошивку и создаёт hci0; HAL
+ * android.hardware.bluetooth-service.default находит его через mgmt.
+ */
+&uart_A {
+	status = "okay";
+	pinctrl-0 = <&uart_a_pins>, <&uart_a_cts_rts_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+
+	bluetooth {
+		compatible = "qcom,qca9377-bt";
+		enable-gpios = <&gpio GPIOX_17 GPIO_ACTIVE_HIGH>;
+		max-speed = <2000000>;
+		clocks = <&wifi32k>;
+		clock-names = "susclk";
+	};
+};
+
+
+/* codex 2026-09-07: rc-core NEC (RAW) decoding, not the GXM HW-mode from 0016.
+ * Bypasses kernel mouse/power interception (0016/0019); mouse -> h96mouse (uinput).
+ */
+&ir {
+	compatible = "amlogic,meson-gxbb-ir";
+	status = "okay";
+};

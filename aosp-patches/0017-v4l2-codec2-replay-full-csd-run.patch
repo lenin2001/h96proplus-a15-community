@@ -1,0 +1,87 @@
+Subject: [PATCH] v4l2_codec2: replay the whole CSD run (SPS+PPS) after flush
+
+Corrects 0008. It stored only the last CODEC_CONFIG block; for DASH/MP4 avc1
+(YouTube AVC) SPS and PPS arrive as two separate CSD works, so only the PPS was
+replayed after a seek-flush. The meson vdec, fully torn down on the flush's CAPTURE
+STREAMOFF, never saw an SPS, never raised CMD_SRC_CHANGE, and decoded nothing until
+SmartTube recreated the codec ~20 s later. Accumulate every CSD block of the current
+run and replay them in order. Measured on the box: 5 seeks, 0 engine restarts, 0 s of
+decoder freeze (was ~20 s + a restart on every seek).
+
+diff --git a/components/DecodeComponent.cpp b/components/DecodeComponent.cpp
+index b9f0439..81051c1 100644
+--- a/components/DecodeComponent.cpp
++++ b/components/DecodeComponent.cpp
+@@ -447,7 +447,11 @@ void DecodeComponent::processCSDWork(const int32_t bitstreamId, const C2Work* wo
+             mPendingColorAspectsChange = true;
+             mPendingColorAspectsChangeFrameIndex = work->input.ordinal.frameIndex.peeku();
+         }
+-        mLastCsd = linearBlock; /* h96: запомнить для повтора после flush */
++        /* h96 16.09: новая серия CSD (после обычных кадров) заменяет старую;
++         * внутри серии блоки копятся по порядку: SPS, PPS[, PPS...]. */
++        if (!mCsdRunOpen) mCsdRun.clear();
++        mCsdRunOpen = true;
++        mCsdRun.push_back(linearBlock);
+     }
+ 
+     processWorkBuffer(bitstreamId, linearBlock);
+@@ -458,6 +462,7 @@ void DecodeComponent::processWork(const int32_t bitstreamId, const C2Work* work)
+     C2ConstLinearBlock linearBlock = work->input.buffers.front()->data().linearBlocks().front();
+     ALOG_ASSERT(linearBlock.size() > 0u, "Input buffer of work(%d) is empty.", bitstreamId);
+ 
++    mCsdRunOpen = false;  // h96: обычный кадр закрывает серию CSD -> следующий CSD начнёт новую
+     processWorkBuffer(bitstreamId, linearBlock);
+ }
+ 
+@@ -709,14 +714,21 @@ void DecodeComponent::flushTask() {
+      * SPS/PPS теряются), а CCodec пересылает CSD только из flushedWork, которого мы не
+      * даём. Для DASH avc1/hvc1 (YouTube AVC) после seek приходили одни слайсы - ни
+      * кадров, ни SOURCE_CHANGE. Повторяем последний CSD первым же буфером. */
+-    if (mLastCsd && (mIntfImpl->getVideoCodec() == VideoCodec::H264 ||
+-                     mIntfImpl->getVideoCodec() == VideoCodec::HEVC)) {
+-        constexpr int32_t kCsdReplayId = -2;
+-        mDecoder->decode(std::make_unique<ConstBitstreamBuffer>(kCsdReplayId, *mLastCsd,
+-                                                                mLastCsd->offset(),
+-                                                                mLastCsd->size()),
+-                         ::base::BindOnce([](VideoDecoder::DecodeStatus) {}));
+-        ALOGV("h96: CSD replayed after flush");
++    if (!mCsdRun.empty() && (mIntfImpl->getVideoCodec() == VideoCodec::H264 ||
++                            mIntfImpl->getVideoCodec() == VideoCodec::HEVC)) {
++        /* h96 16.09: повторяем ВСЮ серию CSD (SPS, потом PPS[, ...]) в исходном
++         * порядке. id = -2, -3, ... - отрицательные, никогда не совпадут с
++         * frameIndex настоящих AU. Это ровно стартовая последовательность,
++         * которую firmware принимает (два CSD-work -> src_change за ~5 мс). */
++        int32_t replayId = -2;
++        for (const C2ConstLinearBlock& csd : mCsdRun) {
++            mDecoder->decode(std::make_unique<ConstBitstreamBuffer>(replayId, csd,
++                                                                    csd.offset(), csd.size()),
++                             ::base::BindOnce([](VideoDecoder::DecodeStatus) {}));
++            ALOGV("h96: CSD replayed after flush id=%d size=%zu", replayId, csd.size());
++            --replayId;
++        }
++        mCsdRunOpen = false;
+     }
+ 
+     // Pending EOS work will be abandoned here due to component flush if any.
+diff --git a/components/include/v4l2_codec2/components/DecodeComponent.h b/components/include/v4l2_codec2/components/DecodeComponent.h
+index d7f463c..273b529 100644
+--- a/components/include/v4l2_codec2/components/DecodeComponent.h
++++ b/components/include/v4l2_codec2/components/DecodeComponent.h
+@@ -104,9 +104,14 @@ protected:
+     std::shared_ptr<Listener> mListener;
+ 
+     std::unique_ptr<VideoDecoder> mDecoder;
+-    /* h96 03.09: последний CSD (SPS/PPS) H264/HEVC - повторяется после flush,
+-     * т.к. meson-vdec на STREAMOFF CAPTURE сбрасывает прошивку вместе с параметрами. */
+-    std::optional<C2ConstLinearBlock> mLastCsd;
++    /* h96 16.09: ВСЕ CSD-блоки текущей серии. avc1 в DASH/MP4 доставляет SPS и PPS
++     * ДВУМЯ отдельными CODEC_CONFIG-работами (csd-0, csd-1); hvc1 - одним блоком.
++     * meson-vdec на STREAMOFF CAPTURE сбрасывает прошивку вместе с параметрами,
++     * поэтому после flush повторяем серию целиком, в исходном порядке. Раньше
++     * хранился только последний блок (mLastCsd) => после seek в firmware уходил
++     * один PPS, без SPS не поднимался CMD_SRC_CHANGE, декодер молчал ~20 с. */
++    std::vector<C2ConstLinearBlock> mCsdRun;
++    bool mCsdRunOpen = false;  // true, пока приходят подряд идущие CSD-работы
+     // The queue of works that haven't processed and sent to |mDecoder|.
+     std::queue<std::unique_ptr<C2Work>> mPendingWorks;
+     // The works whose input buffers are sent to |mDecoder|. The key is the

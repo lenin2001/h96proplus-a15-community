@@ -1,0 +1,57 @@
+Кнопка POWER на пульте = ПОЛНЫЙ poweroff (как сток Frankenstein).
+
+Запрос пользователя: во Frankenstein нажатие power ПОЛНОСТЬЮ выключало приставку,
+а потом ПОЛНОСТЬЮ включало — поэтому вентилятор не крутился. Сделать так же.
+
+Причина, почему это единственный рабочий путь для вентилятора:
+ узла вентилятора нет ни в стоковом, ни в нашем DTB (нет gpio-fan/pwm-fan/
+ cooling-device) — вентилятор запитан железно и НЕ управляется ядром. Единственный
+ способ его остановить — полностью снять питание, т.е. настоящий poweroff (SCP режет
+ рейлы), а не suspend-to-RAM (наш deep-sleep), где рейл вентилятора остаётся под 5В.
+
+Реализация: в meson_ir_nec_handler перед rc_keydown() спрашиваем у ЗАГРУЖЕННОЙ
+rc-карты keycode для пришедшего скан-кода; если это KEY_POWER — вызываем
+orderly_poweroff(true) и НЕ отдаём клавишу в Android (иначе PhoneWindowManager
+уведёт систему в suspend). orderly_poweroff() шедулит работу (безопасно из IRQ) ->
+Android чисто выключается -> PSCI SYSTEM_OFF -> SCP standby с пробуждением по
+IR-power (следующее нажатие = холодная загрузка с SD). Скан-код НЕ хардкодим —
+берём из rc-карты (rc_g_keycode_from_table), поэтому работает независимо от remote.
+
+Безопасность: перехват срабатывает ТОЛЬКО на скан-код, который rc-карта отображает
+в KEY_POWER; обычные клавиши и режим мыши (patch 0016) не затрагиваются. Если карта
+не знает power — вернётся KEY_RESERVED(0) и нажатие просто ничего не сделает (без
+случайного выключения).
+
+Собрано ядром #66 (make ARCH=arm64), meson-ir компилируется чисто, драйвер
+пробуется (event0 + event1-мышь на месте, NEC активен). Проверять пультом — не
+эмулируется через adb.
+--- a/drivers/media/rc/meson-ir.c
++++ b/drivers/media/rc/meson-ir.c
+@@ -19,6 +19,7 @@
+ 
+ #include <linux/input.h>
+ #include <media/rc-core.h>
++#include <linux/reboot.h>
+ 
+ #define DRIVER_NAME		"meson-ir"
+ 
+@@ -260,6 +261,19 @@
+ 		}
+ 	}
+ 
++	/*
++	 * h96 06.09.2026: knopka POWER = POLNYJ poweroff (kak stok Frankenstein),
++	 * chtoby ventilyator ostanavlivalsya. Klavishu v Android NE otdaem: inache
++	 * on ujdet v suspend-to-RAM, gde rejl ventilyatora ostaetsya pod pitaniem.
++	 * orderly_poweroff() shedulit rabotu (bezopasno iz IRQ) -> Android chisto
++	 * vyklyuchaetsya -> PSCI SYSTEM_OFF -> SCP standby, probujdenie po IR-power.
++	 * Skankod ne hardkodim: keycode beriom iz zagrujennoj rc-karty.
++	 */
++	if (rc_g_keycode_from_table(ir->rc, code) == KEY_POWER) {
++		orderly_poweroff(true);
++		return;
++	}
++
+ 	rc_keydown(ir->rc, proto, code, 0);
+ }
+ 

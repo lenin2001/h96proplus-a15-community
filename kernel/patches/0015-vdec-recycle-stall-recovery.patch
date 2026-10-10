@@ -1,0 +1,26 @@
+Восстановление декодера при вечном застое recycle-потока.
+
+Симптом (05.09.2026): в Alfa/SmartTube видео «не стартует», при перемотке
+кубики; в dmesg «meson-vdec: No dst buffer available» + «recycle stalled
+>1s (fw not draining returns)». Прошивка H264/VP9 перестаёт возвращать
+выходные буферы -> vdec_recycle_thread ждёт вечно, удерживая ВСЕ CMA-буферы
+-> декодер голодает, а система захлёбывается в памяти (load 13, swap 97%,
+CmaFree ~0). Это и есть корень «всё дико тормозит».
+
+HEVC на «No dst buffer» уже делает amvdec_abort (codec_hevc.c:1472/1502) и
+восстанавливается — сессия сбрасывается, c2-клиент пересоздаёт её. Для
+H264/VP9 такого не было: recycle-поток лишь печатал предупреждение.
+
+Правка (drivers/staging/media/meson/vdec/vdec.c, vdec_recycle_thread): после
+>3с непрерывного застоя (stall_iters >= 600) вызвать amvdec_abort(sess) и
+сбросить счётчик. amvdec_abort лишь помечает обе vb2-очереди ошибкой
+(vb2_queue_error) -> клиент штатно пересоздаёт сессию. Освобождает CMA,
+убирает вечный фриз, даёт видео повтор. НЕ полное лечение голодания DPB
+(это отдельно), но снимает катастрофическое зависание.
+
+Полный разбор буферного бага (для будущего фикса): patch 0010 понизил
+q->min_queued_buffers (vdec.c:300); amvdec_set_canvases (vdec_helpers.c:251)
+и codec_hevc_setup_buffers_gxl (codec_hevc_common.c:135) программируют
+канвасы/FBC только для буферов в очереди на момент resume -> заквешенный
+позже буфер получает fbc_buffer_paddr[idx]=0. Правильный фикс: программировать
+на ВСЕ num_dst_bufs по индексу + догрузка в vdec_vb2_buf_queue.

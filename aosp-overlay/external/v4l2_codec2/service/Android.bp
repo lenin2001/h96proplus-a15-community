@@ -1,0 +1,84 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "external_v4l2_codec2_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-BSD
+    default_applicable_licenses: ["external_v4l2_codec2_license"],
+}
+
+cc_defaults {
+    name: "libv4l2_codec2_service",
+
+    defaults: [
+        "hidl_defaults",
+        "libcodec2-hidl-defaults",
+        // ЛОКАЛЬНАЯ ПРАВКА: служба регистрируется через AIDL, см. service.cpp
+        "libcodec2-aidl-defaults",
+    ],
+    vendor: true,
+    relative_install_path: "hw",
+
+    srcs: [
+        "service.cpp",
+    ],
+
+    shared_libs: [
+        "libv4l2_codec2_v4l2",
+        "libv4l2_codec2_components",
+        "libavservices_minijail",
+        "libchrome",
+        "libcutils",
+        "libbinder_ndk",
+        "libhidlbase",
+        "liblog",
+        "libutils",
+    ],
+
+    required: ["android.hardware.media.c2-default-seccomp_policy"],
+}
+
+cc_binary {
+    name: "android.hardware.media.c2@1.2-service-v4l2",
+
+    defaults: [
+        "libv4l2_codec2_service",
+    ],
+
+    shared_libs: [
+        "libv4l2_codec2_v4l2",
+    ],
+
+    cflags: [
+        "-DV4L2_CODEC2_SERVICE_V4L2_STORE",
+    ],
+
+    // ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 24.08.2026): было "both".
+    //
+    // Оба .rc объявляют службу с ОДНИМ И ТЕМ ЖЕ именем
+    // `android-hardware-media-c2-v4l2-hal-1-2`, но разными бинарниками.
+    // Init оставляет то определение, что разобрал последним, — и это
+    // оказалась 32-битная служба. Она немедленно умирает:
+    //     libminijail: nonexistent syscall 'mmap' / 'getrlimit' / 'newfstatat'
+    //     libminijail: blocked syscall: mmap2
+    // потому что единственный установленный файл ограничений системных
+    // вызовов написан под 64 бита: на 32-битном ARM эти вызовы называются
+    // mmap2, ugetrlimit, fstatat64, строки отбрасываются, mmap2 в разрешённые
+    // не попадает. Итог — бесконечный перезапуск, а 64-битная служба не
+    // стартует ни разу (проверено на приставке 24.08).
+    //
+    // Нам 32-битный вариант не нужен: приставка 64-битная, кодек живёт в
+    // отдельном процессе. "first" собирает только основную разрядность.
+    compile_multilib: "first",
+    multilib: {
+        lib32: {
+            suffix: "-32",
+            init_rc: ["android.hardware.media.c2@1.2-service-v4l2-32.rc"],
+        },
+        lib64: {
+            suffix: "-64",
+            init_rc: ["android.hardware.media.c2@1.2-service-v4l2-64.rc"],
+        },
+    },
+    vintf_fragments: ["android.hardware.media.c2@1.2-service-v4l2.xml"],
+}

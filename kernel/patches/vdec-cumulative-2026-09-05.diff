@@ -1,0 +1,1023 @@
+diff --git a/drivers/staging/media/meson/vdec/codec_h264.c b/drivers/staging/media/meson/vdec/codec_h264.c
+index 77d75ed2c..64e67fb0d 100644
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -342,6 +342,15 @@ static void codec_h264_src_change(struct amvdec_session *sess)
+ 
+ 	h264->max_refs = ((parsed_info >> MAX_REF_BIT) & MAX_REF_MASK) + 1;
+ 
++	/* The GXM H.264 microcode exposes only 24 canvas slots (ANC0..23).
++	 * Streams without an explicit max_dec_frame_buffering make the
++	 * firmware report max_refs = 24, so the requested DPB (max_refs + 5)
++	 * exceeds the canvas pool and decode stalls forever waiting for
++	 * free frames. Clamp so DPB + userspace extras still fit in 24.
++	 */
++	if (h264->max_refs > 15)
++		h264->max_refs = 15;
++
+ 	crop_infor = amvdec_read_dos(core, AV_SCRATCH_6);
+ 	crop_bottom = (crop_infor & 0xff);
+ 	crop_right = (crop_infor >> 16) & 0xff;
+@@ -353,6 +362,8 @@ static void codec_h264_src_change(struct amvdec_session *sess)
+ 		frame_width, frame_height, crop_right, crop_bottom);
+ 
+ 	codec_h264_set_par(sess);
++	pr_info("h96 h264 src_change: %ux%u max_refs=%u dpb=%u\n",
++		frame_width, frame_height, h264->max_refs, h264->max_refs + 5);
+ 	amvdec_src_change(sess, frame_width, frame_height,
+ 			  h264->max_refs + 5, 8);
+ }
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc.c b/drivers/staging/media/meson/vdec/codec_hevc.c
+index 3c32f0d2a..317bbf38e 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc.c
+@@ -855,8 +855,7 @@ codec_hevc_set_sao(struct amvdec_session *sess, struct hevc_frame *frame)
+ 	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M) {
+ 		buf_y_paddr =
+ 		       vb2_dma_contig_plane_dma_addr(vb, 0);
+-		buf_u_v_paddr =
+-		       vb2_dma_contig_plane_dma_addr(vb, 1);
++		buf_u_v_paddr = codec_hevc_chroma_paddr(sess, vb);
+ 		amvdec_write_dos(core, HEVC_SAO_Y_START_ADDR, buf_y_paddr);
+ 		amvdec_write_dos(core, HEVC_SAO_C_START_ADDR, buf_u_v_paddr);
+ 		amvdec_write_dos(core, HEVC_SAO_Y_WPTR, buf_y_paddr);
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc_common.c b/drivers/staging/media/meson/vdec/codec_hevc_common.c
+index 1c74b4837..b28c5d0ad 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.c
+@@ -94,7 +94,7 @@ static void codec_hevc_setup_buffers_gxbb(struct amvdec_session *sess,
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR,
+ 					 val);
+ 		} else {
+-			buf_uv_paddr = vb2_dma_contig_plane_dma_addr(vb, 1);
++			buf_uv_paddr = codec_hevc_chroma_paddr(sess, vb);
+ 			val = buf_y_paddr | ((idx * 2) << 8) | 1;
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR,
+ 					 val);
+@@ -151,7 +151,7 @@ static void codec_hevc_setup_buffers_gxl(struct amvdec_session *sess,
+ 				 buf_y_paddr >> 5);
+ 
+ 		if (!codec_hevc_use_fbc(pixfmt_cap, is_10bit)) {
+-			buf_uv_paddr = vb2_dma_contig_plane_dma_addr(vb, 1);
++			buf_uv_paddr = codec_hevc_chroma_paddr(sess, vb);
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_DATA,
+ 					 buf_uv_paddr >> 5);
+ 		}
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc_common.h b/drivers/staging/media/meson/vdec/codec_hevc_common.h
+index 13f9f1d90..0cb525456 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.h
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.h
+@@ -9,6 +9,31 @@
+ 
+ #include "vdec.h"
+ 
++#include <media/videobuf2-dma-contig.h>
++
++/* h96 (01.09.2026): Android gralloc отдаёт NV12 одним dmabuf, а
++ * vb2-dma-contig игнорирует смещение плоскости при импорте — адрес
++ * плоскости 1 совпадает с плоскостью 0. Без поправки цветность пишется
++ * поверх люмы с нулевого смещения, а потребитель ищет её по
++ * stride*ALIGN(h,32) и находит нули (зелёный кадр). Та же поправка, что
++ * в set_canvas_nv12m (vdec_helpers.c) от 26.08. Раскладка minigbm:
++ * stride = ALIGN(width, 64), цветность после ALIGN(height, 32) строк
++ * люмы. Для ширин, не кратных 64, внутренний страйд HEVC-ядра может
++ * разойтись с gralloc — на типовых 1280/1920/3840 совпадает. */
++static inline dma_addr_t
++codec_hevc_chroma_paddr(struct amvdec_session *sess, struct vb2_buffer *vb)
++{
++	dma_addr_t buf_y = vb2_dma_contig_plane_dma_addr(vb, 0);
++	dma_addr_t buf_uv = vb2_dma_contig_plane_dma_addr(vb, 1);
++
++	if (buf_uv == buf_y)
++		buf_uv = buf_y +
++			 (dma_addr_t)ALIGN(sess->width, 64) *
++			 ALIGN(sess->height, 32);
++
++	return buf_uv;
++}
++
+ #define PARSER_CMD_SKIP_CFG_0 0x0000090b
+ #define PARSER_CMD_SKIP_CFG_1 0x1b14140f
+ #define PARSER_CMD_SKIP_CFG_2 0x001b1910
+diff --git a/drivers/staging/media/meson/vdec/codec_vp9.c b/drivers/staging/media/meson/vdec/codec_vp9.c
+index 12c3bcd86..257e21afb 100644
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -689,6 +689,29 @@ static void codec_vp9_flush_output(struct amvdec_session *sess)
+ 		list_del(&tmp->list);
+ 		kfree(tmp);
+ 	}
++
++	/*
++	 * Karta referensov ZHIVET dol'she spiska kadrov. Do 01.09.2026 zdes'
++	 * chistilsya tol'ko ref_frames_list, a ref_frame_map[] ostavalsya so
++	 * starymi indeksami ot pozicii DO peremotki. Posle seek dekoder iskal
++	 * eti indeksy cherez codec_vp9_get_frame_by_idx(), ne nahodil ih i
++	 * pisal v zhurnal "couldn't find VP9 ref N" sotnyami strok.
++	 *
++	 * Dal'she huzhe: codec_vp9_set_refs() na NULL delaet continue i NE
++	 * pishet kanvas v HEVCD_MPP_ANC_CANVAS_DATA_ADDR. Zhelezo chitaet
++	 * nezapolnennyj bufer, a pustoj YUV (Y=0,U=0,V=0) - eto imenno
++	 * ZELENYJ kadr. Otsyuda zelen' posle peremotki.
++	 *
++	 * Sbrasyvaem kartu v -1, kak v codec_vp9_start(): sledujushchij kadr
++	 * posle seek vsegda klyuchevoj, ssylat'sya emu ne na chto.
++	 */
++	memset(&vp9->ref_frame_map, -1, sizeof(vp9->ref_frame_map));
++	memset(&vp9->next_ref_frame_map, -1, sizeof(vp9->next_ref_frame_map));
++	vp9->cur_frame = NULL;
++	vp9->prev_frame = NULL;
++	memset(vp9->frame_refs, 0, sizeof(vp9->frame_refs));
++	vp9->frames_num = 0;
++
+ 	mutex_unlock(&vp9->lock);
+ }
+ 
+@@ -915,8 +938,7 @@ static void codec_vp9_set_sao(struct amvdec_session *sess,
+ 	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M) {
+ 		buf_y_paddr =
+ 		       vb2_dma_contig_plane_dma_addr(vb, 0);
+-		buf_u_v_paddr =
+-		       vb2_dma_contig_plane_dma_addr(vb, 1);
++		buf_u_v_paddr = codec_hevc_chroma_paddr(sess, vb);
+ 		amvdec_write_dos(core, HEVC_SAO_Y_START_ADDR, buf_y_paddr);
+ 		amvdec_write_dos(core, HEVC_SAO_C_START_ADDR, buf_u_v_paddr);
+ 		amvdec_write_dos(core, HEVC_SAO_Y_WPTR, buf_y_paddr);
+@@ -982,24 +1004,119 @@ static void codec_vp9_set_sao(struct amvdec_session *sess,
+ 	amvdec_write_dos(core, HEVCD_IPP_AXIIF_CONFIG, val);
+ }
+ 
++/*
++ * Ssylaetsya li na kadr hotya by odna karta referensov.
++ *
++ * 01.09.2026: dobavlena proverka next_ref_frame_map. Bez nee kadr, kotoryj
++ * tol'ko chto naznachen referensom dlya SLEDUYUSHCHEGO kadra, no eshche ne
++ * perenesen v ref_frame_map, schitalsya nenuzhnym i osvobozhdalsya.
++ */
++static bool codec_vp9_is_ref(struct codec_vp9 *vp9, struct vp9_frame *frame)
++{
++	int i;
++
++	for (i = 0; i < REF_FRAMES; ++i)
++		if (vp9->ref_frame_map[i] == frame->index ||
++		    vp9->next_ref_frame_map[i] == frame->index)
++			return true;
++
++	return false;
++}
++
++/*
++ * Prinadlezhit li ukazatel' spisku zhivyh kadrov.
++ *
++ * cur_frame i prev_frame - obychnye ukazateli, i posle flush pri peremotke
++ * oni ostayutsya visyachimi: kadr uzhe kfree(), a adres v pole lezhit. Chtenie
++ * po nemu v set_mpred_mv() davalo musornyj MV-adres pryamo v zhelezo.
++ */
++static bool codec_vp9_frame_is_live(struct codec_vp9 *vp9,
++				    struct vp9_frame *frame)
++{
++	struct vp9_frame *tmp;
++
++	if (!frame)
++		return false;
++
++	list_for_each_entry(tmp, &vp9->ref_frames_list, list)
++		if (tmp == frame)
++			return true;
++
++	return false;
++}
++
++/*
++ * Referens dlya slota i, s otkatom na lyuboj validnyj kadr.
++ *
++ * Porty HEVCD_MPP_ANC_CANVAS_DATA_ADDR i VP9D_MPP_REFINFO_DATA -
++ * avtoinkrementnye. Propusk odnogo slota ne "ostavlyaet pusto", a SDVIGAET
++ * vsyu ostal'nuyu tablicu, i ostavshiesya referensy nachinayut ukazyvat' na
++ * chuzhie kanvasy. Esli propushcheny vse tri - predskazanie idet iz nulevogo
++ * kanvasa, a Y=0,U=0,V=0 po BT.709 limited eto RGB(0,135,0), rovno tot samyj
++ * zelenyj ekran.
++ *
++ * Poetomu slot zapolnyaetsya vsegda. Kartinka do blizhajshego klyuchevogo kadra
++ * budet nevernoj (smazannoj ili dublirovannoj), no eto ne zelen' i tablica
++ * ostaetsya vyrovnennoj.
++ */
++static struct vp9_frame *codec_vp9_ref_or_fallback(struct codec_vp9 *vp9, int i)
++{
++	int j;
++
++	if (vp9->frame_refs[i])
++		return vp9->frame_refs[i];
++
++	for (j = 0; j < REFS_PER_FRAME; ++j)
++		if (vp9->frame_refs[j])
++			return vp9->frame_refs[j];
++
++	if (codec_vp9_frame_is_live(vp9, vp9->prev_frame))
++		return vp9->prev_frame;
++
++	return vp9->cur_frame;
++}
++
+ static dma_addr_t codec_vp9_get_frame_mv_paddr(struct codec_vp9 *vp9,
+ 					       struct vp9_frame *frame)
+ {
++	/*
++	 * V workspace rovno MAX_REF_PIC_NUM slotov MV, srazu za nimi lezhit
++	 * RPM. frame->index - eto vb2-indeks, on nichem ne ogranichen: kadr s
++	 * indeksom >= 24 zatiral RPM, i dekoder poluchal musornye
++	 * refresh_frame_flags i ref_info. Zavorachivaem indeks i shumim odin
++	 * raz, chtoby eto ne prohodilo tiho.
++	 */
++	WARN_ON_ONCE(frame->index >= MAX_REF_PIC_NUM);
++
+ 	return vp9->workspace_paddr + MPRED_MV_OFFSET +
+-	       (frame->index * MPRED_MV_BUF_SIZE);
++	       ((frame->index % MAX_REF_PIC_NUM) * MPRED_MV_BUF_SIZE);
+ }
+ 
+ static void codec_vp9_set_mpred_mv(struct amvdec_core *core,
+ 				   struct codec_vp9 *vp9)
+ {
+ 	int mpred_mv_rd_end_addr;
+-	int use_prev_frame_mvs = vp9->prev_frame->width ==
+-					vp9->cur_frame->width &&
+-				 vp9->prev_frame->height ==
+-					vp9->cur_frame->height &&
+-				 !vp9->prev_frame->intra_only &&
+-				 vp9->prev_frame->show &&
+-				 vp9->prev_frame->type != KEY_FRAME;
++	struct vp9_frame *prev = vp9->prev_frame;
++	int use_prev_frame_mvs;
++
++	/*
++	 * 01.09.2026: posle flush pri peremotke prev_frame - visyachij
++	 * ukazatel' na uzhe osvobozhdennyj kadr. Ran'she ego polya chitalis'
++	 * pryamo zdes', i v HEVC_MPRED_MV_RD_START_ADDR uezzhal musornyj
++	 * adres.
++	 */
++	if (!codec_vp9_frame_is_live(vp9, prev))
++		prev = NULL;
++
++	use_prev_frame_mvs = prev &&
++			     prev->width == vp9->cur_frame->width &&
++			     prev->height == vp9->cur_frame->height &&
++			     !prev->intra_only &&
++			     prev->show &&
++			     prev->type != KEY_FRAME;
++
++	if (!prev)
++		prev = vp9->cur_frame;
+ 
+ 	amvdec_write_dos(core, HEVC_MPRED_CTRL3, 0x24122412);
+ 	amvdec_write_dos(core, HEVC_MPRED_ABV_START_ADDR,
+@@ -1015,12 +1132,12 @@ static void codec_vp9_set_mpred_mv(struct amvdec_core *core,
+ 			 codec_vp9_get_frame_mv_paddr(vp9, vp9->cur_frame));
+ 
+ 	amvdec_write_dos(core, HEVC_MPRED_MV_RD_START_ADDR,
+-			 codec_vp9_get_frame_mv_paddr(vp9, vp9->prev_frame));
++			 codec_vp9_get_frame_mv_paddr(vp9, prev));
+ 	amvdec_write_dos(core, HEVC_MPRED_MV_RPTR,
+-			 codec_vp9_get_frame_mv_paddr(vp9, vp9->prev_frame));
++			 codec_vp9_get_frame_mv_paddr(vp9, prev));
+ 
+ 	mpred_mv_rd_end_addr =
+-			codec_vp9_get_frame_mv_paddr(vp9, vp9->prev_frame) +
++			codec_vp9_get_frame_mv_paddr(vp9, prev) +
+ 			(vp9->lcu_total * MV_MEM_UNIT);
+ 	amvdec_write_dos(core, HEVC_MPRED_MV_RD_END_ADDR, mpred_mv_rd_end_addr);
+ }
+@@ -1121,7 +1238,7 @@ static void codec_vp9_sync_ref(struct codec_vp9 *vp9)
+ 
+ 		vp9->frame_refs[i] = codec_vp9_get_frame_by_idx(vp9, idx);
+ 		if (!vp9->frame_refs[i])
+-			pr_warn("%s: couldn't find VP9 ref %d\n", __func__,
++			pr_warn_ratelimited("%s: couldn't find VP9 ref %d\n", __func__,
+ 				idx);
+ 	}
+ }
+@@ -1133,12 +1250,25 @@ static void codec_vp9_set_refs(struct amvdec_session *sess,
+ 	int i;
+ 
+ 	for (i = 0; i < REFS_PER_FRAME; ++i) {
+-		struct vp9_frame *frame = vp9->frame_refs[i];
++		struct vp9_frame *frame = codec_vp9_ref_or_fallback(vp9, i);
+ 		int id_y;
+ 		int id_u_v;
+ 
++		/*
++		 * Zapis' idet v HEVCD_MPP_ANC_CANVAS_DATA_ADDR s
++		 * avtoinkrementom, poetomu "continue" na propavshem referense
++		 * ne prosto propuskal odin sloty - on SDVIGAL vsyu ostal'nuyu
++		 * tablicu, i ostavshiesya referensy nachinali ukazyvat' ne na
++		 * svoi kanvasy. Kartinka posle etogo libo zelenaya (pustoj
++		 * bufer), libo sobrana iz chuzhih kuskov.
++		 *
++		 * Teper' slot zapolnyaetsya vsegda: esli referens poteryan,
++		 * podstavlyaem tekushchij kadr. Kartinka na paru kadrov do
++		 * blizhajshego klyuchevogo budet nevernoj, no eto luchshe
++		 * zeleni i sohranyaet vyravnivanie tablicy.
++		 */
+ 		if (!frame)
+-			continue;
++			continue;	/* vozmozhno tol'ko do pervogo kadra */
+ 
+ 		if (codec_hevc_use_fbc(sess->pixfmt_cap, vp9->is_10bit)) {
+ 			id_y = frame->index;
+@@ -1173,27 +1303,29 @@ static void codec_vp9_set_mc(struct amvdec_session *sess,
+ 
+ 	amvdec_write_dos(core, VP9D_MPP_REFINFO_TBL_ACCCONFIG, BIT(2));
+ 	for (i = 0; i < REFS_PER_FRAME; ++i) {
+-		if (!vp9->frame_refs[i])
++		struct vp9_frame *ref = codec_vp9_ref_or_fallback(vp9, i);
++
++		/*
++		 * Ta zhe lovushka, chto i v codec_vp9_set_refs(): tablica
++		 * REFINFO zapolnyaetsya po 5 slov na referens s
++		 * avtoinkrementom, i propusk sdvigaet vse posleduyushchie
++		 * zapisi. Podstavlyaem tekushchij kadr vmesto propuska.
++		 */
++		if (!ref)
+ 			continue;
+ 
+-		if (vp9->frame_refs[i]->width != vp9->width ||
+-		    vp9->frame_refs[i]->height != vp9->height)
++		if (ref->width != vp9->width || ref->height != vp9->height)
+ 			scale = 1;
+ 
+-		sz = amvdec_amfbc_body_size(vp9->frame_refs[i]->width,
+-					    vp9->frame_refs[i]->height,
++		sz = amvdec_amfbc_body_size(ref->width, ref->height,
+ 					    vp9->is_10bit, use_mmu);
+ 
++		amvdec_write_dos(core, VP9D_MPP_REFINFO_DATA, ref->width);
++		amvdec_write_dos(core, VP9D_MPP_REFINFO_DATA, ref->height);
+ 		amvdec_write_dos(core, VP9D_MPP_REFINFO_DATA,
+-				 vp9->frame_refs[i]->width);
++				 (ref->width << 14) / vp9->width);
+ 		amvdec_write_dos(core, VP9D_MPP_REFINFO_DATA,
+-				 vp9->frame_refs[i]->height);
+-		amvdec_write_dos(core, VP9D_MPP_REFINFO_DATA,
+-				 (vp9->frame_refs[i]->width << 14) /
+-				 vp9->width);
+-		amvdec_write_dos(core, VP9D_MPP_REFINFO_DATA,
+-				 (vp9->frame_refs[i]->height << 14) /
+-				 vp9->height);
++				 (ref->height << 14) / vp9->height);
+ 		amvdec_write_dos(core, VP9D_MPP_REFINFO_DATA, sz >> 5);
+ 	}
+ 
+@@ -1207,6 +1339,8 @@ static struct vp9_frame *codec_vp9_get_new_frame(struct amvdec_session *sess)
+ 	struct vb2_v4l2_buffer *vbuf;
+ 	struct vp9_frame *new_frame;
+ 
++	int tries;
++
+ 	new_frame = kzalloc_obj(*new_frame);
+ 	if (!new_frame)
+ 		return NULL;
+@@ -1218,9 +1352,29 @@ static struct vp9_frame *codec_vp9_get_new_frame(struct amvdec_session *sess)
+ 		return NULL;
+ 	}
+ 
++	/*
++	 * 01.09.2026: dobavlen schetchik popytok.
++	 *
++	 * Cikl vrashchaet ochered: izymaet odin bufer i vozvrashchaet
++	 * predydushchij, poetomu dlina ocheredi ne ubyvaet i uslovie
++	 * v4l2_m2m_dst_buf_remove() == NULL ne nastupaet. Kogda VSE bufery
++	 * uderzhany kak referensy - a posle pravki rm_noshow_frame oni
++	 * uderzhivayutsya dolshe - cikl stanovitsya vechnym, prichem krutitsya
++	 * on v trede preryvaniya s zazhatym vp9->lock. Zavisanie bez edinoj
++	 * zapisi v zhurnal.
++	 */
++	tries = sess->num_dst_bufs + 1;
+ 	while (codec_vp9_get_frame_by_idx(vp9, vbuf->vb2_buf.index)) {
+ 		struct vb2_v4l2_buffer *old_vbuf = vbuf;
+ 
++		if (--tries <= 0) {
++			dev_err(sess->core->dev,
++				"Vse dst-bufery uderzhany kak referensy VP9\n");
++			v4l2_m2m_buf_queue(sess->m2m_ctx, old_vbuf);
++			kfree(new_frame);
++			return NULL;
++		}
++
+ 		vbuf = v4l2_m2m_dst_buf_remove(sess->m2m_ctx);
+ 		v4l2_m2m_buf_queue(sess->m2m_ctx, old_vbuf);
+ 		if (!vbuf) {
+@@ -1262,6 +1416,20 @@ static void codec_vp9_rm_noshow_frame(struct amvdec_session *sess)
+ 		if (tmp->show)
+ 			continue;
+ 
++		/*
++		 * 01.09.2026: eto i est' istochnik "couldn't find VP9 ref N".
++		 *
++		 * Ran'she kadr udalyalsya po edinstvennoj proverke show == 0.
++		 * No show == 0 v VP9 - eto ne "kadr nenuzhen", a ZHIVOJ alt-ref:
++		 * on ne pokazyvaetsya, no na nego ssylayutsya sleduyushchie kadry.
++		 * Bufer vozvrashchalsya v ochered' i osvobozhdalsya, a ego indeks
++		 * ostavalsya v ref_frame_map - i sleduyushchij zhe kadr etot
++		 * referens uzhe ne nahodil.
++		 */
++		if (tmp == vp9->cur_frame || tmp == vp9->prev_frame ||
++		    codec_vp9_is_ref(vp9, tmp))
++			continue;
++
+ 		pr_debug("rm noshow: %u\n", tmp->index);
+ 		v4l2_m2m_buf_queue(sess->m2m_ctx, tmp->vbuf);
+ 		list_del(&tmp->list);
+@@ -1419,17 +1587,6 @@ static int codec_vp9_process_rpm(struct codec_vp9 *vp9)
+ 	return src_changed;
+ }
+ 
+-static bool codec_vp9_is_ref(struct codec_vp9 *vp9, struct vp9_frame *frame)
+-{
+-	int i;
+-
+-	for (i = 0; i < REF_FRAMES; ++i)
+-		if (vp9->ref_frame_map[i] == frame->index)
+-			return true;
+-
+-	return false;
+-}
+-
+ static void codec_vp9_show_frame(struct amvdec_session *sess)
+ {
+ 	struct codec_vp9 *vp9 = sess->priv;
+@@ -2146,20 +2303,72 @@ static irqreturn_t codec_vp9_threaded_isr(struct amvdec_session *sess)
+ 
+ 	codec_vp9_fetch_rpm(sess);
+ 	if (codec_vp9_process_rpm(vp9)) {
+-		amvdec_src_change(sess, vp9->width, vp9->height, 16,
+-				  vp9->is_10bit ? 10 : 8);
++		u32 w = vp9->width, h = vp9->height;
++		u32 bd = vp9->is_10bit ? 10 : 8;
+ 
+ 		/* No frame is actually processed */
+ 		vp9->cur_frame = NULL;
+ 
+-		/* Show the remaining frame */
+-		codec_vp9_show_frame(sess);
++		/*
++		 * h96 04.09.2026: pri smene razresheniya (seek na 4K VP9) nuzhno
++		 * ne prosto vydat' show-kadry, no I VERNUT' noshow (alt-ref)
++		 * bufery v ochered'. codec_vp9_show_frame() noshow ostavlyaet v
++		 * ref_frames_list - oni derzhat CAPTURE-bufery, kotorye my nizhe
++		 * vse ravno brosaem (ref_frame_map -> -1). Cherez neskol'ko seek
++		 * bufery zakanchivayutsya, codec_vp9_get_new_frame() vozvrashchaet
++		 * NULL -> process_frame tiho vyhodit -> dekoder zависает (vremya
++		 * idet, kadrov net). Tut - polnyj reklejm, kak v flush_output().
++		 */
++		{
++			struct vp9_frame *ftmp, *fn;
++
++			list_for_each_entry_safe(ftmp, fn,
++						 &vp9->ref_frames_list, list) {
++				if (!ftmp->done) {
++					if (ftmp->show)
++						amvdec_dst_buf_done(sess,
++							ftmp->vbuf,
++							V4L2_FIELD_NONE);
++					else
++						v4l2_m2m_buf_queue(
++							sess->m2m_ctx,
++							ftmp->vbuf);
++					vp9->frames_num--;
++				}
++				list_del(&ftmp->list);
++				kfree(ftmp);
++			}
++		}
+ 
+ 		/* FIXME: Save refs for resized frame */
+ 		if (vp9->frames_num)
+ 			codec_vp9_save_refs(vp9);
+ 
+-		goto unlock;
++		/*
++		 * 01.09.2026: codec_vp9_save_refs() nichego ne perenosit - eto
++		 * zaglushka s pr_warn "would need to save ref". Znachit posle
++		 * smeny razresheniya karty obyazany stat' pustymi, inache
++		 * sleduyushchij inter-kadr ishchet indeksy uzhe osvobozhdennyh
++		 * kadrov i my snova poluchaem "couldn't find VP9 ref N".
++		 */
++		memset(vp9->ref_frame_map, -1, sizeof(vp9->ref_frame_map));
++		memset(vp9->next_ref_frame_map, -1,
++		       sizeof(vp9->next_ref_frame_map));
++		for (i = 0; i < REFS_PER_FRAME; ++i)
++			vp9->frame_refs[i] = NULL;
++		vp9->prev_frame = NULL;
++
++		/*
++		 * I glavnoe: amvdec_src_change() SINHRONNO zovet
++		 * codec_ops->resume() (vdec_helpers.c:494), a codec_vp9_resume()
++		 * beret vot etot samyj vp9->lock. Ran'she vyzov shel iz-pod
++		 * zazhatogo loka - tred preryvaniya blokiroval sam sebya
++		 * namertvo. Otpuskaem lok DO vyzova; nizhe metki unlock nichego
++		 * krome mutex_unlock net, poetomu vyhodim srazu.
++		 */
++		mutex_unlock(&vp9->lock);
++		amvdec_src_change(sess, w, h, 16, bd);
++		return IRQ_HANDLED;
+ 	}
+ 
+ 	codec_vp9_process_lf(vp9);
+diff --git a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+index 809eca9d8..f7f55c181 100644
+--- a/drivers/staging/media/meson/vdec/esparser.c
++++ b/drivers/staging/media/meson/vdec/esparser.c
+@@ -378,6 +378,11 @@ void esparser_queue_all_src(struct work_struct *work)
+ 		container_of(work, struct amvdec_session, esparser_queue_work);
+ 
+ 	mutex_lock(&sess->lock);
++	/* h96 03.09 (H4): сессия сворачивается - в регистры не лезть */
++	if (sess->stopping) {
++		mutex_unlock(&sess->lock);
++		return;
++	}
+ 	/*
+ 	 * Po specifikatsii V4L2_DEC_CMD_STOP obyazan snachala obrabotat
+ 	 * VSE prinyatye OUTPUT-bufery. Staryj break po should_stop
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 928e0287e..9d2ebc5c2 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -57,11 +57,37 @@ static int vdec_recycle_thread(void *data)
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct amvdec_buffer *tmp, *n;
+ 
++	u32 stall_iters = 0;
++
+ 	while (!kthread_should_stop()) {
++		bool stalled = false;
++
++		/*
++		 * 01.09.2026: ne trogat' registry, esli sessiya bol'she ne
++		 * tekushchaya.
++		 *
++		 * Etot potok perezhivaet sessiyu: kthread_stop() vyzyvaetsya po
++		 * usloviyu vdec_codec_needs_recycle(), kotoroe chitaet TEKUSHCHIJ
++		 * sess->fmt_out, a plejer mog pomenyat' ego cherez S_FMT. Sirota
++		 * prodolzhaet zvat' can_recycle() staroj sessii, to est' chitat'
++		 * MMIO. Posle vdec_poweroff() domen VDEC1 izolirovan i dos_clk
++		 * pogashen, a amvdec_read_dos() - eto obychnyj readl_relaxed:
++		 * chtenie s pogashennoj shiny na GXM veshaet CPU nasovsem.
++		 *
++		 * Imenno tak vyglyadelo "pri smene kodeka vse visnet".
++		 */
++		if (READ_ONCE(core->cur_sess) != sess ||
++		    sess->status < STATUS_INIT) {
++			usleep_range(5000, 10000);
++			continue;
++		}
++
+ 		mutex_lock(&sess->bufs_recycle_lock);
+ 		list_for_each_entry_safe(tmp, n, &sess->bufs_recycle, list) {
+-			if (!codec_ops->can_recycle(core))
++			if (!codec_ops->can_recycle(core)) {
++				stalled = true;
+ 				break;
++			}
+ 
+ 			codec_ops->recycle(core, tmp->vb->index);
+ 			list_del(&tmp->list);
+@@ -69,6 +95,13 @@ static int vdec_recycle_thread(void *data)
+ 		}
+ 		mutex_unlock(&sess->bufs_recycle_lock);
+ 
++		if (stalled) {
++			if (++stall_iters == 200)
++				pr_info("h96 vdec: recycle stalled >1s (fw not draining returns)\n");
++		} else {
++			stall_iters = 0;
++		}
++
+ 		usleep_range(5000, 10000);
+ 	}
+ 
+@@ -106,10 +139,33 @@ static int vdec_poweron(struct amvdec_session *sess)
+ 
+ static void vdec_wait_inactive(struct amvdec_session *sess)
+ {
+-	/* We consider 50ms with no IRQ to be inactive. */
++	/*
++	 * 01.09.2026: dobavlen potolok ozhidaniya.
++	 *
++	 * Uslovie vyhoda - "50 ms bez preryvanij". Kogda proshivka srivaetsya
++	 * (naprimer poteryany opornye kadry i ona shtormit mailbox-IRQ),
++	 * last_irq_jiffies obnovlyaetsya bystree, chem istekaet okno, i cikl
++	 * ne zavershaetsya NIKOGDA. A vyzyvaetsya on iz vdec_poweroff(), to
++	 * est' vnutri stop_streaming, POD sess->lock i core->lock - poetomu
++	 * vmeste s nim namertvo vstaet ves' /dev/video0: lyuboj sleduyushchij
++	 * ioctl igroka viset v D. Eto i est' "peremotka zavisla" i "pri smene
++	 * kodeka vse vislo".
++	 *
++	 * Teper' zhdem ne bol'she sekundy. Esli zhelezo za eto vremya ne
++	 * uspokoilos', ono uzhe ne uspokoitsya samo - luchshe poluchit' zapis'
++	 * v zhurnale i prodolzhit' ostanovku, chem povisnut' navsegda.
++	 */
++	u64 deadline = get_jiffies_64() + msecs_to_jiffies(1000);
++
+ 	while (time_is_after_jiffies64(sess->last_irq_jiffies +
+-				       msecs_to_jiffies(50)))
++				       msecs_to_jiffies(50))) {
++		if (time_is_before_jiffies64(deadline)) {
++			dev_warn(sess->core->dev,
++				 "vdec: zhelezo ne zatihlo za 1 s, prodolzhaem ostanovku\n");
++			return;
++		}
+ 		msleep(25);
++	}
+ }
+ 
+ /*
+@@ -230,7 +286,18 @@ static void process_num_buffers(struct vb2_queue *q,
+ 	 * we need all of them to be queued into the driver
+ 	 */
+ 	sess->num_dst_bufs = q_num_bufs + *num_buffers;
+-	q->min_queued_buffers = max(fmt_out->min_buffers, sess->num_dst_bufs);
++	/*
++	 * h96 04.09.2026: старт декода развязан от ПОЛНОГО пула. Прошивка
++	 * пишет только в буфер, снятый через prepare_new_frame (v4l2_m2m_dst_
++	 * buf_remove), поэтому для старта достаточно DPB-набора (min_buf_capture);
++	 * остальные дотекают через buf_queue. Прежнее =num_dst_bufs требовало
++	 * QBUF'нуть ВСЕ буферы до start_streaming, а клиент часть держит под
++	 * reorder/rendering (maxDequeue) -> в m2m-очереди CAPTURE пусто ->
++	 * codec_hevc_prepare_new_frame ловит "No dst buffer available" -> abort,
++	 * видео НЕ стартует (HEVC/VP9 в SmartTube/Alfa). Канвас-список
++	 * (num_dst_bufs) программируется целиком - это не трогаем.
++	 */
++	q->min_queued_buffers = max(fmt_out->min_buffers, min_buf_capture);
+ }
+ 
+ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+@@ -348,6 +415,18 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	if (sess->status == STATUS_NEEDS_RESUME &&
+ 	    q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+ 	    sess->changed_format) {
++		/*
++		 * 01.09.2026: eto "legkij" put' vozobnovleniya posle peremotki -
++		 * teardown ne vypolnyaetsya, poetomu flagi konca potoka nuzhno
++		 * snyat' vruchnuyu. Inache should_stop, vystavlennyj do seek,
++		 * perezhivaet peremotku, i kazhdyj sleduyushchij kadr uezzhaet s
++		 * V4L2_BUF_FLAG_LAST i sobytiem EOS: plejer schitaet, chto
++		 * rolik konchilsya, srazu posle togo kak vy peremotali.
++		 */
++		sess->should_stop = 0;
++		sess->eos_queued = 0;
++		v4l2_m2m_clear_state(sess->m2m_ctx);
++
+ 		codec_ops->resume(sess);
+ 		sess->status = STATUS_RUNNING;
+ 		return 0;
+@@ -370,6 +449,7 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
+ 
+ 	sess->should_stop = 0;
+ 	sess->eos_queued = 0;
++	sess->stopping = 0;
+ 	sess->keyframe_found = 0;
+ 	sess->last_offset = 0;
+ 	sess->wrap_count = 0;
+@@ -446,28 +526,91 @@ static void vdec_stop_streaming(struct vb2_queue *q)
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct amvdec_core *core = sess->core;
+ 
+-	cancel_delayed_work_sync(&sess->drain_work);
+ 	struct vb2_v4l2_buffer *buf;
+ 
++	cancel_delayed_work_sync(&sess->drain_work);
++	/*
++	 * h96 04.09.2026: stopping vystavlyaem SRAZU, do vsego. Kormilku
++	 * esparser NEL'ZYA gasit' cherez cancel_work_sync() otsyuda: eta
++	 * funktsiya vyzyvaetsya POD sess->lock (vb2 queue lock == sess->lock),
++	 * a sam vorker esparser_queue_all_src pervym delom beret sess->lock ->
++	 * cancel_work_sync zhdet vorkera, vorker zhdet lok -> AB-BA DEDLOK
++	 * (DecodeComponent v __flush_work + kworker v esparser_queue_all_src,
++	 * oba v D, /dev/video0 mertv, plejer "format ne podderzhivaetsya").
++	 * Zashchita ot dostupa k regsitram posle poweroff uzhe est': flag
++	 * sess->stopping (rannij return v esparser_queue_all_src pod lokom) i
++	 * "if(!stopping) schedule_work" v dst_buf_done. Lyuboj uzhe
++	 * zaplanirovannyj vorker, poluchiv lok POSLE vozvrata stop_streaming,
++	 * uvidit stopping=1 i vyjdet, ne trogaya regsitry i priv.
++	 */
++	sess->stopping = 1;
++
+ 	if (sess->status == STATUS_RUNNING ||
+ 	    sess->status == STATUS_INIT ||
+ 	    (sess->status == STATUS_NEEDS_RESUME &&
+ 	     (!sess->streamon_out || !sess->streamon_cap))) {
+-		if (vdec_codec_needs_recycle(sess))
++		/*
++		 * Ne po vdec_codec_needs_recycle(): ono chitaet TEKUSHCHIJ
++		 * fmt_out, a on mog smenit'sya cherez S_FMT - togda potok
++		 * ostavalsya zhit' sirotoj.
++		 */
++		if (sess->recycle_thread) {
+ 			kthread_stop(sess->recycle_thread);
++			sess->recycle_thread = NULL;
++		}
+ 
++		/* h96 03.09 (H4): drain() внутри poweroff перевзводит esparser-работу
++		 * через dst_buf_done; блокирует "if(!stopping) schedule_work" +
++		 * stopping=1 (выставлен в начале stop_streaming). cancel_work_sync
++		 * здесь УБРАН - он под sess->lock давал AB-BA дедлок (см. выше). */
+ 		vdec_poweroff(sess);
+ 		vdec_free_canvas(sess);
+ 		dma_free_coherent(sess->core->dev, sess->vififo_size,
+ 				  sess->vififo_vaddr, sess->vififo_paddr);
+ 		vdec_reset_timestamps(sess);
+ 		vdec_reset_bufs_recycle(sess);
++
++		/*
++		 * Poryadok vazhen: snachala ubiraem sessiyu iz core->cur_sess,
++		 * i tol'ko potom osvobozhdaem priv. Ran'she bylo naoborot, i
++		 * tred preryvaniya uspeval vzyat' eshche nenulevoj cur_sess i
++		 * obratit'sya k uzhe osvobozhdennoj pamyati.
++		 */
++		core->cur_sess = NULL;
+ 		kfree(sess->priv);
+ 		sess->priv = NULL;
+-		core->cur_sess = NULL;
+ 		sess->status = STATUS_STOPPED;
++
++		sess->keyframe_found = 0;
++		sess->last_offset = 0;
++		sess->wrap_count = 0;
++		sess->sequence_cap = 0;
++		sess->sequence_out = 0;
++		atomic_set(&sess->esparser_queued_bufs, 0);
+ 	}
+ 
++	/*
++	 * Sbrasyvaem TOL'KO flagi konca potoka, i tol'ko ih.
++	 *
++	 * 01.09.2026, proverено na zheleze: snachala zdes' stoyal "polnyj
++	 * sbros konvejera" - vmeste so smeshcheniyami i vyzovom
++	 * vdec_reset_timestamps(). Eto slomalo vosproizvedenie nasovsem.
++	 * Prichina: stop_streaming vyzyvaetsya dlya KAZHDOJ ocheredi otdel'no,
++	 * i pri obychnoj peremotke plejer gasit tol'ko CAPTURE, a OUTPUT
++	 * prodolzhaet rabotat'. Stirat' pri etom spisok metok vremeni nel'zya:
++	 * posle etogo KAZHDYJ dekodirovannyj kadr uezzhaet s nesopostavlennoj
++	 * metkoj ("Buffer N done but can't match offset"), plejer schitaet ego
++	 * ustarevshim i vybrasyvaet - ekran ostaetsya chernym.
++	 *
++	 * Smeshcheniya, schetchiki i metki ochishchayutsya vyshe, v bloke
++	 * polnoj ostanovki, gde eto bezopasno.
++	 */
++	sess->should_stop = 0;
++	sess->eos_queued = 0;
++	/* h96 03.09 (H5): m2m has_stopped иначе переживает flush и каждый QBUF CAPTURE
++	 * до start_streaming возвращается пустышкой с LAST (v4l2-mem2mem force_last_buf_done). */
++	v4l2_m2m_clear_state(sess->m2m_ctx);
++
+ 	if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+ 		while ((buf = v4l2_m2m_src_buf_remove(sess->m2m_ctx)))
+ 			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
+@@ -888,6 +1031,10 @@ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	dst_vq->drv_priv = sess;
+ 	dst_vq->buf_struct_size = sizeof(struct dummy_buf);
+ 	dst_vq->min_queued_buffers = 1;
++	/* h96: разрешить V4L2_MEMORY_FLAG_NON_COHERENT — CPU-копия кадров
++	 * из некэшируемых MMAP-буферов шла ~4 fps, кэшируемые дают полный
++	 * темп; vb2 сам инвалидирует кэш на dqbuf. */
++	dst_vq->allow_cache_hints = 1;
+ 	dst_vq->dev = sess->core->dev;
+ 	dst_vq->lock = &sess->lock;
+ 	return vb2_queue_init(dst_vq);
+@@ -1009,6 +1156,15 @@ static irqreturn_t vdec_isr(int irq, void *data)
+ 	struct amvdec_core *core = data;
+ 	struct amvdec_session *sess = core->cur_sess;
+ 
++	/*
++	 * 01.09.2026: cur_sess obnulyaetsya v stop_streaming, a preryvanie
++	 * moglo byt' vystavleno do etogo i prijti uzhe posle. Razymenovanie
++	 * NULL v obrabotchike preryvaniya - eto oops, posle kotorogo
++	 * pristavka uhodit v perezagruzku.
++	 */
++	if (!sess || !sess->fmt_out)
++		return IRQ_NONE;
++
+ 	sess->last_irq_jiffies = get_jiffies_64();
+ 
+ 	return sess->fmt_out->codec_ops->isr(sess);
+@@ -1019,6 +1175,9 @@ static irqreturn_t vdec_threaded_isr(int irq, void *data)
+ 	struct amvdec_core *core = data;
+ 	struct amvdec_session *sess = core->cur_sess;
+ 
++	if (!sess || !sess->fmt_out)
++		return IRQ_NONE;
++
+ 	return sess->fmt_out->codec_ops->threaded_isr(sess);
+ }
+ 
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index bd761e61c..b2371ba65 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -261,6 +261,7 @@ struct amvdec_session {
+ 	unsigned int sequence_cap, sequence_out;
+ 	unsigned int should_stop;
+ 	unsigned int eos_queued;
++	unsigned int stopping; /* h96: teardown идёт, кормилку не перевзводить */
+ 	unsigned int keyframe_found;
+ 	unsigned int num_dst_bufs;
+ 	unsigned int changed_format;
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index e504e5aea..c8f4cbf1b 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -11,6 +11,14 @@
+ 
+ #include "vdec_helpers.h"
+ 
++#include <linux/moduleparam.h>
++
++/* h96 (01.09.2026): vremennyj damp kadra. Skol'ko kadrov dampit'.
++ * Vklyuchat' pered proigryvaniem: echo 3 > .../parameters/h96_dump */
++static int h96_dump;
++module_param(h96_dump, int, 0644);
++MODULE_PARM_DESC(h96_dump, "dump N decoded frames (luma+chroma bytes)");
++
+ #define NUM_CANVAS_NV12 2
+ #define NUM_CANVAS_YUV420 3
+ 
+@@ -164,15 +172,58 @@ static int set_canvas_nv12m(struct amvdec_session *sess,
+ 		    vb2_dma_contig_plane_dma_addr(vb, i);
+ 	}
+ 
++	/* h96 (26.08): Android gralloc отдаёт NV12 одним dmabuf на обе
++	 * плоскости, а vb2-dma-contig игнорирует смещение плоскости при
++	 * импорте — адрес плоскости 1 совпадает с плоскостью 0, и хрома
++	 * писалась поверх люмы (зелёный кадр, сдвиг картинки). Раскладка
++	 * minigbm (drv_bo_from_format): stride = ALIGN(width, 64), хрома
++	 * вплотную за люмой: offset = stride * height (высота НЕ
++	 * выравнивается). Пишем кадр тем же страйдом, каким его будет
++	 * читать потребитель gralloc-буфера.
++	 */
++	u32 stride = width;
++
++	if (buf_paddr[1] == buf_paddr[0]) {
++		stride = ALIGN(width, 64);
++		/*
++		 * 01.09.2026: EKSPERIMENT. Damp syrogo kadra pokazal, chto po
++		 * smeshcheniyu stride*ALIGN(h,32) lezhit korrektnaya cvetnost'
++		 * (pary "9c 2c"), a po stride*h - eshche hvost yarkosti ("eb eb").
++		 * Znachit dekoder pishet tuda, kuda my emu skazali. No na ekrane
++		 * cveta razrusheny, hotya programmnyj dekoder na tom zhe fajle daet
++		 * ideal. Ostaetsya odno: POTREBITEL' (gralloc/minigbm) ishchet
++		 * hromu po drugomu smeshcheniyu - imenno tomu, chto opisano v
++		 * kommentarii vyshe: stride * height, bez vyravnivaniya vysoty.
++		 * Pishem tuda, kuda on chitaet.
++		 */
++		/*
++		 * 01.09.2026, PROVERENO: menyat' eto smeshchenie BESPOLEZNO.
++		 * Stavili stride*sess->height (1920*1080) - adres kanvasa
++		 * dejstvitel'no menyalsya (uv-y = 0x1FA400 v zhurnale), no damp
++		 * syrogo kadra pokazyval hromu vse ravno po 1920*1088. Znachit
++		 * raspolozhenie hromy zadaet ne kanvas.
++		 */
++		buf_paddr[1] = buf_paddr[0] + stride * ALIGN(height, 32);
++		pr_info_once("h96 canvas: single-dmabuf NV12, y=%pad uv=%pad stride=%u h=%u\n",
++			     &buf_paddr[0], &buf_paddr[1], stride, height);
++	} else {
++		pr_info_once("h96 canvas: separate planes, y=%pad uv=%pad w=%u h=%u\n",
++			     &buf_paddr[0], &buf_paddr[1], width, height);
++	}
++
+ 	/* Y plane */
+ 	meson_canvas_config(core->canvas, canvas_id[0], buf_paddr[0],
+-			    width, height, MESON_CANVAS_WRAP_NONE,
++			    stride, height, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+ 			    MESON_CANVAS_ENDIAN_SWAP64);
+ 
+-	/* U/V plane */
++	/* U/V plane.
++	 * h96 (28.08): fw pishet chroma kak CrCb (NV21-poryadok), a gralloc
++	 * potrebitel chitaet bufer kak NV12 (CbCr) - rozovo-fioletovyj sdvig
++	 * cveta. Endian 0x6 (= SWAP64 bez SWAP16) menyaet sosednie bajty
++	 * mestami otnositelno 0x7 - apparatnyj swap Cb<->Cr pri zapisi. */
+ 	meson_canvas_config(core->canvas, canvas_id[1], buf_paddr[1],
+-			    width, height / 2, MESON_CANVAS_WRAP_NONE,
++			    stride, height / 2, MESON_CANVAS_WRAP_NONE,
+ 			    MESON_CANVAS_BLKMODE_LINEAR,
+ 			    MESON_CANVAS_ENDIAN_SWAP64);
+ 
+@@ -286,6 +337,47 @@ static void dst_buf_done(struct amvdec_session *sess,
+ 	struct device *dev = sess->core->dev_dec;
+ 	u32 output_size = amvdec_get_output_size(sess);
+ 
++	if (h96_dump > 0) {
++		void *va = vb2_plane_vaddr(&vbuf->vb2_buf, 0);
++
++		if (va) {
++			u8 *b = va;
++			u32 stride = ALIGN(sess->width, 64);
++			u32 uvoff = stride * ALIGN(sess->height, 32);
++			u32 total = uvoff + uvoff / 2;
++			u32 off, gran = 0;
++			u8 first = b[64];
++			char line[256];
++			int n = 0, i;
++
++			/* gde konchaetsya odnorodnaya oblast' (dlya sploshnogo
++			 * cveta eto granica lumy) */
++			for (off = 4096; off < total; off += 4096) {
++				if (b[off] != first) {
++					gran = off;
++					break;
++				}
++			}
++
++			for (i = 0; i < 40 && (u32)i * 65536 < total; i++)
++				n += scnprintf(line + n, sizeof(line) - n,
++					       "%02x", b[(u32)i * 65536]);
++
++			pr_info("h96 map w=%u h=%u stride=%u uvoff=%u total=%u\n",
++				sess->width, sess->height, stride, uvoff, total);
++			pr_info("h96 map granica=%u (stroka %u) bajt %02x -> %02x\n",
++				gran, gran / stride, first,
++				gran ? b[gran] : 0);
++			pr_info("h96 map po64k: %s\n", line);
++			pr_info("h96 map @0     : %*ph\n", 16, b + 64);
++			pr_info("h96 map @gran  : %*ph\n", 16,
++				b + (gran ? gran : 0) + 64);
++			pr_info("h96 map @uvoff : %*ph\n", 16, b + uvoff + 64);
++		} else {
++			pr_info("h96 dump: vaddr NULL\n");
++		}
++		h96_dump--;
++	}
+ 	switch (sess->pixfmt_cap) {
+ 	case V4L2_PIX_FMT_NV12M:
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, 0, output_size);
+@@ -325,7 +417,8 @@ static void dst_buf_done(struct amvdec_session *sess,
+ 	v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
+ 
+ 	/* Buffer done probably means the vififo got freed */
+-	schedule_work(&sess->esparser_queue_work);
++	if (!sess->stopping)
++		schedule_work(&sess->esparser_queue_work);
+ }
+ 
+ void amvdec_dst_buf_done(struct amvdec_session *sess,
+@@ -406,6 +499,7 @@ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
+ 	spin_unlock_irqrestore(&sess->ts_spinlock, flags);
+ 
+ 	dst_buf_done(sess, vbuf, field, timestamp, timecode, vbuf_flags);
++
+ 	if (match)
+ 		atomic_dec(&sess->esparser_queued_bufs);
+ }
+@@ -467,6 +561,19 @@ void amvdec_src_change(struct amvdec_session *sess, u32 width,
+ 	    sess->height == height &&
+ 	    dpb_size <= sess->num_dst_bufs) {
+ 		sess->fmt_out->codec_ops->resume(sess);
++		/*
++		 * h96 04.09.2026: geometriya NE izmenilas' i CAPTURE-ochered'
++		 * uzhe nastroena - tiho prodolzhaem dekod na tekh zhe buferah.
++		 * NEL'ZYA slat' V4L2_EVENT_SOURCE_CHANGE (nizhe): CCodec po
++		 * kontraktu stateful-dekodera gasit CAPTURE (STREAMOFF ->
++		 * polnyj teardown vdec_stop_streaming), rekonfiguriruet, snova
++		 * STREAMON -> proshivka perechityvaet SPS -> snova CMD_SRC_CHANGE
++		 * -> samopodderzhivayushchayasya petlya teardown/reconfigure kazhdye
++		 * 3-5 s, konvejer stoit, na odnoj iz iteracij poweroff lovit gonku
++		 * s mailbox-IRQ i storozh perezagruzhaet SoC (Alfa H264 1920x1036).
++		 * V mainline posle resume() byl imenno return.
++		 */
++		return;
+ 	} else {
+ 		sess->status = STATUS_NEEDS_RESUME;
+ 		sess->changed_format = 0;
+diff --git a/drivers/staging/media/meson/vdec/vdec_platform.c b/drivers/staging/media/meson/vdec/vdec_platform.c
+index c25d8393f..a8d881eea 100644
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c
+@@ -168,7 +168,7 @@ static const struct amvdec_format vdec_formats_gxm[] = {
+ 	{
+ 		.pixfmt = V4L2_PIX_FMT_VP9,
+ 		.min_buffers = 16,
+-		.max_buffers = 24,
++		.max_buffers = 22, /* h96 03.09: 24 == лимиту CCodec (17+4+3) -> после seek дисплей держит 1 буфер, 24/24 недостижимо, декодер вечно ждёт resume() */
+ 		.max_width = 3840,
+ 		.max_height = 2160,
+ 		.vdec_ops = &vdec_hevc_ops,
+@@ -180,7 +180,7 @@ static const struct amvdec_format vdec_formats_gxm[] = {
+ 	}, {
+ 		.pixfmt = V4L2_PIX_FMT_HEVC,
+ 		.min_buffers = 4,
+-		.max_buffers = 24,
++		.max_buffers = 22, /* h96 03.09: 24 == лимиту CCodec (17+4+3) -> после seek дисплей держит 1 буфер, 24/24 недостижимо, декодер вечно ждёт resume() */
+ 		.max_width = 3840,
+ 		.max_height = 2160,
+ 		.vdec_ops = &vdec_hevc_ops,
+@@ -192,7 +192,7 @@ static const struct amvdec_format vdec_formats_gxm[] = {
+ 	}, {
+ 		.pixfmt = V4L2_PIX_FMT_H264,
+ 		.min_buffers = 2,
+-		.max_buffers = 24,
++		.max_buffers = 22, /* h96 03.09: 24 == лимиту CCodec (17+4+3) -> после seek дисплей держит 1 буфер, 24/24 недостижимо, декодер вечно ждёт resume() */
+ 		.max_width = 3840,
+ 		.max_height = 2160,
+ 		.vdec_ops = &vdec_1_ops,

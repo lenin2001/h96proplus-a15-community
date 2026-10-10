@@ -1,0 +1,34 @@
+--- a/packages/apps/Settings/src/com/android/settings/homepage/SettingsHomepageActivity.java
++++ b/packages/apps/Settings/src/com/android/settings/homepage/SettingsHomepageActivity.java
+@@ -42,6 +42,7 @@
+ import android.util.FeatureFlagUtils;
+ import android.util.Log;
+ import android.view.View;
++import android.view.ViewGroup;
+ import android.view.Window;
+ import android.view.WindowManager;
+ import android.widget.FrameLayout;
+@@ -764,6 +765,23 @@
+ 
+     private void initHomepageContainer() {
+         final View view = findViewById(R.id.homepage_container);
++        // h96 (13.09.2026): on a leanback device this guard is the defect, not the cure.
++        //
++        // The container is a plain LinearLayout with clickable=false. Making it focusable and
++        // handing it the focus means the D-pad has nothing to activate: up/down only scroll the
++        // NestedScrollView while the preference rows below never receive focus, so OK has no
++        // target. Measured on the box: exactly one focused node, com.android.settings:id/
++        // homepage_container, alongside nine clickable rows that never took focus.
++        //
++        // The scrolling this guard was written to prevent is how a TV list is supposed to move,
++        // and there is no touchscreen here for the original problem to occur on. Let focus reach
++        // the rows, and leave handset behaviour exactly as it was.
++        if (getPackageManager().hasSystemFeature(PackageManager.FEATURE_LEANBACK)) {
++            if (view instanceof ViewGroup) {
++                ((ViewGroup) view).setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
++            }
++            return;
++        }
+         // Prevent inner RecyclerView gets focus and invokes scrolling.
+         view.setFocusableInTouchMode(true);
+         view.requestFocus();

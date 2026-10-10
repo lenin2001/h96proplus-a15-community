@@ -1,0 +1,30 @@
+// Prebuilt applications of the device.
+//
+// Only the project's own MovieLauncher is imported here. Its APK is a build
+// output of launcher/ (Gradle) and is NOT stored in git: build it first and
+// copy it to this directory as MovieLauncher.apk (launcher/README.md).
+//
+// Third-party launchers are deliberately absent from public builds:
+//   * Google LeanbackLauncher 2.8 (2016) is proprietary;
+//   * Monet-Launcher (github.com/Klevico/Monet-Launcher), which the
+//     maintainer's unit used, publishes no licence.
+// Users who want either install it themselves after first boot.
+//
+// Input: the UNSIGNED Gradle release output (app-release-unsigned.apk).
+// Neither presigned nor preprocessed: the AOSP build zip-aligns it and signs
+// it with the build's default key, like the rest of the image (test-keys in a
+// developer build). Importing an unsigned APK as presigned would install a
+// package that the device rejects.
+// overrides: Launcher3QuickStep from the base AOSP profile crash-loops on
+// this TV build (no widget service), so it must not be installed.
+android_app_import {
+    name: "MovieLauncher",
+    apk: "MovieLauncher.apk",
+    overrides: [
+        "Launcher3QuickStep",
+        "Launcher3",
+    ],
+    dex_preopt: {
+        enabled: false,
+    },
+}

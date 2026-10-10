@@ -1,0 +1,90 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0038] meson-vdec: a failed drain reaches userspace as LAST+ERROR; test knob
+
+0031 marked a timed-out drain terminator with vbuf->flags = V4L2_BUF_FLAG_ERROR and
+completed it with v4l2_m2m_last_buffer_done(). vb2 strips V4L2_BUF_FLAG_ERROR
+from vbuf->flags in __fill_v4l2_buffer() and only derives it from the buffer
+state, and v4l2_m2m_last_buffer_done() always completes in STATE_DONE - so the
+error never left the kernel and the client saw a clean EOS. The terminator is
+now completed by hand with VB2_BUF_STATE_ERROR (plus LAST and the stopped mark,
+exactly what v4l2_m2m_last_buffer_done() does).
+
+drain_fail_once (module parameter, 0644, default N): the next drain terminator
+is sent as a failed one; the knob clears itself when that terminator goes out.
+Used to exercise the end-to-end contract (userspace side: V4L2Decoder maps
+LAST+ERROR to DecodeStatus::kError, DecodeComponent reports C2_CORRUPTED).
+
+---
+diff -ruN s37/drivers/staging/media/meson/vdec/vdec.c s98/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -25,6 +25,15 @@
+ #include "vdec_helpers.h"
+ #include "dos_regs.h"
+ 
++/*
++ * h96 0038: test knob for the drain-failure contract. Setting it makes the
++ * NEXT drain terminator carry V4L2_BUF_FLAG_ERROR exactly as a timed-out
++ * drain would; the knob clears itself when that terminator is sent.
++ */
++static bool drain_fail_once;
++module_param(drain_fail_once, bool, 0644);
++MODULE_PARM_DESC(drain_fail_once, "fail the next drain with LAST+ERROR (one-shot, testing)");
++
+ struct dummy_buf {
+ 	struct vb2_v4l2_buffer vb;
+ 	struct list_head list;
+@@ -348,7 +357,7 @@
+ 	struct vb2_v4l2_buffer *vbuf;
+ 	unsigned long flags, now = jiffies, quiet_from;
+ 	unsigned int i, idx, stop_ms = 0;
+-	bool forced = false;
++	bool forced = false, injected = false;
+ 
+ 	spin_lock_irqsave(&sess->eos_lock, flags);
+ 	if (sess->eos_armed_gen != sess->eos_gen || sess->stopping ||
+@@ -386,25 +395,40 @@
+ 	}
+ 	sess->eos_pending = 0;
+ 
++	if (READ_ONCE(drain_fail_once)) {
++		WRITE_ONCE(drain_fail_once, false);
++		forced = true;
++		injected = true;
++	}
++
+ 	for (i = 0; i < vbuf->vb2_buf.num_planes; i++)
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, i, 0);
+ 
+ 	idx = vbuf->vb2_buf.index;
+ 	if (idx < 32)
+ 		sess->buf_output[idx] = false;
+-	vbuf->flags = forced ? V4L2_BUF_FLAG_ERROR : 0;
++	vbuf->flags = V4L2_BUF_FLAG_LAST;
+ 	vbuf->sequence = sess->sequence_cap++;
+ 	vbuf->field = V4L2_FIELD_NONE;
+ 	sess->last_sent = 1;
+ 	stop_ms = jiffies_to_msecs(now - sess->stop_jiffies);
+ 	v4l2_event_queue_fh(&sess->fh, &ev);
+-	v4l2_m2m_last_buffer_done(sess->m2m_ctx, vbuf);
++	/*
++	 * h96 0038: v4l2_m2m_last_buffer_done() always completes in STATE_DONE,
++	 * and vb2 strips V4L2_BUF_FLAG_ERROR from vbuf->flags on DQBUF - only
++	 * the buffer STATE produces it. So a failed drain is completed here by
++	 * hand with STATE_ERROR; the rest mirrors v4l2_m2m_last_buffer_done().
++	 */
++	vb2_buffer_done(&vbuf->vb2_buf,
++			forced ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
++	v4l2_m2m_mark_stopped(sess->m2m_ctx);
+ 	spin_unlock_irqrestore(&sess->eos_lock, flags);
+ 
+ 	if (forced)
+ 		dev_err(sess->core->dev,
+-			"vdec: drain NE zavershen za %u ms (drain_done=%u eos_queued=%u) - LAST s ERROR\n",
+-			stop_ms, sess->drain_done, sess->eos_queued);
++			"vdec: drain NE zavershen za %u ms (drain_done=%u eos_queued=%u) - LAST s ERROR%s\n",
++			stop_ms, sess->drain_done, sess->eos_queued,
++			injected ? " (injected by drain_fail_once)" : "");
+ 	else
+ 		dev_dbg(sess->core->dev,
+ 			"vdec: drain zavershen pustym LAST cherez %u ms (buf %u)\n",

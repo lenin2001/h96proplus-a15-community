@@ -1,0 +1,42 @@
+# SELinux-метки устройства H96 Pro Plus.
+#
+# Сервис v4l2_codec2 помечаем как mediacodec_exec: домен mediacodec в
+# базовой политике уже hal_server_domain(hal_codec2) и уже имеет
+# rw к video_device (system/sepolicy/vendor/mediacodec.te) — своего
+# домена не требуется.
+/vendor/bin/hw/android\.hardware\.media\.c2@1\.2-service-v4l2-64    u:object_r:mediacodec_exec:s0
+/vendor/bin/hw/android\.hardware\.media\.c2@1\.2-service-v4l2-32    u:object_r:mediacodec_exec:s0
+
+# ⛔ БЛОКЕР ЗАГРУЗКИ, стоил попыток №4-10: базовое правило AOSP покрывает
+# только точное имя «keymint-service», а бинарь зовётся
+# «keymint-service.nonsecure» — без метки init ОТКАЗЫВАЕТСЯ стартовать
+# сервис даже в permissive («does not have a SELinux domain defined»),
+# keystore2 вечно ждёт KeyMint, загрузка стоит. У cuttlefish этой проблемы
+# нет: там keymint внутри APEX со своими контекстами.
+/vendor/bin/hw/android\.hardware\.security\.keymint-service\.nonsecure    u:object_r:hal_keymint_default_exec:s0
+
+# ⛔ Та же болезнь с gralloc (попытка №12): AOSP матчит «allocator-service»
+# без суффикса, а minigbm-сборка зовётся «allocator-service.minigbm» →
+# сервис не стартовал, SurfaceFlinger 13 минут не мог получить IAllocator
+# и UI не поднимался. Правило: КАЖДЫЙ vendor-бинарь с нестандартным
+# суффиксом требует своей строки здесь.
+/vendor/bin/hw/android\.hardware\.graphics\.allocator-service\.minigbm   u:object_r:hal_graphics_allocator_default_exec:s0
+
+# mapper5 (stable-C) грузится ВНУТРЬ процесса клиента, поэтому
+# same_process_hal_file — как у всех mapper@N-impl в базовой политике.
+/vendor/lib(64)?/hw/mapper\.minigbm\.so                                  u:object_r:same_process_hal_file:s0
+
+# ⛔ Загрузчик таблицы ИК-пульта. Без ЭТОЙ строки init отказывается
+# запускать службу h96-irkeymap: файл получает обычную метку vendor_file,
+# которая НЕ является исполняемой, и перехода домена не существует —
+# ровно та же болезнь, что у keymint и gralloc выше. Проверено 23.08:
+# «File /vendor/bin/irkeymap has incorrect label or no domain transition».
+# Домен объявлен в h96_setup.te.
+/vendor/bin/irkeymap                                                     u:object_r:h96_setup_exec:s0
+/vendor/bin/h96mouse                                                     u:object_r:h96mouse_exec:s0
+
+# Драйвер графики Mesa/panfrost лежит в /vendor/lib64/dri. Каталог egl рядом
+# платформа метит сама, а dri — нет: без этой строки библиотека драйвера
+# получит метку vendor_file, и загрузчик EGL внутри процессов приложений не
+# сможет её открыть, когда SELinux работает в строгом режиме.
+/vendor/lib(64)?/dri(/.*)?    u:object_r:same_process_hal_file:s0

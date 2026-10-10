@@ -1,0 +1,6 @@
+# libcutils ashmem-dev.cpp memfd fallback on kernels without /dev/ashmem.
+# Probe and allocation need sealing (fcntl) and sizing (ftruncate).
+# This extends media.extractor only; it does not replace the APEX policy.
+memfd_create: 1
+fcntl: 1
+ftruncate: 1

@@ -1,0 +1,117 @@
+vdec: recycle-stall abort только при реальном зависании fw (activity-gated), одноразово
+
+09.09.2026. Эвристика 0015 (vdec_recycle_thread) абортила сессию после 600 итераций
+(3–6 с) любого простоя recycle-mailbox'ов H264/MPEG12 — без проверки, есть ли у fw
+вход и идёт ли прогресс. Доказано по логу Alfa→VLC 08.09 (abort в окне ожидания HTTP,
+0 decode() за 15 с) и ВОСПРОИЗВЕДЕНО детерминированно на #74 harness'ом: подача 11 AU
+(5 кадров выдано), пауза подачи 8 с при дренаже выхода → `h96 stall: recycle_pending=1
+scr7=3 scr8=5` → `Aborting decoding session!` → C2 onError → reportError(14) → плеер
+мёртв (`Released state`). Это симптом «после перемотки/подгрузки видео не продолжается».
+
+v1 (has_work = esparser_queued_bufs > 1) НЕ помог: этот счётчик включает декодированные
+кадры, удерживаемые в DPB (B-frame reorder) — при голодании он всегда > 1 (на #78:
+queued=8 при 11 in / 5 out → abort остался).
+
+v2: stall засчитывается только если сессия RUNNING, не stopping/should_stop, **очередь
+OUTPUT v4l2 не пуста** (`v4l2_m2m_num_src_bufs_ready(m2m_ctx) > 0` — клиент кормит, а
+esparser не может скормить: fw забит, случай 0020) и нет IRQ >1 с; таймер jiffies 3 с,
+abort однократный на сессию. При паузе подачи (seek/буферизация) очередь пуста → abort
+не происходит; recovery настоящего зависания сохранён. Ядро #79 = #74 + 0025-v2.
+
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -59,6 +59,9 @@
+ 	struct amvdec_buffer *tmp, *n;
+ 
+ 	u32 stall_iters = 0;
++	/* h96 0025: wall-clock stall timer, counts only while the fw provably has work */
++	u64 stall_since = 0;
++	bool aborted = false;
+ 
+ 	while (!kthread_should_stop()) {
+ 		bool stalled = false;
+@@ -97,30 +100,64 @@
+ 		mutex_unlock(&sess->bufs_recycle_lock);
+ 
+ 		if (stalled) {
+-			if (++stall_iters == 200) {
+-				struct amvdec_buffer *db;
+-				unsigned int rc = 0;
+-				u32 s7 = amvdec_read_dos(core, AV_SCRATCH_7);
+-				u32 s8 = amvdec_read_dos(core, AV_SCRATCH_8);
+-
+-				mutex_lock(&sess->bufs_recycle_lock);
+-				list_for_each_entry(db, &sess->bufs_recycle, list)
+-					rc++;
+-				mutex_unlock(&sess->bufs_recycle_lock);
+-				pr_info("h96 stall: num_dst=%u recycle_pending=%u scr7=%u scr8=%u\n",
+-					sess->num_dst_bufs, rc, s7, s8);
+-			}
+-				else if (stall_iters >= 600) {
+-					/* 05.09.2026: вечный застой (H264/VP9 fw не отдаёт буферы)
+-					 * держал ВСЕ CMA -> декодер не стартует, система в свопе.
+-					 * HEVC на "No dst buffer" уже делает abort; делаем то же:
+-					 * после >3с сбрасываем сессию, c2 пересоздаёт и повторяет. */
+-					pr_warn("h96 vdec: recycle stalled >3s -- abort dlya vosstanovleniya\n");
++			/*
++			 * h96 0025 (09.09.2026): abort tol'ko pri REAL'NOM zavisanii fw.
++			 * Staryj schetchik iteracij (0015) abortil sessiyu cherez 3-6 s
++			 * lyubogo prostoya recycle -- v tom chisle legal'noj buferizacii
++			 * posle seek (klient zhdet novyj HTTP range, vhoda net) ili
++			 * pauzy/DRC. amvdec_abort() stavit q->error, C2 poluchaet -EIO ->
++			 * C2_CORRUPTED -> MediaCodec error, dal'she flush ignoriruetsya:
++			 * "peremotka ne rabotaet". Teper' stall schitaetsya tol'ko esli:
++			 *   - sessiya RUNNING, ne stopping/should_stop (ne seek/EOS/teardown),
++			 *   - v OUTPUT-ocheredi est' eshche ne skormlennye AU,
++			 *   - i fw ne dal ni odnogo IRQ za okno (net progressa).
++			 * Abort odnokratnyj na sessiyu (povtor kazhdye 3 s byl bespolezen).
++			 */
++			bool active = sess->status == STATUS_RUNNING &&
++				      !READ_ONCE(sess->stopping) &&
++				      !READ_ONCE(sess->should_stop);
++			/* v2: esparser_queued_bufs schitaet i dekodirovannye kadry, uderzhivaemye
++			 * v DPB (B-frame reorder) -- pri golodanii on vsegda > 1. Nastoyashchij
++			 * priznak "klient kormit, a fw ne est": OUTPUT-ochered v4l2 ne pusta
++			 * (esparser ne mozhet skormit -- fw zabit, sluchaj 0020). Pri pauze
++			 * podachi (seek/buferizaciya) ona pusta -> ne abort. */
++			bool has_work = v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx) > 0;
++			bool irq_recent = time_is_after_jiffies64(sess->last_irq_jiffies +
++							      msecs_to_jiffies(1000));
++
++			if (!active || !has_work || irq_recent) {
++				/* buferizaciya / pauza / seek / progress est' -- ne zavisanie */
++				stall_since = 0;
++				stall_iters = 0;
++			} else {
++				if (!stall_since)
++					stall_since = get_jiffies_64();
++				if (++stall_iters == 200) {
++					struct amvdec_buffer *db;
++					unsigned int rc = 0;
++					u32 s7 = amvdec_read_dos(core, AV_SCRATCH_7);
++					u32 s8 = amvdec_read_dos(core, AV_SCRATCH_8);
++
++					mutex_lock(&sess->bufs_recycle_lock);
++					list_for_each_entry(db, &sess->bufs_recycle, list)
++						rc++;
++					mutex_unlock(&sess->bufs_recycle_lock);
++					pr_info("h96 stall: num_dst=%u recycle_pending=%u scr7=%u scr8=%u queued=%d src_ready=%u\n",
++						sess->num_dst_bufs, rc, s7, s8,
++						atomic_read(&sess->esparser_queued_bufs),
++						v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx));
++				}
++				if (!aborted &&
++				    time_is_before_jiffies64(stall_since + msecs_to_jiffies(3000))) {
++					pr_warn("h96 vdec: recycle stalled >3s, %u src bufs waiting, no IRQ -- abort dlya vosstanovleniya\n",
++						v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx));
+ 					amvdec_abort(sess);
+-					stall_iters = 0;
++					aborted = true;
+ 				}
++			}
+ 		} else {
+ 			stall_iters = 0;
++			stall_since = 0;
+ 		}
+ 
+ 		usleep_range(5000, 10000);

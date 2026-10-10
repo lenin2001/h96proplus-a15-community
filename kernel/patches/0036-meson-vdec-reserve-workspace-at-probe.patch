@@ -1,0 +1,188 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0036] meson-vdec: reserve the VP9/HEVC workspace at probe
+
+The VP9/HEVC workspace is ~29 MiB of physically contiguous CMA (7328 pages),
+allocated per decoding session. Once SmartTube had filled CMA with its own,
+partly pinned, pages the allocation failed on the very first VP9 session after
+boot and on every retry:
+
+  cma: __cma_alloc_frozen: linux,cma: alloc failed, req-size: 7328 pages, ret: -16
+  meson-vdec: Failed to allocate VP9 Workspace        (x94 in 80 s)
+
+and the player looped through ~130 codec instances without playing (CmaFree
+~94 MiB, largest free run ~3600 pages). 32 MiB are now taken once at probe,
+while CMA is empty, and lent to one VP9/HEVC session at a time
+(amvdec_workspace_get/put, zeroed on every loan as dma_alloc_coherent() did);
+a larger or concurrent request falls back to the old per-session allocation.
+Cost: 32 MiB of the 1 GiB CMA kept permanently.
+
+---
+diff -ruN s35/drivers/staging/media/meson/vdec/codec_hevc.c s36/drivers/staging/media/meson/vdec/codec_hevc.c
+--- a/drivers/staging/media/meson/vdec/codec_hevc.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc.c
+@@ -525,8 +525,8 @@
+ 	dma_addr_t wkaddr;
+ 
+ 	/* Allocate some memory for the HEVC decoder's state */
+-	hevc->workspace_vaddr = dma_alloc_coherent(core->dev, SIZE_WORKSPACE,
+-						   &wkaddr, GFP_KERNEL);
++	/* h96 0036: from the probe-time reserve when it is free */
++	hevc->workspace_vaddr = amvdec_workspace_get(core, SIZE_WORKSPACE, &wkaddr);
+ 	if (!hevc->workspace_vaddr)
+ 		return -ENOMEM;
+ 
+@@ -757,9 +757,8 @@
+ 	__codec_hevc_flush_output(sess);
+ 
+ 	if (hevc->workspace_vaddr)
+-		dma_free_coherent(core->dev, SIZE_WORKSPACE,
+-				  hevc->workspace_vaddr,
+-				  hevc->workspace_paddr);
++		amvdec_workspace_put(core, hevc->workspace_vaddr,
++				     SIZE_WORKSPACE, hevc->workspace_paddr);
+ 
+ 	if (hevc->aux_vaddr)
+ 		dma_free_coherent(core->dev, SIZE_AUX,
+diff -ruN s35/drivers/staging/media/meson/vdec/codec_vp9.c s36/drivers/staging/media/meson/vdec/codec_vp9.c
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -791,9 +791,9 @@
+ 				     struct codec_vp9 *vp9)
+ {
+ 	/* Allocate some memory for the VP9 decoder's state */
+-	vp9->workspace_vaddr = dma_alloc_coherent(core->dev, SIZE_WORKSPACE,
+-						  &vp9->workspace_paddr,
+-						  GFP_KERNEL);
++	/* h96 0036: from the probe-time reserve when it is free */
++	vp9->workspace_vaddr = amvdec_workspace_get(core, SIZE_WORKSPACE,
++						    &vp9->workspace_paddr);
+ 	if (!vp9->workspace_vaddr) {
+ 		dev_err(core->dev, "Failed to allocate VP9 Workspace\n");
+ 		return -ENOMEM;
+@@ -937,9 +937,8 @@
+ 
+ 	mutex_lock(&vp9->lock);
+ 	if (vp9->workspace_vaddr)
+-		dma_free_coherent(core->dev, SIZE_WORKSPACE,
+-				  vp9->workspace_vaddr,
+-				  vp9->workspace_paddr);
++		amvdec_workspace_put(core, vp9->workspace_vaddr,
++				     SIZE_WORKSPACE, vp9->workspace_paddr);
+ 
+ 	codec_hevc_free_fbc_buffers(sess, &vp9->common);
+ 	mutex_unlock(&vp9->lock);
+diff -ruN s35/drivers/staging/media/meson/vdec/vdec.c s36/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -1586,6 +1586,19 @@
+ 		return ret;
+ 	core->irq = irq;
+ 
++	/* h96 0036: reserve the VP9/HEVC workspace while CMA is still empty */
++	spin_lock_init(&core->ws_lock);
++	core->ws_size = SZ_32M;
++	core->ws_vaddr = dmam_alloc_coherent(dev, core->ws_size, &core->ws_paddr,
++					     GFP_KERNEL);
++	if (!core->ws_vaddr) {
++		core->ws_size = 0;
++		dev_warn(dev, "h96: no probe-time workspace, per-session allocation\n");
++	} else {
++		dev_info(dev, "h96: %zu MiB workspace reserved at probe\n",
++			 core->ws_size >> 20);
++	}
++
+ 	ret = esparser_init(pdev, core);
+ 	if (ret)
+ 		return ret;
+diff -ruN s35/drivers/staging/media/meson/vdec/vdec.h s36/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -71,6 +71,12 @@
+  */
+ struct amvdec_core {
+ 	int irq;	/* h96 0034: vdec IRQ, for synchronize_irq() at stop */
++	/* h96 0036: workspace reserved at probe, lent to one VP9/HEVC session */
++	void *ws_vaddr;
++	dma_addr_t ws_paddr;
++	size_t ws_size;
++	bool ws_busy;
++	spinlock_t ws_lock;
+ 	void __iomem *dos_base;
+ 	void __iomem *esparser_base;
+ 	struct regmap *regmap_ao;
+diff -ruN s35/drivers/staging/media/meson/vdec/vdec_helpers.c s36/drivers/staging/media/meson/vdec/vdec_helpers.c
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -442,6 +442,56 @@
+ }
+ EXPORT_SYMBOL_GPL(amvdec_remove_ts);
+ 
++/*
++ * h96 0036 (23.09.2026): the VP9/HEVC workspace is ~29 MiB of physically
++ * contiguous CMA. Allocated per session, it failed once SmartTube had filled
++ * CMA with its own (partly pinned) pages: "cma: alloc failed, req-size: 7328
++ * pages, ret: -16" -> "Failed to allocate VP9 Workspace" on the very first
++ * VP9 session 180 s after boot, then on every retry - the player looped
++ * through ~130 codec instances and never played. The workspace is now taken
++ * once at probe, while CMA is empty, and lent to one session at a time;
++ * anything larger or concurrent falls back to the old per-session allocation.
++ */
++void *amvdec_workspace_get(struct amvdec_core *core, size_t size,
++			   dma_addr_t *paddr)
++{
++	unsigned long flags;
++	bool mine = false;
++
++	spin_lock_irqsave(&core->ws_lock, flags);
++	if (core->ws_vaddr && !core->ws_busy && size <= core->ws_size) {
++		core->ws_busy = true;
++		mine = true;
++	}
++	spin_unlock_irqrestore(&core->ws_lock, flags);
++
++	if (mine) {
++		/* dma_alloc_coherent() hands out zeroed memory; keep that */
++		memset(core->ws_vaddr, 0, size);
++		*paddr = core->ws_paddr;
++		return core->ws_vaddr;
++	}
++	return dma_alloc_coherent(core->dev, size, paddr, GFP_KERNEL);
++}
++EXPORT_SYMBOL_GPL(amvdec_workspace_get);
++
++void amvdec_workspace_put(struct amvdec_core *core, void *vaddr, size_t size,
++			  dma_addr_t paddr)
++{
++	unsigned long flags;
++
++	if (!vaddr)
++		return;
++	if (vaddr == core->ws_vaddr) {
++		spin_lock_irqsave(&core->ws_lock, flags);
++		core->ws_busy = false;
++		spin_unlock_irqrestore(&core->ws_lock, flags);
++		return;
++	}
++	dma_free_coherent(core->dev, size, vaddr, paddr);
++}
++EXPORT_SYMBOL_GPL(amvdec_workspace_put);
++
+ static void dst_buf_done(struct amvdec_session *sess,
+ 			 struct vb2_v4l2_buffer *vbuf,
+ 			 u32 field, u64 timestamp,
+diff -ruN s35/drivers/staging/media/meson/vdec/vdec_helpers.h s36/drivers/staging/media/meson/vdec/vdec_helpers.h
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h
+@@ -70,6 +70,12 @@
+ 		  struct v4l2_timecode tc, u32 offset, u32 size, u32 flags);
+ void amvdec_remove_ts(struct amvdec_session *sess, u64 ts);
+ 
++/* h96 0036: probe-time workspace, see vdec_helpers.c */
++void *amvdec_workspace_get(struct amvdec_core *core, size_t size,
++			   dma_addr_t *paddr);
++void amvdec_workspace_put(struct amvdec_core *core, void *vaddr, size_t size,
++			  dma_addr_t paddr);
++
+ /**
+  * amvdec_set_par_from_dar() - Set Pixel Aspect Ratio from Display Aspect Ratio
+  *

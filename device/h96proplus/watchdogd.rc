@@ -1,0 +1,18 @@
+# Служба аппаратного сторожа.
+#
+# ⛔ В образе AOSP бинарь /system/bin/watchdogd ЕСТЬ, а описания службы
+# НЕТ НИ В ОДНОМ rc-файле — я это предположил, а не проверил, и попытка
+# №23 поплатилась: ядро кормило сторож ровно watchdog.open_timeout=600
+# секунд (см. cmdline в make-android-sd.sh), не дождалось userspace и
+# сбросило SoC на десятой минуте — уже ПОСЛЕ успешной загрузки.
+#
+# Ставим сюда, в /system/etc/init/, а не в vendor-rc: бинарь системный,
+# и метка u:r:watchdogd:s0 в vendor-контексте на enforcing не пройдёт.
+#
+# Аргументы: интервал кормления 10 с, запас 20 с (штатные значения AOSP).
+# class core стартует в `on boot`, задолго до истечения 600 с.
+
+service watchdogd /system/bin/watchdogd 10 20
+    class core
+    oneshot
+    seclabel u:r:watchdogd:s0

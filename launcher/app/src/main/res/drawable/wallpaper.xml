@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Обои. Пока градиент, а не картинка: он ничего не весит, рисуется мгновенно
+    и не тянет декодирование при старте. Заменить на изображение можно позже —
+    главное, чтобы оно лежало локально (ТЗ §33), а не грузилось из сети.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <gradient
+        android:type="linear"
+        android:angle="315"
+        android:startColor="#FF0B1020"
+        android:centerColor="#FF121A2E"
+        android:endColor="#FF1B2440" />
+</shape>

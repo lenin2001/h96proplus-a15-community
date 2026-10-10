@@ -1,0 +1,79 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0042] arm_scpi: Amlogic legacy SET_USR_DATA (IR wake key for BL301)
+
+Part of the remote-standby build (25.09, #111). Adds scpi_send_usr_data(): vendor command 0x20 on the legacy
+low-priority channel, client id in bits 15:8 (vendor PACK_SCPI_CMD), no reply awaited.
+Used by kernel/meson_gx_pm.c (canonical copy: ir_wake_key=0xbf40fe01 sent at
+PM_SUSPEND_PREPARE, KEY_WAKEUP and eth0 close/open after a real resume). Built as
+#104/#105 and tested 24-25.09 with the owner: BL301 accepts the key (usr data: 0) and the
+remote wakes the box from deep suspend with picture. Open: after a resume the remote's
+key-up arrives 1.4-1.7 s after key-down (0.3-0.5 s on a fresh boot), so Android treats
+POWER as a long press and the box cannot be put back to sleep from the remote.
+
+---
+diff -ruN a/drivers/firmware/arm_scpi.c b/drivers/firmware/arm_scpi.c
+--- a/drivers/firmware/arm_scpi.c
++++ b/drivers/firmware/arm_scpi.c
+@@ -810,6 +810,47 @@
+ }
+ EXPORT_SYMBOL_GPL(get_scpi_ops);
+ 
++/*
++ * h96 0042: Amlogic vendor command SET_USR_DATA (0x20) of the legacy SCPI
++ * protocol: hands a small blob to the SCP firmware's low-priority task, which
++ * dispatches it by the sender (client) id in bits 15:8 of the command word
++ * (vendor PACK_SCPI_CMD: id 7:0, sender 15:8, size 28:20). Used by meson-gx-pm
++ * to give BL301 the IR power-key frame (client 5 = SCPI_CL_REMOTE). Sent on
++ * the low-priority channel without a reply buffer: with rx_buf the token
++ * would overwrite the sender field. @data must stay valid until the mailbox
++ * has sent it (callers pass static storage).
++ */
++int scpi_send_usr_data(u8 client_id, const void *data, unsigned int len)
++{
++	struct scpi_chan *scpi_chan;
++	struct scpi_xfer *msg;
++	int ret;
++
++	if (!scpi_info || !scpi_info->is_legacy)
++		return -ENODEV;
++	if (len > 0x1fc)
++		return -E2BIG;
++
++	scpi_chan = scpi_info->channels;	/* legacy low priority */
++	msg = get_scpi_xfer(scpi_chan);
++	if (!msg)
++		return -ENOMEM;
++
++	msg->cmd = PACK_LEGACY_SCPI_CMD(0x20, len) |
++		   FIELD_PREP(CMD_TOKEN_ID_MASK, client_id);
++	msg->slot = msg->cmd;
++	msg->tx_buf = (void *)data;
++	msg->tx_len = len;
++	msg->rx_buf = NULL;
++	msg->rx_len = 0;
++	reinit_completion(&msg->done);
++
++	ret = mbox_send_message(scpi_chan->chan, msg);
++	put_scpi_xfer(msg, scpi_chan);
++	return ret < 0 ? ret : 0;
++}
++EXPORT_SYMBOL_GPL(scpi_send_usr_data);
++
+ static int scpi_init_versions(struct scpi_drvinfo *info)
+ {
+ 	int ret;
+diff -ruN a/include/linux/scpi_protocol.h b/include/linux/scpi_protocol.h
+--- a/include/linux/scpi_protocol.h
++++ b/include/linux/scpi_protocol.h
+@@ -80,8 +80,11 @@
+ 
+ #if IS_REACHABLE(CONFIG_ARM_SCPI_PROTOCOL)
+ struct scpi_ops *get_scpi_ops(void);
++int scpi_send_usr_data(u8 client_id, const void *data, unsigned int len);
+ #else
+ static inline struct scpi_ops *get_scpi_ops(void) { return NULL; }
++static inline int scpi_send_usr_data(u8 client_id, const void *data,
++				     unsigned int len) { return -ENODEV; }
+ #endif
+ 
+ #endif /* _LINUX_SCPI_PROTOCOL_H */

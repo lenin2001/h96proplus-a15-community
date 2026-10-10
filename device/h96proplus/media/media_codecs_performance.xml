@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!--
+  Замеренные скорости декодирования (CTS смотрит на эти диапазоны).
+
+  Числа — консервативные оценки для Amlogic S912: vdectest мерит
+  декод+хеширование (11-12 fps на 1080p — это скорость ХЕША, не
+  декодера), а чистый HW-декод на этой платформе — сотни fps в 1080p
+  и 30+ в 4K (тактовая vdec 666 МГц). Уточнить после M6, когда декод
+  пойдёт без хеширования через реальный MediaCodec.
+-->
+<MediaCodecs>
+    <Decoders>
+        <MediaCodec name="c2.v4l2.avc.decoder" type="video/avc" update="true">
+            <Limit name="measured-frame-rate-320x240" range="500-800" />
+            <Limit name="measured-frame-rate-720x480" range="300-500" />
+            <Limit name="measured-frame-rate-1280x720" range="150-300" />
+            <Limit name="measured-frame-rate-1920x1080" range="80-160" />
+        </MediaCodec>
+        <!-- 03.09.2026: 4K-диапазоны подняты по РЕАЛЬНОМУ замеру (vdectest
+             без MD5, 600-кадровые клипы): HEVC 4K 59-67 fps, VP9 4K 66,
+             2K 120, 1080p AVC 127. Прежние «24-40» на 4K говорили
+             ExoPlayer-у «60 fps не тянем» — и он брал программный кодек. -->
+        <MediaCodec name="c2.v4l2.hevc.decoder" type="video/hevc" update="true">
+            <Limit name="measured-frame-rate-352x288" range="400-700" />
+            <Limit name="measured-frame-rate-640x360" range="300-500" />
+            <Limit name="measured-frame-rate-1280x720" range="150-300" />
+            <Limit name="measured-frame-rate-1920x1080" range="90-160" />
+            <Limit name="measured-frame-rate-2560x1440" range="100-130" />
+            <Limit name="measured-frame-rate-3840x2160" range="59-70" />
+        </MediaCodec>
+        <MediaCodec name="c2.v4l2.vp9.decoder" type="video/x-vnd.on2.vp9" update="true">
+            <Limit name="measured-frame-rate-1280x720" range="150-300" />
+            <Limit name="measured-frame-rate-1920x1080" range="80-160" />
+            <Limit name="measured-frame-rate-3840x2160" range="60-70" />
+        </MediaCodec>
+    </Decoders>
+</MediaCodecs>

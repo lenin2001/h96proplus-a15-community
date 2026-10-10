@@ -1,0 +1,9 @@
+# fstab для загрузки с ВНУТРЕННЕЙ eMMC (androidboot.fstab_suffix=emmc), 09.09.2026.
+# Разделы задаются ядру через blkdevparts= (mainline не читает Amlogic MPT), имена из
+# него попадают в PARTNAME → /dev/block/by-name/<имя>. Смещения — из MPT стока
+# (backup/partitions-20260816-195027/reserved.img): vendor = бывший `cache` (512 МиБ @108 МиБ),
+# system = `system` (2 ГиБ @876 МиБ), data = `data` (11,7 ГиБ @2932 МиБ). Образы — EROFS, как на SD.
+/dev/block/by-name/system  /system  erofs  ro                                    wait,first_stage_mount
+/dev/block/by-name/vendor  /vendor  erofs  ro                                    wait,first_stage_mount
+/dev/block/by-name/data    /data    ext4   noatime,nosuid,nodev,errors=remount-ro  wait,check,formattable
+/dev/block/zram0           none     swap   defaults                              zramsize=536870912

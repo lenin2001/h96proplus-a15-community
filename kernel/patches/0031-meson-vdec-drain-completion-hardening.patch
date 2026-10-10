@@ -1,0 +1,487 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0031] meson-vdec: complete a drain on real completion, never
+ certify a timeout, serialise the LAST decision
+
+Incremental on top of 0030 (kernel #87). Answers the five concrete findings of
+the 22.09 Codex review of 0030 against the effective #87 source:
+
+1. drain_issued was set BEFORE codec_ops->drain(), so the EOS worker could
+   hand out LAST while drain() was still delivering the DPB tail, and its
+   200 ms quiet clock did not start from a completed drain. VP9/HEVC drain()
+   (codec_vp9_flush_output / codec_hevc_flush_output) deliver the whole tail
+   synchronously under their codec lock, so their return IS the completion:
+   drain_done is now set after drain() returns and the worker is kicked at
+   once - no quiet timer for these codecs. Their counter-based in-band LAST
+   in dst_buf_done() is disabled, since it could cut drain()'s batch.
+   The quiet timer remains only for codecs without .drain (H.264, MPEG-1/2),
+   whose firmware has no "DPB empty" signal, and it now runs from the moment
+   the EOS picture was actually queued (eos_queued_jiffies), not from STOP.
+2. The 15 s branch skipped every gate and emitted a normal LAST. It now fires
+   only if nothing has come out for 1 s, and the terminator carries
+   V4L2_BUF_FLAG_ERROR plus a dev_err naming what was missing.
+3. No CAPTURE buffer for 60 ticks made the worker give up for good (the
+   same infinite end-of-video hang). Now the terminator is marked pending
+   and the next CAPTURE QBUF (vdec_vb2_buf_queue) re-arms the worker.
+4. last_sent/sequence_cap were touched by the worker and the ISR-thread
+   completion path with no common lock. The decision, sequence number and
+   vb2 publication are now one transaction under a new eos_lock spinlock,
+   in both paths; a real frame after LAST is counted and warned about.
+   Lock facts from the source: DECODER_CMD runs under core->lock
+   (vdev->lock), QBUF/STREAMOFF under sess->lock (m2m q_lock), so the two
+   are NOT serialised with each other; the worker takes neither mutex
+   (vdec_stop_streaming cancels it synchronously under sess->lock).
+5. Generation guard: every STOP/START/stream on/off bumps eos_gen and a
+   worker armed by an older STOP does nothing. The resume path of
+   start_streaming now also cancels both works first. A repeated STOP while
+   a drain is pending is a no-op instead of resetting state under the worker.
+
+Terminator buffer ownership: taken from the m2m ready list. For VP9/HEVC,
+after drain() the codec's frame lists are empty, so the firmware owns none of
+those buffers. For H.264 the buffer was already recycled to the firmware as
+free; the client re-queues the empty buffer before DEC_CMD_START, and
+buf_output[idx] is cleared so that QBUF does not recycle the same index to the
+firmware a second time.
+
+---
+diff -ruN base/drivers/staging/media/meson/vdec/esparser.c s1/drivers/staging/media/meson/vdec/esparser.c
+--- a/drivers/staging/media/meson/vdec/esparser.c
++++ b/drivers/staging/media/meson/vdec/esparser.c
+@@ -405,9 +405,18 @@
+ 		if (codec_ops->eos_sequence) {
+ 			u32 len;
+ 			const u8 *data = codec_ops->eos_sequence(&len);
++			unsigned long flags;
+ 
+-			sess->eos_queued = 1;
+ 			esparser_queue_eos(sess->core, data, len);
++			/*
++			 * h96 0031: otschet tishiny dlya terminatora h264 idet
++			 * ot momenta, kogda EOS-kartinka REALNO ushla v parser,
++			 * a ne ot STOP ili poslednego kadra.
++			 */
++			spin_lock_irqsave(&sess->eos_lock, flags);
++			sess->eos_queued = 1;
++			sess->eos_queued_jiffies = jiffies;
++			spin_unlock_irqrestore(&sess->eos_lock, flags);
+ 		}
+ 	}
+ 	mutex_unlock(&sess->lock);
+diff -ruN base/drivers/staging/media/meson/vdec/vdec.c s1/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -264,8 +264,20 @@
+ 			sess->drain_total_ticks);
+ 		vdec_wait_inactive(sess);
+ 		if (codec_ops->drain) {
+-			sess->drain_issued = 1;
++			unsigned long flags;
++
++			/*
++			 * h96 0031: drain() SINHRONNO otdaet ves hvost DPB (vp9/
++			 * hevc flush_output pod svoim codec-lock) - tolko ego
++			 * VOZVRAT i est nastoyashchee zavershenie. Flag stavim
++			 * posle vyzova, a ne do nego, inache eos_work mog
++			 * otdat LAST parallelno s vydachej hvosta.
++			 */
+ 			codec_ops->drain(sess);
++			spin_lock_irqsave(&sess->eos_lock, flags);
++			sess->drain_done = 1;
++			spin_unlock_irqrestore(&sess->eos_lock, flags);
++			mod_delayed_work(system_wq, &sess->eos_work, 0);
+ 		}
+ 		return;
+ 	}
+@@ -290,13 +302,41 @@
+  * ~100 raz v sekundu: video-render nikogda ne konchaetsya, plejer ne
+  * zakryvaetsya i ne perehodit k sleduyushchemu roliku.
+  *
+- * Posle CMD_STOP zhdem 200 ms tishiny na CAPTURE i, esli LAST tak i ne
+- * ushel, otdaem pustoj bufer s LAST i sobytiem EOS. Potolok ozhidaniya
+- * klientskogo bufera - 3 s.
++ * Posle CMD_STOP otdaem pustoj bufer s LAST i sobytiem EOS, kogda drain
++ * DEJSTVITELNO zavershen (sm. nizhe), esli LAST tak i ne ushel s realnym
++ * kadrom.
++ *
++ * h96 0031 (23.09), razbor Codex ot 22.09 - chto zdes teper garantiruetsya:
++ *
++ * 1. Kriterij zaversheniya - nastoyashchij, gde on est. U kodekov s
++ *    codec_ops->drain (vp9, hevc) drain() sinhronno otdaet ves hvost DPB;
++ *    vdec_drain_work stavit drain_done POSLE ego vozvrata i srazu budit
++ *    nas - nikakogo tajmera tishiny. Tajmer (eos_queued + 200 ms bez
++ *    kadrov POSLE podachi EOS-kartinki) ostaetsya TOLKO dlya kodekov bez
++ *    .drain (h264, mpeg12): u ih proshivki signala "DPB pust" net.
++ * 2. 15 s ot STOP - eto ne uspeh, a avariya: srabatyvaet tolko esli za
++ *    1 s ne bylo ni odnogo kadra, i terminator uhodit s
++ *    V4L2_BUF_FLAG_ERROR i dev_err, a ne kak chistyj konec potoka.
++ * 3. Net CAPTURE-bufera - ne sdaemsya: eos_pending, i pervyj zhe QBUF
++ *    CAPTURE (vdec_vb2_buf_queue) budit vorker snova.
++ * 4. Reshenie "LAST uzhe ushel?" + sequence_cap + publikaciya - odna
++ *    tranzakciya pod eos_lock, i v dst_buf_done tozhe; poetomu LAST rovno
++ *    odin, a realnyj kadr ne mozhet ujti POSLE nego nezamechennym
++ *    (schetchik frames_after_last + dev_warn).
++ * 5. Pokolenie: kazhdyj STOP/START/streamon/streamoff menyaet eos_gen;
++ *    vorker, vzvedennyj starym STOP, nichego ne delaet.
+  *
+- * Lok zdes ne berem (kak i vdec_drain_work): vdec_stop_streaming()
+- * vyzyvaet cancel_delayed_work_sync() pod tem zhe sess->lock, i vzyatie
+- * loka vnutri vorkera dalo by AB-BA dedlok.
++ * Bufer-terminator beretsya iz ready-spiska m2m. Dlya vp9/hevc tam tolko
++ * bufery, kotoryh net v spiskah kadrov kodeka (posle drain() spiski
++ * pusty), t.e. proshivka v nih ne pishet. Dlya h264 bufer v ready-spiske
++ * uzhe otdan proshivke cherez recycle kak svobodnyj; posle LAST klient
++ * vozvrashchaet pustyshku QBUF-om ranshe, chem DEC_CMD_START, a
++ * buf_output[idx] snimaem, chtoby etot QBUF ne otdal proshivke tot zhe
++ * indeks VTOROJ raz.
++ *
++ * Lok sess->lock zdes ne berem (kak i vdec_drain_work): vdec_stop_streaming()
++ * vyzyvaet cancel_delayed_work_sync() pod nim, i vzyatie loka vnutri
++ * vorkera dalo by AB-BA dedlok.
+  */
+ static void vdec_eos_work(struct work_struct *work)
+ {
+@@ -304,63 +344,99 @@
+ 		container_of(to_delayed_work(work), struct amvdec_session,
+ 			     eos_work);
+ 	const struct v4l2_event ev = { .type = V4L2_EVENT_EOS };
+-	struct amvdec_codec_ops *codec_ops;
++	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct vb2_v4l2_buffer *vbuf;
+-	unsigned int i;
++	unsigned long flags, now = jiffies, quiet_from;
++	unsigned int i, idx, stop_ms = 0;
++	bool forced = false;
++
++	spin_lock_irqsave(&sess->eos_lock, flags);
++	if (sess->eos_armed_gen != sess->eos_gen || sess->stopping ||
++	    !sess->should_stop || sess->last_sent)
++		goto out;
+ 
+-	if (sess->stopping || !sess->should_stop || sess->last_sent)
+-		return;
+-
+-	codec_ops = sess->fmt_out->codec_ops;
+-
+-	/*
+-	 * Ne obryvat hvost: terminator imeet pravo srabotat tolko posle togo,
+-	 * kak sbros DPB realno ZAPROSHEN. Dlya codec_ops->drain (vp9, hevc)
+-	 * eto drain_issued iz vdec_drain_work, kotoryj zhdet uspokoeniya
+-	 * esparser do 10 s; dlya eos_sequence (h264) - eos_queued, t.e.
+-	 * fiktivnaya kartinka uzhe ushla v firmware. Absolyutnyj predel 15 s
+-	 * ot CMD_STOP vse ravno ostaetsya: obrezannyj hvost luchshe vechnogo
+-	 * zavisaniya, radi kotorogo etot patch i sdelan.
+-	 */
+-	if (time_before(jiffies, sess->stop_jiffies + msecs_to_jiffies(15000))) {
+-		if (codec_ops->drain && !sess->drain_issued)
+-			goto again;
+-		if (!codec_ops->drain && codec_ops->eos_sequence &&
+-		    !sess->eos_queued)
+-			goto again;
+-
+-		/* zhelezo eshche otdaet kadry - pust LAST povesit obychnyj put */
+-		if (time_before(jiffies,
+-				sess->last_dst_jiffies + msecs_to_jiffies(200))) {
+-			sess->eos_ticks = 0;
+-			goto again;
++	if (codec_ops->drain) {
++		if (!sess->drain_done)
++			goto not_done;
++	} else {
++		quiet_from = sess->last_dst_jiffies;
++		if (codec_ops->eos_sequence) {
++			if (!sess->eos_queued)
++				goto not_done;
++			if (time_after(sess->eos_queued_jiffies, quiet_from))
++				quiet_from = sess->eos_queued_jiffies;
+ 		}
++		if (time_before(now, quiet_from + msecs_to_jiffies(200)))
++			goto not_done;
+ 	}
++	goto terminate;
++
++not_done:
++	if (time_before(now, sess->stop_jiffies + msecs_to_jiffies(15000)) ||
++	    time_before(now, sess->last_dst_jiffies + msecs_to_jiffies(1000)))
++		goto again;
++	forced = true;
+ 
++terminate:
+ 	vbuf = v4l2_m2m_dst_buf_remove(sess->m2m_ctx);
+ 	if (!vbuf) {
+-		/* klient poka ne vernul ni odnogo svobodnogo CAPTURE-bufera */
+-		if (++sess->eos_ticks > 60) {
+-			dev_warn(sess->core->dev,
+-				 "vdec: drain ne zavershen, net CAPTURE-bufera\n");
+-			return;
+-		}
+-		goto again;
++		/* terminator dolzhen, no bufera net - ego vernet QBUF */
++		sess->eos_pending = 1;
++		goto out;
+ 	}
++	sess->eos_pending = 0;
+ 
+ 	for (i = 0; i < vbuf->vb2_buf.num_planes; i++)
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, i, 0);
+ 
++	idx = vbuf->vb2_buf.index;
++	if (idx < 32)
++		sess->buf_output[idx] = false;
++	vbuf->flags = forced ? V4L2_BUF_FLAG_ERROR : 0;
+ 	vbuf->sequence = sess->sequence_cap++;
+ 	vbuf->field = V4L2_FIELD_NONE;
+ 	sess->last_sent = 1;
+-	dev_dbg(sess->core->dev, "vdec: drain zavershen pustym LAST\n");
++	stop_ms = jiffies_to_msecs(now - sess->stop_jiffies);
+ 	v4l2_event_queue_fh(&sess->fh, &ev);
+ 	v4l2_m2m_last_buffer_done(sess->m2m_ctx, vbuf);
++	spin_unlock_irqrestore(&sess->eos_lock, flags);
++
++	if (forced)
++		dev_err(sess->core->dev,
++			"vdec: drain NE zavershen za %u ms (drain_done=%u eos_queued=%u) - LAST s ERROR\n",
++			stop_ms, sess->drain_done, sess->eos_queued);
++	else
++		dev_dbg(sess->core->dev,
++			"vdec: drain zavershen pustym LAST cherez %u ms (buf %u)\n",
++			stop_ms, idx);
+ 	return;
+ 
+ again:
++	spin_unlock_irqrestore(&sess->eos_lock, flags);
+ 	schedule_delayed_work(&sess->eos_work, msecs_to_jiffies(50));
++	return;
++out:
++	spin_unlock_irqrestore(&sess->eos_lock, flags);
++}
++
++/*
++ * h96 0031: vse sostoyanie konca potoka - v nol, i vse ranee vzvedennye
++ * STOP stanovyatsya nedejstvitelnymi. Vyzyvaetsya POSLE otmeny drain_work
++ * i eos_work.
++ */
++static void vdec_eos_reset(struct amvdec_session *sess)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&sess->eos_lock, flags);
++	sess->should_stop = 0;
++	sess->eos_queued = 0;
++	sess->last_sent = 0;
++	sess->drain_done = 0;
++	sess->eos_pending = 0;
++	sess->frames_after_last = 0;
++	sess->eos_gen++;
++	spin_unlock_irqrestore(&sess->eos_lock, flags);
+ }
+ 
+ static void vdec_poweroff(struct amvdec_session *sess)
+@@ -531,6 +607,15 @@
+ 
+ 	v4l2_m2m_buf_queue(m2m_ctx, vbuf);
+ 
++	/*
++	 * h96 0031: terminator drain zhdal svobodnyj CAPTURE-bufer - vot on.
++	 * Bez etogo propushchennoe probuzhdenie snova davalo vechnoe
++	 * "video ne konchaetsya".
++	 */
++	if (vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    READ_ONCE(sess->eos_pending))
++		mod_delayed_work(system_wq, &sess->eos_work, 0);
++
+ 	if (!sess->streamon_out)
+ 		return;
+ 
+@@ -612,10 +697,9 @@
+ 		 * V4L2_BUF_FLAG_LAST i sobytiem EOS: plejer schitaet, chto
+ 		 * rolik konchilsya, srazu posle togo kak vy peremotali.
+ 		 */
+-		sess->should_stop = 0;
+-		sess->eos_queued = 0;
+-		sess->last_sent = 0;
+-		sess->drain_issued = 0;
++		cancel_delayed_work_sync(&sess->drain_work);
++		cancel_delayed_work_sync(&sess->eos_work);
++		vdec_eos_reset(sess);
+ 		/*
+ 		 * h96 0022 (07.09.2026): pri PERVOM DRC (256x144 -> realnoe
+ 		 * razreshenie) klient delaet STREAMOFF starogo CAPTURE ->
+@@ -652,10 +736,7 @@
+ 		goto bufs_done;
+ 	}
+ 
+-	sess->should_stop = 0;
+-	sess->eos_queued = 0;
+-	sess->last_sent = 0;
+-	sess->drain_issued = 0;
++	vdec_eos_reset(sess);
+ 	sess->stopping = 0;
+ 	sess->keyframe_found = 0;
+ 	sess->last_offset = 0;
+@@ -813,8 +894,7 @@
+ 	 * Smeshcheniya, schetchiki i metki ochishchayutsya vyshe, v bloke
+ 	 * polnoj ostanovki, gde eto bezopasno.
+ 	 */
+-	sess->should_stop = 0;
+-	sess->eos_queued = 0;
++	vdec_eos_reset(sess);
+ 	/* h96 03.09 (H5): m2m has_stopped иначе переживает flush и каждый QBUF CAPTURE
+ 	 * до start_streaming возвращается пустышкой с LAST (v4l2-mem2mem force_last_buf_done). */
+ 	v4l2_m2m_clear_state(sess->m2m_ctx);
+@@ -1111,6 +1191,7 @@
+ 	struct amvdec_session *sess = file_to_amvdec_session(file);
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct device *dev = sess->core->dev;
++	unsigned long flags;
+ 	int ret;
+ 
+ 	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, fh, cmd);
+@@ -1124,10 +1205,10 @@
+ 		cancel_delayed_work_sync(&sess->drain_work);
+ 		cancel_delayed_work_sync(&sess->eos_work);
+ 		v4l2_m2m_clear_state(sess->m2m_ctx);
+-		sess->should_stop = 0;
+-		sess->eos_queued = 0;
+-		sess->last_sent = 0;
+-		sess->drain_issued = 0;
++		if (sess->frames_after_last)
++			dev_warn(dev, "vdec: %u kadr(ov) prishli POSLE LAST i poteryany\n",
++				 sess->frames_after_last);
++		vdec_eos_reset(sess);
+ 		return 0;
+ 	}
+ 
+@@ -1137,12 +1218,25 @@
+ 
+ 	dev_dbg(dev, "Received V4L2_DEC_CMD_STOP\n");
+ 
++	/*
++	 * h96 0031: STOP vo vremya uzhe idushchego (ili zakonchennogo, no eshche
++	 * ne START-ovannogo) drain nichego ne menyaet - inache on sbrasyval
++	 * last_sent/tajmery pryamo pod rabotayushchim vorkerom.
++	 */
++	spin_lock_irqsave(&sess->eos_lock, flags);
++	if (sess->should_stop) {
++		spin_unlock_irqrestore(&sess->eos_lock, flags);
++		return 0;
++	}
+ 	sess->should_stop = 1;
+ 	sess->last_sent = 0;
+-	sess->drain_issued = 0;
+-	sess->eos_ticks = 0;
++	sess->drain_done = 0;
++	sess->eos_pending = 0;
++	sess->frames_after_last = 0;
+ 	sess->stop_jiffies = jiffies;
+-	sess->last_dst_jiffies = jiffies;
++	sess->last_dst_jiffies = sess->stop_jiffies;
++	sess->eos_armed_gen = ++sess->eos_gen;
++	spin_unlock_irqrestore(&sess->eos_lock, flags);
+ 
+ 	v4l2_m2m_mark_stopped(sess->m2m_ctx);
+ 
+@@ -1330,6 +1424,7 @@
+ 	mutex_init(&sess->lock);
+ 	mutex_init(&sess->bufs_recycle_lock);
+ 	spin_lock_init(&sess->ts_spinlock);
++	spin_lock_init(&sess->eos_lock);
+ 
+ 	v4l2_fh_init(&sess->fh, core->vdev_dec);
+ 	sess->fh.ctrl_handler = &sess->ctrl_handler;
+diff -ruN base/drivers/staging/media/meson/vdec/vdec.h s1/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -292,9 +292,26 @@
+ 	struct delayed_work eos_work;
+ 	unsigned long last_dst_jiffies;
+ 	unsigned long stop_jiffies;
+-	unsigned int eos_ticks;
+ 	unsigned int last_sent;
+-	unsigned int drain_issued;
++
++	/*
++	 * h96 23.09 (0031): eos_lock serializuet reshenie "kto otdaet LAST" i
++	 * ego publikaciyu. DECODER_CMD idet pod core->lock (vdev->lock), a
++	 * QBUF/STREAMOFF - pod sess->lock (m2m q_lock): drug s drugom oni NE
++	 * serializovany, a vorker ne beret ni odin iz nih. Pod eos_lock
++	 * menyayutsya should_stop, eos_queued, last_sent, drain_done,
++	 * eos_pending, eos_gen/eos_armed_gen, last_dst_jiffies,
++	 * eos_queued_jiffies, a v dst_buf_done - sequence_cap++ vmeste s
++	 * buf_done. Spinlock: dst_buf_done zovetsya iz threaded ISR, a
++	 * vb2_buffer_done() i v4l2_event_queue_fh() atomic-bezopasny.
++	 */
++	spinlock_t eos_lock;
++	unsigned long eos_queued_jiffies;
++	unsigned int eos_gen;		/* +1 na kazhdom STOP/START/stream on/off */
++	unsigned int eos_armed_gen;	/* pokolenie, k kotoromu otnositsya STOP */
++	unsigned int drain_done;	/* codec_ops->drain() VERNULSYA: hvost DPB otdan */
++	unsigned int eos_pending;	/* LAST dolzhen ujti, no net CAPTURE: zhdem QBUF */
++	unsigned int frames_after_last;	/* realnye kadry posle LAST - poteryany */
+ 
+ 	unsigned int streamon_cap, streamon_out;
+ 	unsigned int sequence_cap, sequence_out;
+diff -ruN base/drivers/staging/media/meson/vdec/vdec_helpers.c s1/drivers/staging/media/meson/vdec/vdec_helpers.c
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -440,7 +440,10 @@
+ 			 struct v4l2_timecode timecode, u32 flags)
+ {
+ 	struct device *dev = sess->core->dev_dec;
++	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	u32 output_size = amvdec_get_output_size(sess);
++	unsigned long irqflags;
++	bool lost = false;
+ 
+ 	if (h96_dump > 0) {
+ 		void *va = vb2_plane_vaddr(&vbuf->vb2_buf, 0);
+@@ -496,15 +499,33 @@
+ 	}
+ 
+ 	vbuf->vb2_buf.timestamp = timestamp;
+-	vbuf->sequence = sess->sequence_cap++;
+ 	vbuf->flags = flags;
+ 	vbuf->timecode = timecode;
++	vbuf->field = field;
+ 
+-	/* h96 21.09: otmetka dlya vdec_eos_work - zhelezo eshche otdaet kadry */
++	/*
++	 * h96 0031: reshenie o LAST, sequence i publikaciya - odna tranzakciya
++	 * pod eos_lock, obshchaya s vdec_eos_work. Inache oba videli
++	 * last_sent == 0 i LAST mog ujti dvazhdy, a realnyj kadr - posle
++	 * terminatora.
++	 */
++	spin_lock_irqsave(&sess->eos_lock, irqflags);
++	vbuf->sequence = sess->sequence_cap++;
++	/* otmetka dlya vdec_eos_work - zhelezo eshche otdaet kadry */
+ 	sess->last_dst_jiffies = jiffies;
+ 
+-	if (sess->should_stop && !sess->last_sent &&
+-	    atomic_read(&sess->esparser_queued_bufs) <= 1) {
++	if (sess->should_stop && sess->last_sent) {
++		/* klient uzhe poluchil LAST: etot kadr on ne uvidit */
++		sess->frames_after_last++;
++		lost = true;
++	} else if (sess->should_stop && !codec_ops->drain &&
++		   atomic_read(&sess->esparser_queued_bufs) <= 1) {
++		/*
++		 * Tolko dlya kodekov BEZ .drain: u vp9/hevc hvost DPB vydaet
++		 * drain() pachkoj, i LAST na pervom kadre pachki otrezal by
++		 * ostalnye - tam konec potoka otmechaet vdec_eos_work po
++		 * drain_done.
++		 */
+ 		const struct v4l2_event ev = { .type = V4L2_EVENT_EOS };
+ 
+ 		dev_dbg(dev, "Signaling EOS, sequence_cap = %u\n",
+@@ -522,8 +543,12 @@
+ 
+ 	dev_dbg(dev, "Buffer %u done, ts = %llu, flags = %08X\n",
+ 		vbuf->vb2_buf.index, timestamp, flags);
+-	vbuf->field = field;
++	if (lost)
++		dev_warn_ratelimited(dev,
++				     "vdec: kadr %u posle LAST - klient ego ne poluchit\n",
++				     vbuf->vb2_buf.index);
+ 	v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_DONE);
++	spin_unlock_irqrestore(&sess->eos_lock, irqflags);
+ 
+ 	/* Buffer done probably means the vififo got freed */
+ 	if (!sess->stopping)

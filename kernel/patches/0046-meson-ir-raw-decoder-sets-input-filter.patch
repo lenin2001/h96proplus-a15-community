@@ -1,0 +1,43 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0046] meson-ir: software decoder programs the input filter itself
+
+BL301 reprograms this decoder for its hardware-NEC wake detection during deep suspend and
+leaves REG0 FILTER=3; meson_ir_sw_decoder_init() only set BASE_TIME, so after every resume
+the raw decoder ran with the weaker glitch filter (measured: 70fa0009 -> 30fa0009). The
+filter is now set explicitly (7, the bootloader value on this board) at init and resume.
+Verified with timer-woken cycles: REG0 back to 70fa0009 after resume. Physical remote
+key-up timing after resume: see the 25.09 report.
+
+---
+diff -ruN b/drivers/media/rc/meson-ir.c c/drivers/media/rc/meson-ir.c
+--- a/drivers/media/rc/meson-ir.c
++++ b/drivers/media/rc/meson-ir.c
+@@ -94,6 +94,12 @@
+ #define IRQSEL_RISE				3
+ 
+ #define MESON_RAW_TRATE				10	/* us */
++/*
++ * h96 0046: input glitch filter for raw decoding. The bootloader leaves 7 on
++ * this board; BL301 sets 3 for its hardware-NEC wake detection and does not
++ * restore it, so the raw decoder must program it itself (init and resume).
++ */
++#define MESON_RAW_FILTER			7
+ #define MESON_HW_TRATE				20	/* us */
+ 
+ /**
+@@ -498,10 +504,11 @@
+ 				   FIELD_PREP(IR_DEC_REG2_MODE,
+ 					      DEC_MODE_RAW));
+ 
+-	/* Set rate */
+-	regmap_update_bits(ir->reg, IR_DEC_REG0, IR_DEC_REG0_BASE_TIME,
+-			   FIELD_PREP(IR_DEC_REG0_BASE_TIME,
+-				      MESON_RAW_TRATE - 1));
++	/* Set rate and input filter */
++	regmap_update_bits(ir->reg, IR_DEC_REG0,
++			   IR_DEC_REG0_BASE_TIME | IR_DEC_REG0_FILTER,
++			   FIELD_PREP(IR_DEC_REG0_BASE_TIME, MESON_RAW_TRATE - 1) |
++			   FIELD_PREP(IR_DEC_REG0_FILTER, MESON_RAW_FILTER));
+ 	/* IRQ on rising and falling edges */
+ 	regmap_update_bits(ir->reg, IR_DEC_REG1, IR_DEC_REG1_IRQSEL,
+ 			   FIELD_PREP(IR_DEC_REG1_IRQSEL, IRQSEL_RISE_FALL));

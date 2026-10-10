@@ -1,0 +1,287 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0030] meson-vdec: always terminate a drain with V4L2_BUF_FLAG_LAST
+
+A V4L2_DEC_CMD_STOP on this driver could never complete, so a video that reached its
+natural end left the player hanging: the decoder fell silent, the audio renderer drained,
+and ExoPlayer waited forever for a video end-of-stream that never came. The owner sees
+this as "SmartTube does not return to its own screen when a video ends".
+
+Measured on 21.09.2026 (H.264, 393 s clip, natural end, no key presses):
+
+  00:31:27.308  DecodeComponent  queueTask(): flags=0x2, index=4195   <- the EOS work
+  00:31:27.308  V4L2Decoder      drain() / sendV4L2DecoderCmd(start=0)
+  00:31:27.373  V4L2Decoder      Set state Decoding => Draining
+  00:31:27.5xx  six tail frames dequeued, every one of them isLast=0
+  (nothing ever again)
+
+3034 CAPTURE dequeues over the whole run, isLast=1 exactly zero times. Meanwhile
+ExoPlayer's audio sink had already drained and called playToEndOfStream 25622 times over
+the following 4 min 18 s.
+
+Cause: V4L2_BUF_FLAG_LAST was attached in dst_buf_done() only to a *real* decoded frame,
+and only while esparser_queued_bufs <= 1. That counter also covers frames the DPB still
+holds, and it is decremented *after* dst_buf_done(), so towards the end of a stream it
+never falls to 1 before the hardware goes quiet. The drain is then left without a
+terminator and both sides wait for each other.
+
+The V4L2 stateful decoder interface requires the opposite: a V4L2_DEC_CMD_STOP must
+always be completed by a CAPTURE buffer carrying V4L2_BUF_FLAG_LAST, and when no decoded
+frame is left the driver must return an empty (bytesused = 0) buffer with that flag.
+v4l2_m2m_force_last_buf_done() does not cover this case: it only fires when the capture
+queue is streaming but the device has not started.
+
+So: after CMD_STOP a delayed worker watches the capture side and, when the flush has
+actually been requested and the hardware has then been quiet for 200 ms without LAST
+having gone out, hands userspace an empty CAPTURE buffer with V4L2_BUF_FLAG_LAST and
+queues V4L2_EVENT_EOS. A new last_sent flag keeps the normal path and the backstop from
+both firing, and is cleared everywhere should_stop/eos_queued are.
+
+"The flush has actually been requested" matters, or the terminator would cut the tail off:
+codecs with codec_ops->drain (VP9, HEVC) go through vdec_drain_work(), which deliberately
+waits for the esparser backlog to stop shrinking - up to 10 s - before calling drain(),
+and during that wait the capture queue is silent. So the terminator additionally requires
+drain_issued for those codecs and eos_queued for eos_sequence codecs (H.264, where the
+dummy picture is fed from the esparser_queue_all_src work item). An absolute 15 s deadline
+from CMD_STOP remains as a last resort - above vdec_drain_work()'s own 10 s ceiling -
+because a truncated tail is still far better than the infinite hang this patch removes.
+
+v4l2_codec2 needs no change: V4L2Decoder sets mDrainLastSeen before it looks at the
+payload, and a zero-length MMAP capture buffer is re-queued instead of being copied.
+
+vdec_eos_work() deliberately does not take sess->lock, exactly like vdec_drain_work():
+vdec_stop_streaming() calls cancel_delayed_work_sync() while holding that same lock, and
+taking it inside the worker would reproduce the AB-BA deadlock the esparser feeder is
+already documented to cause.
+
+Verified on the box as kernel #87 (the unhardened form was #86, and three natural endings
+on it produced exactly one isLast=1 each, one reportEOSWork each, playToEndOfStream down
+from 25622 to 78-81, and the player returned to SmartTube's own browse screen unaided).
+Boot images are assembled from the installed image's own ramdisk and cmdline, both proved
+byte-identical.
+---
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -283,6 +283,19 @@
+ 	unsigned int drain_stable_ticks;
+ 	unsigned int drain_total_ticks;
+ 
++	/*
++	 * h96 21.09: zavershenie drain. last_sent - V4L2_BUF_FLAG_LAST uzhe
++	 * otdan za etu ostanovku; last_dst_jiffies - kogda zhelezo v poslednij
++	 * raz vernulo kadr; eos_work dozhimaet drain pustym buferom s LAST,
++	 * esli obychnyj put' etogo ne sdelal.
++	 */
++	struct delayed_work eos_work;
++	unsigned long last_dst_jiffies;
++	unsigned long stop_jiffies;
++	unsigned int eos_ticks;
++	unsigned int last_sent;
++	unsigned int drain_issued;
++
+ 	unsigned int streamon_cap, streamon_out;
+ 	unsigned int sequence_cap, sequence_out;
+ 	unsigned int should_stop;
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -500,7 +500,10 @@
+ 	vbuf->flags = flags;
+ 	vbuf->timecode = timecode;
+ 
+-	if (sess->should_stop &&
++	/* h96 21.09: otmetka dlya vdec_eos_work - zhelezo eshche otdaet kadry */
++	sess->last_dst_jiffies = jiffies;
++
++	if (sess->should_stop && !sess->last_sent &&
+ 	    atomic_read(&sess->esparser_queued_bufs) <= 1) {
+ 		const struct v4l2_event ev = { .type = V4L2_EVENT_EOS };
+ 
+@@ -508,6 +511,7 @@
+ 			sess->sequence_cap - 1);
+ 		v4l2_event_queue_fh(&sess->fh, &ev);
+ 		vbuf->flags |= V4L2_BUF_FLAG_LAST;
++		sess->last_sent = 1;
+ 	} else if (sess->status == STATUS_NEEDS_RESUME) {
+ 		/* Mark LAST for drained show frames during a source change */
+ 		vbuf->flags |= V4L2_BUF_FLAG_LAST;
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -263,14 +263,106 @@
+ 			queued, sess->drain_stable_ticks,
+ 			sess->drain_total_ticks);
+ 		vdec_wait_inactive(sess);
+-		if (codec_ops->drain)
++		if (codec_ops->drain) {
++			sess->drain_issued = 1;
+ 			codec_ops->drain(sess);
++		}
+ 		return;
+ 	}
+ 
+ 	schedule_delayed_work(&sess->drain_work, msecs_to_jiffies(100));
+ }
+ 
++/*
++ * h96 21.09: zavershenie drain po specifikacii V4L2.
++ *
++ * Stateful-dekoder OBYAZAN zakonchit V4L2_DEC_CMD_STOP CAPTURE-buferom s
++ * V4L2_BUF_FLAG_LAST, a esli dekodirovannyh kadrov bolshe net - PUSTYM
++ * buferom (bytesused = 0) s etim flagom.
++ *
++ * Zdes LAST veshalsya tolko na realnyj kadr i tolko pri
++ * esparser_queued_bufs <= 1. Etot schetchik uchityvaet i kadry, kotorye
++ * eshche derzhit DPB, a umenshaetsya POSLE dst_buf_done(), poetomu k koncu
++ * rolika do 1 on ne dohodit. Progon 21.09 (h264, 393 s, estestvennyj
++ * konec): posle CMD_STOP vyshli 6 hvostovyh kadrov, isLast=0 u vseh
++ * 3034 vydach CAPTURE za ves progon, i ochered zamerla navsegda.
++ * ExoPlayer pri etom slil zvuk i 4 minuty vyzyval playToEndOfStream
++ * ~100 raz v sekundu: video-render nikogda ne konchaetsya, plejer ne
++ * zakryvaetsya i ne perehodit k sleduyushchemu roliku.
++ *
++ * Posle CMD_STOP zhdem 200 ms tishiny na CAPTURE i, esli LAST tak i ne
++ * ushel, otdaem pustoj bufer s LAST i sobytiem EOS. Potolok ozhidaniya
++ * klientskogo bufera - 3 s.
++ *
++ * Lok zdes ne berem (kak i vdec_drain_work): vdec_stop_streaming()
++ * vyzyvaet cancel_delayed_work_sync() pod tem zhe sess->lock, i vzyatie
++ * loka vnutri vorkera dalo by AB-BA dedlok.
++ */
++static void vdec_eos_work(struct work_struct *work)
++{
++	struct amvdec_session *sess =
++		container_of(to_delayed_work(work), struct amvdec_session,
++			     eos_work);
++	const struct v4l2_event ev = { .type = V4L2_EVENT_EOS };
++	struct amvdec_codec_ops *codec_ops;
++	struct vb2_v4l2_buffer *vbuf;
++	unsigned int i;
++
++	if (sess->stopping || !sess->should_stop || sess->last_sent)
++		return;
++
++	codec_ops = sess->fmt_out->codec_ops;
++
++	/*
++	 * Ne obryvat hvost: terminator imeet pravo srabotat tolko posle togo,
++	 * kak sbros DPB realno ZAPROSHEN. Dlya codec_ops->drain (vp9, hevc)
++	 * eto drain_issued iz vdec_drain_work, kotoryj zhdet uspokoeniya
++	 * esparser do 10 s; dlya eos_sequence (h264) - eos_queued, t.e.
++	 * fiktivnaya kartinka uzhe ushla v firmware. Absolyutnyj predel 15 s
++	 * ot CMD_STOP vse ravno ostaetsya: obrezannyj hvost luchshe vechnogo
++	 * zavisaniya, radi kotorogo etot patch i sdelan.
++	 */
++	if (time_before(jiffies, sess->stop_jiffies + msecs_to_jiffies(15000))) {
++		if (codec_ops->drain && !sess->drain_issued)
++			goto again;
++		if (!codec_ops->drain && codec_ops->eos_sequence &&
++		    !sess->eos_queued)
++			goto again;
++
++		/* zhelezo eshche otdaet kadry - pust LAST povesit obychnyj put */
++		if (time_before(jiffies,
++				sess->last_dst_jiffies + msecs_to_jiffies(200))) {
++			sess->eos_ticks = 0;
++			goto again;
++		}
++	}
++
++	vbuf = v4l2_m2m_dst_buf_remove(sess->m2m_ctx);
++	if (!vbuf) {
++		/* klient poka ne vernul ni odnogo svobodnogo CAPTURE-bufera */
++		if (++sess->eos_ticks > 60) {
++			dev_warn(sess->core->dev,
++				 "vdec: drain ne zavershen, net CAPTURE-bufera\n");
++			return;
++		}
++		goto again;
++	}
++
++	for (i = 0; i < vbuf->vb2_buf.num_planes; i++)
++		vb2_set_plane_payload(&vbuf->vb2_buf, i, 0);
++
++	vbuf->sequence = sess->sequence_cap++;
++	vbuf->field = V4L2_FIELD_NONE;
++	sess->last_sent = 1;
++	dev_dbg(sess->core->dev, "vdec: drain zavershen pustym LAST\n");
++	v4l2_event_queue_fh(&sess->fh, &ev);
++	v4l2_m2m_last_buffer_done(sess->m2m_ctx, vbuf);
++	return;
++
++again:
++	schedule_delayed_work(&sess->eos_work, msecs_to_jiffies(50));
++}
++
+ static void vdec_poweroff(struct amvdec_session *sess)
+ {
+ 	cancel_delayed_work_sync(&sess->drain_work);
+@@ -522,6 +614,8 @@
+ 		 */
+ 		sess->should_stop = 0;
+ 		sess->eos_queued = 0;
++		sess->last_sent = 0;
++		sess->drain_issued = 0;
+ 		/*
+ 		 * h96 0022 (07.09.2026): pri PERVOM DRC (256x144 -> realnoe
+ 		 * razreshenie) klient delaet STREAMOFF starogo CAPTURE ->
+@@ -560,6 +654,8 @@
+ 
+ 	sess->should_stop = 0;
+ 	sess->eos_queued = 0;
++	sess->last_sent = 0;
++	sess->drain_issued = 0;
+ 	sess->stopping = 0;
+ 	sess->keyframe_found = 0;
+ 	sess->last_offset = 0;
+@@ -640,6 +736,7 @@
+ 	struct vb2_v4l2_buffer *buf;
+ 
+ 	cancel_delayed_work_sync(&sess->drain_work);
++	cancel_delayed_work_sync(&sess->eos_work);
+ 	/*
+ 	 * h96 04.09.2026: stopping vystavlyaem SRAZU, do vsego. Kormilku
+ 	 * esparser NEL'ZYA gasit' cherez cancel_work_sync() otsyuda: eta
+@@ -1025,9 +1122,12 @@
+ 
+ 	if (cmd->cmd == V4L2_DEC_CMD_START) {
+ 		cancel_delayed_work_sync(&sess->drain_work);
++		cancel_delayed_work_sync(&sess->eos_work);
+ 		v4l2_m2m_clear_state(sess->m2m_ctx);
+ 		sess->should_stop = 0;
+ 		sess->eos_queued = 0;
++		sess->last_sent = 0;
++		sess->drain_issued = 0;
+ 		return 0;
+ 	}
+ 
+@@ -1038,6 +1138,11 @@
+ 	dev_dbg(dev, "Received V4L2_DEC_CMD_STOP\n");
+ 
+ 	sess->should_stop = 1;
++	sess->last_sent = 0;
++	sess->drain_issued = 0;
++	sess->eos_ticks = 0;
++	sess->stop_jiffies = jiffies;
++	sess->last_dst_jiffies = jiffies;
+ 
+ 	v4l2_m2m_mark_stopped(sess->m2m_ctx);
+ 
+@@ -1058,6 +1163,9 @@
+ 		vdec_wait_inactive(sess);
+ 	}
+ 
++	/* h96 21.09: strakhovka - drain obyazan zakonchitsya buferom s LAST */
++	schedule_delayed_work(&sess->eos_work, msecs_to_jiffies(250));
++
+ 	return ret;
+ }
+ 
+@@ -1218,6 +1326,7 @@
+ 	INIT_LIST_HEAD(&sess->bufs_recycle);
+ 	INIT_WORK(&sess->esparser_queue_work, esparser_queue_all_src);
+ 	INIT_DELAYED_WORK(&sess->drain_work, vdec_drain_work);
++	INIT_DELAYED_WORK(&sess->eos_work, vdec_eos_work);
+ 	mutex_init(&sess->lock);
+ 	mutex_init(&sess->bufs_recycle_lock);
+ 	spin_lock_init(&sess->ts_spinlock);

@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "id": "h96proplus-czs32v3",
+  "description": "H96 Pro Plus, board CZ-S32-V3, Amlogic S912 (Meson GXM), stock Amlogic MPT with 13 entries",
+  "evidence": "Layout and MPT checksum checked against one unit's stock reserved partition (2026-08-16 backup); eMMC user area 15634268160 bytes on that unit.",
+  "tested_units": 1,
+  "emmc": {
+    "min_bytes": 5221908480,
+    "max_bytes": 68719476736
+  },
+  "mpt": {
+    "offset": 37748736,
+    "magic": "MPT",
+    "version": "01.00.00",
+    "partitions": [
+      {"name": "bootloader", "offset": 0,          "size": 4194304,    "mask": 0},
+      {"name": "reserved",   "offset": 37748736,   "size": 67108864,   "mask": 0},
+      {"name": "cache",      "offset": 113246208,  "size": 536870912,  "mask": 2},
+      {"name": "env",        "offset": 658505728,  "size": 8388608,    "mask": 0},
+      {"name": "logo",       "offset": 675282944,  "size": 33554432,   "mask": 1},
+      {"name": "recovery",   "offset": 717225984,  "size": 33554432,   "mask": 1},
+      {"name": "rsv",        "offset": 759169024,  "size": 8388608,    "mask": 1},
+      {"name": "tee",        "offset": 775946240,  "size": 8388608,    "mask": 1},
+      {"name": "crypt",      "offset": 792723456,  "size": 33554432,   "mask": 1},
+      {"name": "misc",       "offset": 834666496,  "size": 33554432,   "mask": 1},
+      {"name": "boot",       "offset": 876609536,  "size": 33554432,   "mask": 1},
+      {"name": "system",     "offset": 918552576,  "size": 2147483648, "mask": 1},
+      {"name": "data",       "offset": 3074424832, "size": "rest",     "mask": 4}
+    ]
+  },
+  "targets": {
+    "boot":   {"partition": "boot",   "note": "Android boot image v0: gzip Image + ramdisk (fstab.emmc), <= 32 MiB"},
+    "vendor": {"partition": "cache",  "note": "stock 'cache' slot reused as vendor (EROFS)"},
+    "system": {"partition": "system", "note": "EROFS system image"}
+  },
+  "data": {
+    "partition": "data",
+    "wipe_bytes": 67108864,
+    "note": "first install only, with explicit consent: zeroing the first 64 MiB makes Android format /data ('formattable')"
+  },
+  "dtb": {
+    "partition": "reserved",
+    "records": [
+      {"offset_in_partition": 4194304, "size": 262144},
+      {"offset_in_partition": 4456448, "size": 262144}
+    ],
+    "footer_bytes": 16,
+    "method": "payload-only",
+    "note": "The loader keeps two 256 KiB DTB records with a 16-byte magic/version/timestamp/checksum footer. The tested method writes the plain FDT at the start of BOTH records and leaves the rest of each record, including the footer, untouched. Both full records are backed up first."
+  },
+  "never_write": ["bootloader", "env", "logo", "recovery", "rsv", "tee", "crypt", "misc"],
+  "kernel_cmdline_partitions": "blkdevparts=mmcblk1:512M@108M(vendor),2G@876M(system),-@2932M(data)"
+}

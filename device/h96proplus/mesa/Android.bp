@@ -1,0 +1,99 @@
+// Драйвер графики для Mali-T820 приставки: Mesa 24.3, модуль panfrost.
+//
+// Зачем: у Amlogic S912 есть видеоядро Mali-T820, но закрытых драйверов под
+// Linux для него не существует в природе — Amlogic лицензировала только
+// Android-версию, привязанную к своему старому ядру. Поэтому до сих пор всю
+// графику рисовал процессор через программный эмулятор (ANGLE поверх
+// SwiftShader), и кадр 1080p собирался около пяти секунд.
+//
+// Открытый драйвер panfrost из Mesa поддерживает Midgard, к которому
+// относится T820, и работает поверх обычного ядерного драйвера panfrost,
+// уже включённого в наше ядро.
+//
+// Библиотеки в репозитории не лежат: их собирает build/build-mesa.sh
+// (NDK r27c, external/mesa3d и external/libdrm из AOSP android-15.0.0_r36)
+// и кладёт сюда в lib64/. SONAME у них — те имена, которые ищет загрузчик EGL
+// Android: он берёт libEGL_<суффикс>.so, где суффикс — значение
+// ro.hardware.egl (мы ставим mesa).
+//
+// Vulkan здесь намеренно не собран: поддержка Midgard из PanVK выброшена
+// разработчиками, для T820 его не будет никогда. Vulkan остаётся
+// программным (pastel), им пользуется только то немногое, что его требует.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_prebuilt_library_shared {
+    name: "libEGL_mesa",
+    proprietary: true,
+    relative_install_path: "egl",
+    compile_multilib: "64",
+    strip: { none: true },
+    check_elf_files: false,
+    shared_libs: [
+        "libcutils",
+        "libhardware",
+        "liblog",
+        "libnativewindow",
+        "libsync",
+    ],
+    target: { android_arm64: { srcs: ["lib64/libEGL_mesa.so"] } },
+}
+
+cc_prebuilt_library_shared {
+    name: "libGLESv2_mesa",
+    proprietary: true,
+    relative_install_path: "egl",
+    compile_multilib: "64",
+    strip: { none: true },
+    check_elf_files: false,
+    target: { android_arm64: { srcs: ["lib64/libGLESv2_mesa.so"] } },
+}
+
+cc_prebuilt_library_shared {
+    name: "libGLESv1_CM_mesa",
+    proprietary: true,
+    relative_install_path: "egl",
+    compile_multilib: "64",
+    strip: { none: true },
+    check_elf_files: false,
+    target: { android_arm64: { srcs: ["lib64/libGLESv1_CM_mesa.so"] } },
+}
+
+// Собственно драйвер: весь panfrost и общий код Gallium.
+cc_prebuilt_library_shared {
+    name: "libgallium_dri",
+    proprietary: true,
+    relative_install_path: "dri",
+    compile_multilib: "64",
+    strip: { none: true },
+    check_elf_files: false,
+    target: { android_arm64: { srcs: ["lib64/libgallium_dri.so"] } },
+}
+
+cc_prebuilt_library_shared {
+    name: "libglapi",
+    proprietary: true,
+    compile_multilib: "64",
+    strip: { none: true },
+    check_elf_files: false,
+    target: { android_arm64: { srcs: ["lib64/libglapi.so"] } },
+}
+
+// libdrm сюда не кладём: в образе уже есть системная той же версии
+// (external/libdrm 2.4.124 — против неё Mesa и собиралась). Своя копия
+// вызывала конфликт упаковки: два модуля претендовали на один файл
+// vendor/lib64/libdrm.so, и сборка останавливалась.
+
+// Runtime C++ из NDK: библиотеки собраны против него, а в образе Android
+// лежит своя libc++ с другим именем.
+cc_prebuilt_library_shared {
+    name: "libc++_shared_mesa",
+    stem: "libc++_shared",
+    proprietary: true,
+    compile_multilib: "64",
+    strip: { none: true },
+    check_elf_files: false,
+    target: { android_arm64: { srcs: ["lib64/libc++_shared.so"] } },
+}

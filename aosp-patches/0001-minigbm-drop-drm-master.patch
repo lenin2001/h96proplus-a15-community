@@ -1,0 +1,27 @@
+diff --git a/cros_gralloc/cros_gralloc_driver.cc b/cros_gralloc/cros_gralloc_driver.cc
+index cb8b94b..e483be6 100644
+--- a/cros_gralloc/cros_gralloc_driver.cc
++++ b/cros_gralloc/cros_gralloc_driver.cc
+@@ -109,6 +109,22 @@ static struct driver *init_try_node(int idx, char const *str)
+ 	if (fd < 0)
+ 		return NULL;
+ 
++	/*
++	 * H96 Pro Plus (Amlogic GXM, mainline kernel): the display device
++	 * (meson) has no render node, so gralloc has to open the primary
++	 * node - and the first process to open a primary node silently
++	 * becomes the DRM master. That locks out drm_hwcomposer, which then
++	 * reports "DRM/KMS master access required", finds no pipelines and
++	 * falls back to a null display: Android boots, but nothing is ever
++	 * shown on screen (the kernel console stays visible).
++	 *
++	 * An allocator has no business being the DRM master, and it does not
++	 * need to be: DRM_IOCTL_MODE_CREATE_DUMB carries no DRM_MASTER/
++	 * DRM_AUTH requirement. Drop it right away so the composer can take
++	 * it, no matter which service starts first.
++	 */
++	drmDropMaster(fd);
++
+ 	drv = drv_create(fd);
+ 	if (!drv)
+ 		close(fd);

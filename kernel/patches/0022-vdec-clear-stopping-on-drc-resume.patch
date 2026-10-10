@@ -1,0 +1,375 @@
+vdec: снять залипший stopping при resume после первого DRC — фикс «видео стартует только после перемотки»
+
+07.09.2026. Воспроизведено на контролируемом MediaCodec→Surface тесте (форсирован
+c2.v4l2.avc.decoder, локальный H264 1080p, позиция 0, без seek): после первого
+SOURCE_CHANGE (256x144→1920x1080) codec_h264_resume() вызывается, но firmware не
+выдаёт ни одного кадра (out=0, vdec IRQ +2), esparser кормит 2 AU и встаёт.
+
+Корень: vdec_stop_streaming БЕЗУСЛОВНО ставит sess->stopping=1 в самом начале
+(защита от AB-BA дедлока esparser-воркера). При первом DRC клиент делает STREAMOFF
+старого CAPTURE → stopping=1, но полный teardown НЕ выполняется (OUTPUT ещё
+streamon). Путь resume в vdec_start_streaming (NEEDS_RESUME+CAPTURE+changed_format)
+сбрасывал should_stop/eos_queued, но НЕ stopping. Залипший stopping → esparser_
+queue_all_src ранний-return (esparser.c:382), dst_buf_done не перепланирует
+кормление (vdec_helpers.c:525) → firmware голодает → 0 кадров. Seek/flush лечит,
+т.к. полный рестарт OUTPUT сбрасывает stopping (vdec.c:496).
+
+Фикс: в ветке resume снять sess->stopping=0 и перезапустить esparser_queue_work.
+Это точечно (мы ТОЧНО возобновляем, а не останавливаем), не маскировка. Синхронный
+resume (seek, geometry не меняется) не затронут — ему не предшествует capture-streamoff.
+Проверка: чистый старт без seek теперь даёт непрерывный HW-декод 30 к/с.
+
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 928e0287e..aec6dfac9 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -23,6 +23,7 @@
+ #include "vdec.h"
+ #include "esparser.h"
+ #include "vdec_helpers.h"
++#include "dos_regs.h"
+ 
+ struct dummy_buf {
+ 	struct vb2_v4l2_buffer vb;
+@@ -57,11 +58,37 @@ static int vdec_recycle_thread(void *data)
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct amvdec_buffer *tmp, *n;
+ 
++	u32 stall_iters = 0;
++
+ 	while (!kthread_should_stop()) {
++		bool stalled = false;
++
++		/*
++		 * 01.09.2026: ne trogat' registry, esli sessiya bol'she ne
++		 * tekushchaya.
++		 *
++		 * Etot potok perezhivaet sessiyu: kthread_stop() vyzyvaetsya po
++		 * usloviyu vdec_codec_needs_recycle(), kotoroe chitaet TEKUSHCHIJ
++		 * sess->fmt_out, a plejer mog pomenyat' ego cherez S_FMT. Sirota
++		 * prodolzhaet zvat' can_recycle() staroj sessii, to est' chitat'
++		 * MMIO. Posle vdec_poweroff() domen VDEC1 izolirovan i dos_clk
++		 * pogashen, a amvdec_read_dos() - eto obychnyj readl_relaxed:
++		 * chtenie s pogashennoj shiny na GXM veshaet CPU nasovsem.
++		 *
++		 * Imenno tak vyglyadelo "pri smene kodeka vse visnet".
++		 */
++		if (READ_ONCE(core->cur_sess) != sess ||
++		    sess->status < STATUS_INIT) {
++			usleep_range(5000, 10000);
++			continue;
++		}
++
+ 		mutex_lock(&sess->bufs_recycle_lock);
+ 		list_for_each_entry_safe(tmp, n, &sess->bufs_recycle, list) {
+-			if (!codec_ops->can_recycle(core))
++			if (!codec_ops->can_recycle(core)) {
++				stalled = true;
+ 				break;
++			}
+ 
+ 			codec_ops->recycle(core, tmp->vb->index);
+ 			list_del(&tmp->list);
+@@ -69,6 +96,33 @@ static int vdec_recycle_thread(void *data)
+ 		}
+ 		mutex_unlock(&sess->bufs_recycle_lock);
+ 
++		if (stalled) {
++			if (++stall_iters == 200) {
++				struct amvdec_buffer *db;
++				unsigned int rc = 0;
++				u32 s7 = amvdec_read_dos(core, AV_SCRATCH_7);
++				u32 s8 = amvdec_read_dos(core, AV_SCRATCH_8);
++
++				mutex_lock(&sess->bufs_recycle_lock);
++				list_for_each_entry(db, &sess->bufs_recycle, list)
++					rc++;
++				mutex_unlock(&sess->bufs_recycle_lock);
++				pr_info("h96 stall: num_dst=%u recycle_pending=%u scr7=%u scr8=%u\n",
++					sess->num_dst_bufs, rc, s7, s8);
++			}
++				else if (stall_iters >= 600) {
++					/* 05.09.2026: вечный застой (H264/VP9 fw не отдаёт буферы)
++					 * держал ВСЕ CMA -> декодер не стартует, система в свопе.
++					 * HEVC на "No dst buffer" уже делает abort; делаем то же:
++					 * после >3с сбрасываем сессию, c2 пересоздаёт и повторяет. */
++					pr_warn("h96 vdec: recycle stalled >3s -- abort dlya vosstanovleniya\n");
++					amvdec_abort(sess);
++					stall_iters = 0;
++				}
++		} else {
++			stall_iters = 0;
++		}
++
+ 		usleep_range(5000, 10000);
+ 	}
+ 
+@@ -106,10 +160,33 @@ static int vdec_poweron(struct amvdec_session *sess)
+ 
+ static void vdec_wait_inactive(struct amvdec_session *sess)
+ {
+-	/* We consider 50ms with no IRQ to be inactive. */
++	/*
++	 * 01.09.2026: dobavlen potolok ozhidaniya.
++	 *
++	 * Uslovie vyhoda - "50 ms bez preryvanij". Kogda proshivka srivaetsya
++	 * (naprimer poteryany opornye kadry i ona shtormit mailbox-IRQ),
++	 * last_irq_jiffies obnovlyaetsya bystree, chem istekaet okno, i cikl
++	 * ne zavershaetsya NIKOGDA. A vyzyvaetsya on iz vdec_poweroff(), to
++	 * est' vnutri stop_streaming, POD sess->lock i core->lock - poetomu
++	 * vmeste s nim namertvo vstaet ves' /dev/video0: lyuboj sleduyushchij
++	 * ioctl igroka viset v D. Eto i est' "peremotka zavisla" i "pri smene
++	 * kodeka vse vislo".
++	 *
++	 * Teper' zhdem ne bol'she sekundy. Esli zhelezo za eto vremya ne
++	 * uspokoilos', ono uzhe ne uspokoitsya samo - luchshe poluchit' zapis'
++	 * v zhurnale i prodolzhit' ostanovku, chem povisnut' navsegda.
++	 */
++	u64 deadline = get_jiffies_64() + msecs_to_jiffies(1000);
++
+ 	while (time_is_after_jiffies64(sess->last_irq_jiffies +
+-				       msecs_to_jiffies(50)))
++				       msecs_to_jiffies(50))) {
++		if (time_is_before_jiffies64(deadline)) {
++			dev_warn(sess->core->dev,
++				 "vdec: zhelezo ne zatihlo za 1 s, prodolzhaem ostanovku\n");
++			return;
++		}
+ 		msleep(25);
++	}
+ }
+ 
+ /*
+@@ -230,7 +307,18 @@ static void process_num_buffers(struct vb2_queue *q,
+ 	 * we need all of them to be queued into the driver
+ 	 */
+ 	sess->num_dst_bufs = q_num_bufs + *num_buffers;
+-	q->min_queued_buffers = max(fmt_out->min_buffers, sess->num_dst_bufs);
++	/*
++	 * h96 04.09.2026: старт декода развязан от ПОЛНОГО пула. Прошивка
++	 * пишет только в буфер, снятый через prepare_new_frame (v4l2_m2m_dst_
++	 * buf_remove), поэтому для старта достаточно DPB-набора (min_buf_capture);
++	 * остальные дотекают через buf_queue. Прежнее =num_dst_bufs требовало
++	 * QBUF'нуть ВСЕ буферы до start_streaming, а клиент часть держит под
++	 * reorder/rendering (maxDequeue) -> в m2m-очереди CAPTURE пусто ->
++	 * codec_hevc_prepare_new_frame ловит "No dst buffer available" -> abort,
++	 * видео НЕ стартует (HEVC/VP9 в SmartTube/Alfa). Канвас-список
++	 * (num_dst_bufs) программируется целиком - это не трогаем.
++	 */
++	q->min_queued_buffers = max(fmt_out->min_buffers, min_buf_capture);
+ }
+ 
+ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+@@ -310,14 +398,37 @@ static void vdec_vb2_buf_queue(struct vb2_buffer *vb)
+ 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+ 	struct amvdec_session *sess = vb2_get_drv_priv(vb->vb2_queue);
+ 	struct v4l2_m2m_ctx *m2m_ctx = sess->m2m_ctx;
++	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 
+ 	v4l2_m2m_buf_queue(m2m_ctx, vbuf);
+ 
+ 	if (!sess->streamon_out)
+ 		return;
+ 
++	/*
++	 * h96: bufer, vernuvshijsya POSLE resume() (seek), na moment resume v
++	 * ocheredi ne stoyal -> ego slot=index derzhit placeholder-kanvas.
++	 * Dopisyvaem REALNYJ adres imenno etogo vb (dma_addr validen zdes)
++	 * ROVNO ODIN RAZ i DO togo, kak recycle soobshchit fw, chto indeks
++	 * svoboden. V norme (recycle-requeue) slot_real uzhe true -> no-op.
++	 */
+ 	if (sess->streamon_cap &&
++	    sess->status == STATUS_RUNNING &&
+ 	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    vb->index < 32 && !sess->slot_real[vb->index] &&
++	    codec_ops->program_capture_buf)
++		codec_ops->program_capture_buf(sess, vb);
++
++	/*
++	 * h96 06.09: recycl'im CAPTURE-bufer TOL'KO posle togo, kak fw ego hotya
++	 * by raz vydal (buf_output). Inache pervichnye CCodec-QBUF (surface-rejim,
++	 * prihodyat POSLE streamon_cap) recycl'ili by aktivnye reference-bufery fw
++	 * -> DPB fw rushilsya -> hang. V MMAP pervichnye QBUF idut do streamon_cap
++	 * i syuda ne popadali - vosproizvodim tu zhe semantiku yavno.
++	 */
++	if (sess->streamon_cap &&
++	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    vb->index < 32 && sess->buf_output[vb->index] &&
+ 	    vdec_codec_needs_recycle(sess))
+ 		vdec_queue_recycle(sess, vb);
+ 
+@@ -348,8 +459,34 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	if (sess->status == STATUS_NEEDS_RESUME &&
+ 	    q->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+ 	    sess->changed_format) {
++		/*
++		 * 01.09.2026: eto "legkij" put' vozobnovleniya posle peremotki -
++		 * teardown ne vypolnyaetsya, poetomu flagi konca potoka nuzhno
++		 * snyat' vruchnuyu. Inache should_stop, vystavlennyj do seek,
++		 * perezhivaet peremotku, i kazhdyj sleduyushchij kadr uezzhaet s
++		 * V4L2_BUF_FLAG_LAST i sobytiem EOS: plejer schitaet, chto
++		 * rolik konchilsya, srazu posle togo kak vy peremotali.
++		 */
++		sess->should_stop = 0;
++		sess->eos_queued = 0;
++		/*
++		 * h96 0022 (07.09.2026): pri PERVOM DRC (256x144 -> realnoe
++		 * razreshenie) klient delaet STREAMOFF starogo CAPTURE ->
++		 * vdec_stop_streaming BEZUSLOVNO stavit sess->stopping = 1.
++		 * Polnyj teardown pri etom NE srabatyvaet (OUTPUT eshche
++		 * streamon), poetomu stopping ostaetsya zalipshim:
++		 * esparser_queue_all_src rannij-return po stopping,
++		 * dst_buf_done ne pereplaniruet kormlenie -> firmware
++		 * golodaet posle resume() -> 0 kadrov ("pokazyvaet tolko
++		 * posle peremotki"). Zdes' my TOCHNO vozobnovlyaem - snimaem
++		 * flag i perezapuskaem kormilku.
++		 */
++		sess->stopping = 0;
++		v4l2_m2m_clear_state(sess->m2m_ctx);
++
+ 		codec_ops->resume(sess);
+ 		sess->status = STATUS_RUNNING;
++		schedule_work(&sess->esparser_queue_work);
+ 		return 0;
+ 	}
+ 
+@@ -370,6 +507,7 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
+ 
+ 	sess->should_stop = 0;
+ 	sess->eos_queued = 0;
++	sess->stopping = 0;
+ 	sess->keyframe_found = 0;
+ 	sess->last_offset = 0;
+ 	sess->wrap_count = 0;
+@@ -446,28 +584,91 @@ static void vdec_stop_streaming(struct vb2_queue *q)
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct amvdec_core *core = sess->core;
+ 
+-	cancel_delayed_work_sync(&sess->drain_work);
+ 	struct vb2_v4l2_buffer *buf;
+ 
++	cancel_delayed_work_sync(&sess->drain_work);
++	/*
++	 * h96 04.09.2026: stopping vystavlyaem SRAZU, do vsego. Kormilku
++	 * esparser NEL'ZYA gasit' cherez cancel_work_sync() otsyuda: eta
++	 * funktsiya vyzyvaetsya POD sess->lock (vb2 queue lock == sess->lock),
++	 * a sam vorker esparser_queue_all_src pervym delom beret sess->lock ->
++	 * cancel_work_sync zhdet vorkera, vorker zhdet lok -> AB-BA DEDLOK
++	 * (DecodeComponent v __flush_work + kworker v esparser_queue_all_src,
++	 * oba v D, /dev/video0 mertv, plejer "format ne podderzhivaetsya").
++	 * Zashchita ot dostupa k regsitram posle poweroff uzhe est': flag
++	 * sess->stopping (rannij return v esparser_queue_all_src pod lokom) i
++	 * "if(!stopping) schedule_work" v dst_buf_done. Lyuboj uzhe
++	 * zaplanirovannyj vorker, poluchiv lok POSLE vozvrata stop_streaming,
++	 * uvidit stopping=1 i vyjdet, ne trogaya regsitry i priv.
++	 */
++	sess->stopping = 1;
++
+ 	if (sess->status == STATUS_RUNNING ||
+ 	    sess->status == STATUS_INIT ||
+ 	    (sess->status == STATUS_NEEDS_RESUME &&
+ 	     (!sess->streamon_out || !sess->streamon_cap))) {
+-		if (vdec_codec_needs_recycle(sess))
++		/*
++		 * Ne po vdec_codec_needs_recycle(): ono chitaet TEKUSHCHIJ
++		 * fmt_out, a on mog smenit'sya cherez S_FMT - togda potok
++		 * ostavalsya zhit' sirotoj.
++		 */
++		if (sess->recycle_thread) {
+ 			kthread_stop(sess->recycle_thread);
++			sess->recycle_thread = NULL;
++		}
+ 
++		/* h96 03.09 (H4): drain() внутри poweroff перевзводит esparser-работу
++		 * через dst_buf_done; блокирует "if(!stopping) schedule_work" +
++		 * stopping=1 (выставлен в начале stop_streaming). cancel_work_sync
++		 * здесь УБРАН - он под sess->lock давал AB-BA дедлок (см. выше). */
+ 		vdec_poweroff(sess);
+ 		vdec_free_canvas(sess);
+ 		dma_free_coherent(sess->core->dev, sess->vififo_size,
+ 				  sess->vififo_vaddr, sess->vififo_paddr);
+ 		vdec_reset_timestamps(sess);
+ 		vdec_reset_bufs_recycle(sess);
++
++		/*
++		 * Poryadok vazhen: snachala ubiraem sessiyu iz core->cur_sess,
++		 * i tol'ko potom osvobozhdaem priv. Ran'she bylo naoborot, i
++		 * tred preryvaniya uspeval vzyat' eshche nenulevoj cur_sess i
++		 * obratit'sya k uzhe osvobozhdennoj pamyati.
++		 */
++		core->cur_sess = NULL;
+ 		kfree(sess->priv);
+ 		sess->priv = NULL;
+-		core->cur_sess = NULL;
+ 		sess->status = STATUS_STOPPED;
++
++		sess->keyframe_found = 0;
++		sess->last_offset = 0;
++		sess->wrap_count = 0;
++		sess->sequence_cap = 0;
++		sess->sequence_out = 0;
++		atomic_set(&sess->esparser_queued_bufs, 0);
+ 	}
+ 
++	/*
++	 * Sbrasyvaem TOL'KO flagi konca potoka, i tol'ko ih.
++	 *
++	 * 01.09.2026, proverено na zheleze: snachala zdes' stoyal "polnyj
++	 * sbros konvejera" - vmeste so smeshcheniyami i vyzovom
++	 * vdec_reset_timestamps(). Eto slomalo vosproizvedenie nasovsem.
++	 * Prichina: stop_streaming vyzyvaetsya dlya KAZHDOJ ocheredi otdel'no,
++	 * i pri obychnoj peremotke plejer gasit tol'ko CAPTURE, a OUTPUT
++	 * prodolzhaet rabotat'. Stirat' pri etom spisok metok vremeni nel'zya:
++	 * posle etogo KAZHDYJ dekodirovannyj kadr uezzhaet s nesopostavlennoj
++	 * metkoj ("Buffer N done but can't match offset"), plejer schitaet ego
++	 * ustarevshim i vybrasyvaet - ekran ostaetsya chernym.
++	 *
++	 * Smeshcheniya, schetchiki i metki ochishchayutsya vyshe, v bloke
++	 * polnoj ostanovki, gde eto bezopasno.
++	 */
++	sess->should_stop = 0;
++	sess->eos_queued = 0;
++	/* h96 03.09 (H5): m2m has_stopped иначе переживает flush и каждый QBUF CAPTURE
++	 * до start_streaming возвращается пустышкой с LAST (v4l2-mem2mem force_last_buf_done). */
++	v4l2_m2m_clear_state(sess->m2m_ctx);
++
+ 	if (q->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+ 		while ((buf = v4l2_m2m_src_buf_remove(sess->m2m_ctx)))
+ 			v4l2_m2m_buf_done(buf, VB2_BUF_STATE_ERROR);
+@@ -888,6 +1089,10 @@ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	dst_vq->drv_priv = sess;
+ 	dst_vq->buf_struct_size = sizeof(struct dummy_buf);
+ 	dst_vq->min_queued_buffers = 1;
++	/* h96: разрешить V4L2_MEMORY_FLAG_NON_COHERENT — CPU-копия кадров
++	 * из некэшируемых MMAP-буферов шла ~4 fps, кэшируемые дают полный
++	 * темп; vb2 сам инвалидирует кэш на dqbuf. */
++	dst_vq->allow_cache_hints = 1;
+ 	dst_vq->dev = sess->core->dev;
+ 	dst_vq->lock = &sess->lock;
+ 	return vb2_queue_init(dst_vq);
+@@ -1009,6 +1214,15 @@ static irqreturn_t vdec_isr(int irq, void *data)
+ 	struct amvdec_core *core = data;
+ 	struct amvdec_session *sess = core->cur_sess;
+ 
++	/*
++	 * 01.09.2026: cur_sess obnulyaetsya v stop_streaming, a preryvanie
++	 * moglo byt' vystavleno do etogo i prijti uzhe posle. Razymenovanie
++	 * NULL v obrabotchike preryvaniya - eto oops, posle kotorogo
++	 * pristavka uhodit v perezagruzku.
++	 */
++	if (!sess || !sess->fmt_out)
++		return IRQ_NONE;
++
+ 	sess->last_irq_jiffies = get_jiffies_64();
+ 
+ 	return sess->fmt_out->codec_ops->isr(sess);
+@@ -1019,6 +1233,9 @@ static irqreturn_t vdec_threaded_isr(int irq, void *data)
+ 	struct amvdec_core *core = data;
+ 	struct amvdec_session *sess = core->cur_sess;
+ 
++	if (!sess || !sess->fmt_out)
++		return IRQ_NONE;
++
+ 	return sess->fmt_out->codec_ops->threaded_isr(sess);
+ }
+ 

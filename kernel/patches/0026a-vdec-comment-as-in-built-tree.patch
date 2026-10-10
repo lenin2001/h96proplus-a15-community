@@ -1,0 +1,20 @@
+Subject: [PATCH] meson-vdec: keep the 0025 comment as it stood in the built tree (#81)
+
+Comment-only change. The maintainer's #81 tree kept the v1 wording of one comment
+line from 0025, while the published 0025 carries the v2 wording. Applying this makes
+vdec.c byte-identical to the #81 commit (blob 27ef77986), so the git index lines of
+0027 and the source hashes recorded for build #112 verify exactly.
+---
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index a583a8d10..27ef77986 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -109,7 +109,7 @@ static int vdec_recycle_thread(void *data)
+ 			 * C2_CORRUPTED -> MediaCodec error, dal'she flush ignoriruetsya:
+ 			 * "peremotka ne rabotaet". Teper' stall schitaetsya tol'ko esli:
+ 			 *   - sessiya RUNNING, ne stopping/should_stop (ne seek/EOS/teardown),
+-			 *   - v OUTPUT-ocheredi est' eshche ne skormlennye AU,
++			 *   - u fw est' rabota: v ESPARSER >1 nedekodirovannyj AU,
+ 			 *   - i fw ne dal ni odnogo IRQ za okno (net progressa).
+ 			 * Abort odnokratnyj na sessiyu (povtor kazhdye 3 s byl bespolezen).
+ 			 */

@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!--
+  Кодеки H96 Pro Plus (S912/GXM).
+
+  Аппаратные декодеры — v4l2_codec2 поверх staging-драйвера meson-vdec
+  (/dev/video0). Возможности проверены на железе прогонами 12-26
+  (см. docs/hevc-testing.md): h264/hevc/vp9 в 1080p и 4K декодируют
+  бит-в-бит, mpeg2 — в пределах допуска IDCT.
+
+  Порядок объявления = приоритет: аппаратные декодеры стоят ВЫШЕ
+  программных google-кодеков, которые подключаются Include-ом ниже.
+
+  Сознательно НЕ объявлены:
+   - c2.v4l2.*.encoder — на GXM кодировщик не поддержан драйвером;
+   - vp8 — meson-vdec на GXM его не выставляет;
+   - mpeg2 через v4l2_codec2 — компонент не умеет mpeg2, путь остаётся
+     за программным декодером (1080p mpeg2 на A53 тянется легко);
+   - secure-варианты — DRM-виджин не входит в цели проекта.
+
+  10-битный HEVC 4K пока НЕ работает (единый огромный FBC-буфер не
+  выделяется из фрагментированного CMA — известное ограничение,
+  docs/hevc-testing.md, прогон 26). Профиль Main10 поэтому не заявлен.
+-->
+<MediaCodecs>
+    <Settings>
+        <Setting name="supports-multiple-secure-codecs" value="false" />
+    </Settings>
+
+    <Decoders>
+    <!-- ⛔ ЕСЛИ SMARTTUBE СНОВА СКАЖЕТ «НЕПОДДЕРЖИВАЕМЫЙ ФОРМАТ» — ЧИТАТЬ ЭТО.
+
+         Компоненты c2.v4l2.* работают только пока в образе есть служба
+         android.hardware.media.c2@1.2-service-v4l2. Если её нет, а они
+         здесь объявлены, Android остаётся БЕЗ ЕДИНОГО ДЕКОДЕРА вообще:
+         «Decoder infos by media types:» пусто, отваливаются даже
+         программные кодеки из APEX com.android.media.swcodec, и плеер
+         пишет «неподдерживаемый формат видео И АУДИО» на любом ролике.
+         Один недоступный компонент отравляет весь список.
+
+         Именно это и случилось 23.08. Причина отсутствия службы —
+         external/v4l2_codec2/Android.bp:21 объявляет `soong_namespace {}`,
+         а модули пространства имён невидимы продукту, пока оно не указано
+         в PRODUCT_SOONG_NAMESPACES. Из 79 115 модулей сборки оттуда не
+         было НИ ОДНОГО, хотя исходники и libchrome лежали на месте.
+         Исправлено в device.mk; собрано и проверено 24.08 в 01:23:
+             /vendor/bin/hw/android.hardware.media.c2@1.2-service-v4l2-64
+             /vendor/lib64/libc2plugin_store.so
+             /vendor/etc/init/…-service-v4l2-64.rc
+             /vendor/etc/vintf/manifest/android.hardware.media.c2@1.2-service-v4l2.xml
+         Проверка одной командой: scripts/build/verify-device.sh, раздел 10.
+
+         ⚠️ Прежде чем что-то менять здесь — убедиться, что служба в образе.
+         Пределы ниже взяты не с потолка, а из таблицы драйвера
+         vdec_formats_gxm[] (vdec_platform.c:167): VP9, HEVC и H.264 до
+         3840x2160, выход NV12M. AV1 железо не умеет вовсе.
+    -->
+        <MediaCodec name="c2.v4l2.avc.decoder" type="video/avc">
+            <Limit name="size" min="16x16" max="3840x2160" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="1-32640" />
+            <Limit name="blocks-per-second" range="1-979200" />
+            <Limit name="frame-rate" range="1-60" />
+            <Limit name="bitrate" range="1-40000000" />
+            <!-- 01.09.2026: dvizhok vdec fizicheski ODIN. Zayavlennye 8
+                 ekzemplyarov pozvolyali plejeru sozdat' vtoroj dekoder do
+                 togo, kak osvobozhden pervyj - i vtoroj vstaval, zabiraya s
+                 soboj ves' /dev/video0. -->
+            <Limit name="concurrent-instances" max="1" />
+            <Limit name="performance-point-3840x2160" value="30" />
+            <Limit name="performance-point-1920x1080" value="60" />
+            <Limit name="performance-point-1280x720" value="60" />
+            <Limit name="performance-point-720x480" value="60" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+
+        <!-- 03.09.2026: 4K@60 замерен на железе (vdectest без MD5): HEVC
+             59-67 fps, установившаяся ~67. Точка 2160p поднята 30 -> 60,
+             blocks-per-second под 4K60 (32400 блоков x 60), битрейт до
+             100 Мбит (реальные 4K-рипы ходят по 60-80). -->
+        <MediaCodec name="c2.v4l2.hevc.decoder" type="video/hevc">
+            <Limit name="size" min="16x16" max="3840x2160" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="1-32640" />
+            <Limit name="blocks-per-second" range="1-1944000" />
+            <Limit name="frame-rate" range="1-60" />
+            <Limit name="bitrate" range="1-100000000" />
+            <Limit name="concurrent-instances" max="1" />
+            <Limit name="performance-point-3840x2160" value="60" />
+            <Limit name="performance-point-1920x1080" value="60" />
+            <Limit name="performance-point-1280x720" value="60" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+
+        <!-- VP9: потолок 1080p СНЯТ (03.09.2026). История: 31.08 из 768 МБ
+             CMA при работе оставалось 59 МБ, 4K VP9 (~300 МБ) блокирующим
+             выделением вешал декодер намертво в codec_vp9_resume — потолок
+             был честной защитой. С тех пор: 4K VP9 многократно прогнан
+             бит-в-бит и замерен в 66 fps (vdectest). YouTube отдаёт 4K
+             ТОЛЬКО в VP9/AV1 — потолок означал «4K нигде нет» и программный
+             VP9 для всего выше 1080p (жалоба пользователя 03.09).
+             ⚠️ Если «отказали все кодеки» вернётся — смотреть CmaFree в
+             момент старта 4K, лечить размером DPB/CMA, а не этим потолком. -->
+        <MediaCodec name="c2.v4l2.vp9.decoder" type="video/x-vnd.on2.vp9">
+            <Limit name="size" min="16x16" max="3840x2176" />
+            <Limit name="alignment" value="2x2" />
+            <Limit name="block-size" value="16x16" />
+            <Limit name="block-count" range="1-33150" />
+            <Limit name="blocks-per-second" range="1-1989000" />
+            <Limit name="bitrate" range="1-100000000" />
+            <Limit name="concurrent-instances" max="1" />
+            <Limit name="performance-point-3840x2160" value="60" />
+            <Limit name="performance-point-1920x1080" value="60" />
+            <Limit name="performance-point-1280x720" value="60" />
+            <Feature name="adaptive-playback" />
+        </MediaCodec>
+    </Decoders>
+
+    <!-- 26.08: включения переведены со СТАРЫХ OMX-файлов (имена OMX.google.*,
+         таких компонентов в Android 16 нет) на c2-варианты с именами
+         c2.android.* — как у референсной платы yukawa (mainline-Amlogic). -->
+    <Include href="media_codecs_google_c2_video.xml" />
+    <Include href="media_codecs_google_c2_audio.xml" />
+
+    <!-- ⛔ ОТКЛЮЧАЕМ ПРОГРАММНЫЙ AV1 (05.09.2026). Аппаратного AV1 на GXM нет,
+         а софтовые декодеры (их ДВА: c2.android.av1.decoder и dav1d-вариант)
+         1080p на 8×A53 в реальном времени не тянут. Пока av01 есть в списке,
+         SmartTube/ExoPlayer выбирает его и уходит в codec2::software: вечная
+         буферизация, аппаратный vdec НЕ вызывается (в dmesg по vdec пусто —
+         симптом «видео не стартует», замерено 05.09). Без av01-декодера
+         YouTube отдаёт тому же ролику дорожку VP9/AVC → её берёт железо.
+         update="true" enabled="false" — штатный путь отключения кодека,
+         объявленного во включённом файле (MediaCodecsXmlParser.cpp:975,1083). -->
+    <MediaCodec name="c2.android.av1.decoder" type="video/av01" update="true" enabled="false" />
+    <MediaCodec name="c2.android.av1-dav1d.decoder" type="video/av01" update="true" enabled="false" />
+</MediaCodecs>

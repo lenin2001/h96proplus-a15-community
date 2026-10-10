@@ -1,0 +1,905 @@
+diff --git a/components/DecodeComponent.cpp b/components/DecodeComponent.cpp
+index 00880d7..b9f0439 100644
+--- a/components/DecodeComponent.cpp
++++ b/components/DecodeComponent.cpp
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-//#define LOG_NDEBUG 0
++#define LOG_NDEBUG 0
+ #define ATRACE_TAG ATRACE_TAG_VIDEO
+ #define LOG_TAG "DecodeComponent"
+ 
+@@ -447,6 +447,7 @@ void DecodeComponent::processCSDWork(const int32_t bitstreamId, const C2Work* wo
+             mPendingColorAspectsChange = true;
+             mPendingColorAspectsChangeFrameIndex = work->input.ordinal.frameIndex.peeku();
+         }
++        mLastCsd = linearBlock; /* h96: запомнить для повтора после flush */
+     }
+ 
+     processWorkBuffer(bitstreamId, linearBlock);
+@@ -704,6 +705,20 @@ void DecodeComponent::flushTask() {
+     mDecoder->flush();
+     reportAbandonedWorks();
+ 
++    /* h96 03.09 (H3): драйвер meson-vdec на flush делает полный teardown (прошивка,
++     * SPS/PPS теряются), а CCodec пересылает CSD только из flushedWork, которого мы не
++     * даём. Для DASH avc1/hvc1 (YouTube AVC) после seek приходили одни слайсы - ни
++     * кадров, ни SOURCE_CHANGE. Повторяем последний CSD первым же буфером. */
++    if (mLastCsd && (mIntfImpl->getVideoCodec() == VideoCodec::H264 ||
++                     mIntfImpl->getVideoCodec() == VideoCodec::HEVC)) {
++        constexpr int32_t kCsdReplayId = -2;
++        mDecoder->decode(std::make_unique<ConstBitstreamBuffer>(kCsdReplayId, *mLastCsd,
++                                                                mLastCsd->offset(),
++                                                                mLastCsd->size()),
++                         ::base::BindOnce([](VideoDecoder::DecodeStatus) {}));
++        ALOGV("h96: CSD replayed after flush");
++    }
++
+     // Pending EOS work will be abandoned here due to component flush if any.
+     mIsDraining = false;
+ }
+diff --git a/components/DecodeInterface.cpp b/components/DecodeInterface.cpp
+index 53689bd..dfb74fc 100644
+--- a/components/DecodeInterface.cpp
++++ b/components/DecodeInterface.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <v4l2_codec2/components/DecodeInterface.h>
+ 
++#include <algorithm>
++
+ #include <C2PlatformSupport.h>
+ #include <SimpleC2Interface.h>
+ #include <android/hardware/graphics/common/1.0/types.h>
+@@ -132,9 +134,29 @@ DecodeInterface::DecodeInterface(const std::string& name,
+         }
+     }
+ 
++    // h96: не заявляем 10-битные профили. Вывод у нас NV12/SDR, а 10-бит
++    // на GXM требует непрерывных FBC-аллокаций, которые тихо не собираются
++    // (26.08: SmartTube выбрал vp9.2 1440p60 HDR — декодер молча не выдал
++    // ни кадра, плеер вечно BUFFERING; ср. hevc-4k-10bit в docs/hevc-testing).
++    // Без этих профилей ExoPlayer сам выбирает vp9 profile 0 или AVC.
++    profiles.erase(std::remove_if(profiles.begin(), profiles.end(),
++                                  [](uint32_t p) {
++                                      return p == C2Config::PROFILE_VP9_2 ||
++                                             p == C2Config::PROFILE_VP9_3 ||
++                                             p == C2Config::PROFILE_HEVC_MAIN_10;
++                                  }),
++                   profiles.end());
++
+     // In case of no supported profile or uninitialized device maxSize is set to default
+     if (maxSize == ui::Size(1, 1)) maxSize = ui::Size(4096, 4096);
+ 
++    // h96: MMAP+CPU-copy output path sustains only ~10 fps at 1080p on the
++    // S912's A53 cores - not realtime, the player starves and deadlocks.
++    // Advertise 720p max so adaptive players pick a stream we can decode
++    // at full speed. Remove when a zero-copy/GE2D output path lands.
++    if (maxSize.width > 1280) maxSize.setWidth(1280);
++    if (maxSize.height > 736) maxSize.setHeight(736);
++
+     if (profiles.empty()) {
+         ALOGW("No supported profiles for H264 codec");
+         switch (*mVideoCodec) {  //default values used when querry is not supported
+@@ -427,13 +449,19 @@ c2_status_t DecodeInterface::queryColorAspects(
+ uint32_t DecodeInterface::getOutputDelay(VideoCodec codec) {
+     switch (codec) {
+     case VideoCodec::H264:
+-        // Due to frame reordering an H264 decoder might need multiple additional input frames to be
+-        // queued before being able to output the associated decoded buffers. We need to tell the
+-        // codec2 framework that it should not stop queuing new work items until the maximum number
+-        // of frame reordering is reached, to avoid stalling the decoder.
+-        return 16;
++        /* h96 (26.08): meson-vdec программирует ПОЛНЫЙ canvas-список на
++         * start_streaming и через min_queued_buffers требует, чтобы ВСЕ
++         * выданные REQBUFS буферы (24 для h264 1080p) были в очереди до
++         * старта. CCodec же ограничивает surface maxDequeue величиной
++         * outputDelay+pipeline(3)+smoothness(4): при 16 это 23 < 24 —
++         * клиент физически не может отдать 24-й буфер, декодер никогда
++         * не стартует (вечное «1+23/24», ни одного done-кадра, SmartTube
++         * навечно в BUFFERING). Поднимаем задержку до max_buffers
++         * платформы, чтобы лимит surface был выше списка драйвера.
++         * То же для HEVC и VP9 (у VP9 8+7=15 < 20 — та же мина). */
++        return 19; /* h96 03.09: 19+4+3=26 > 24 буферов драйвера (+2 у дисплея после seek) */
+     case VideoCodec::HEVC:
+-        return 16;
++        return 19; /* h96 03.09: 19+4+3=26 > 24 буферов драйвера (+2 у дисплея после seek) */
+     case VideoCodec::VP8:
+         // The decoder might held a few frames as a reference for decoding. Since Android T
+         // the Codec2 is more prone to timeout the component if one is not producing frames. This
+@@ -445,7 +473,8 @@ uint32_t DecodeInterface::getOutputDelay(VideoCodec codec) {
+         return 3;
+     case VideoCodec::VP9:
+         // Reference: https://www.webmproject.org/vp9/levels/
+-        return 8;
++        // h96: 24 вместо 8 — см. комментарий у H264 (дедлок canvas-списка).
++        return 19; /* h96 03.09: 19+4+3=26 > 24 буферов драйвера (+2 у дисплея после seek) */
+     }
+ }
+ 
+diff --git a/components/VideoFramePool.cpp b/components/VideoFramePool.cpp
+index 9927acf..fd7bad8 100644
+--- a/components/VideoFramePool.cpp
++++ b/components/VideoFramePool.cpp
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-//#define LOG_NDEBUG 0
++#define LOG_NDEBUG 0
+ #define LOG_TAG "VideoFramePool"
+ 
+ #include <v4l2_codec2/components/VideoFramePool.h>
+@@ -36,6 +36,13 @@ std::optional<uint32_t> VideoFramePool::getBufferIdFromGraphicBlock(C2BlockPool&
+     switch (blockPool.getAllocatorId()) {
+     case V4L2AllocatorId::SECURE_GRAPHIC:
+         FALLTHROUGH;
++    /* h96 (26.08): Android 16 CCodec отдаёт выходные графические блоки через
++     * новый AHardwareBuffer-аллокатор (C2PlatformAllocatorStore::IGBA, id 20).
++     * Такие блоки точно так же dmabuf-backed, поэтому идентификатор буфера
++     * извлекается тем же путём, что и для BUFFERQUEUE. Без этой ветки пул
++     * отвечал «unknown allocator ID: 20» и декодер не мог отдать ни кадра. */
++    case C2PlatformAllocatorStore::IGBA:
++        FALLTHROUGH;
+     case C2PlatformAllocatorStore::BUFFERQUEUE: {
+         auto dmabufId = android::getDmabufId(block.handle()->data[0]);
+         if (!dmabufId) {
+@@ -138,6 +145,10 @@ void VideoFramePool::destroyTask() {
+ }
+ 
+ bool VideoFramePool::shouldDropBuffer(uint32_t bufferId) {
++    /* h96: MMAP-выход с копированием — клиентские блоки одноразовые,
++     * их id не повторяются; ограничение по множеству известных id
++     * зацикливало фетчер (Got/Dropping id по кругу). */
++    return false;
+     if (mBuffers.size() < mMaxBufferCount) {
+         return false;
+     }
+diff --git a/components/include/v4l2_codec2/components/DecodeComponent.h b/components/include/v4l2_codec2/components/DecodeComponent.h
+index 27905c7..d7f463c 100644
+--- a/components/include/v4l2_codec2/components/DecodeComponent.h
++++ b/components/include/v4l2_codec2/components/DecodeComponent.h
+@@ -7,6 +7,7 @@
+ 
+ #include <atomic>
+ #include <memory>
++#include <optional>
+ 
+ #include <C2Component.h>
+ #include <C2ComponentFactory.h>
+@@ -103,6 +104,9 @@ protected:
+     std::shared_ptr<Listener> mListener;
+ 
+     std::unique_ptr<VideoDecoder> mDecoder;
++    /* h96 03.09: последний CSD (SPS/PPS) H264/HEVC - повторяется после flush,
++     * т.к. meson-vdec на STREAMOFF CAPTURE сбрасывает прошивку вместе с параметрами. */
++    std::optional<C2ConstLinearBlock> mLastCsd;
+     // The queue of works that haven't processed and sent to |mDecoder|.
+     std::queue<std::unique_ptr<C2Work>> mPendingWorks;
+     // The works whose input buffers are sent to |mDecoder|. The key is the
+diff --git a/components/include/v4l2_codec2/components/VideoFrame.h b/components/include/v4l2_codec2/components/VideoFrame.h
+index b5d7b99..fc9c4ac 100644
+--- a/components/include/v4l2_codec2/components/VideoFrame.h
++++ b/components/include/v4l2_codec2/components/VideoFrame.h
+@@ -35,6 +35,9 @@ public:
+     // Get the read-only C2GraphicBlock, should be called after calling setVisibleRect().
+     C2ConstGraphicBlock getGraphicBlock();
+ 
++    // h96: записываемый доступ к блоку — выход декодера копируется CPU.
++    C2GraphicBlock* getMutableBlock() { return mGraphicBlock.get(); }
++
+ private:
+     VideoFrame(std::shared_ptr<C2GraphicBlock> block, std::vector<int> fds);
+ 
+diff --git a/service/Android.bp b/service/Android.bp
+index 7a0bc41..46641b1 100644
+--- a/service/Android.bp
++++ b/service/Android.bp
+@@ -13,6 +13,8 @@ cc_defaults {
+     defaults: [
+         "hidl_defaults",
+         "libcodec2-hidl-defaults",
++        // ЛОКАЛЬНАЯ ПРАВКА: служба регистрируется через AIDL, см. service.cpp
++        "libcodec2-aidl-defaults",
+     ],
+     vendor: true,
+     relative_install_path: "hw",
+@@ -27,6 +29,7 @@ cc_defaults {
+         "libavservices_minijail",
+         "libchrome",
+         "libcutils",
++        "libbinder_ndk",
+         "libhidlbase",
+         "liblog",
+         "libutils",
+@@ -50,7 +53,23 @@ cc_binary {
+         "-DV4L2_CODEC2_SERVICE_V4L2_STORE",
+     ],
+ 
+-    compile_multilib: "both",
++    // ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 24.08.2026): было "both".
++    //
++    // Оба .rc объявляют службу с ОДНИМ И ТЕМ ЖЕ именем
++    // `android-hardware-media-c2-v4l2-hal-1-2`, но разными бинарниками.
++    // Init оставляет то определение, что разобрал последним, — и это
++    // оказалась 32-битная служба. Она немедленно умирает:
++    //     libminijail: nonexistent syscall 'mmap' / 'getrlimit' / 'newfstatat'
++    //     libminijail: blocked syscall: mmap2
++    // потому что единственный установленный файл ограничений системных
++    // вызовов написан под 64 бита: на 32-битном ARM эти вызовы называются
++    // mmap2, ugetrlimit, fstatat64, строки отбрасываются, mmap2 в разрешённые
++    // не попадает. Итог — бесконечный перезапуск, а 64-битная служба не
++    // стартует ни разу (проверено на приставке 24.08).
++    //
++    // Нам 32-битный вариант не нужен: приставка 64-битная, кодек живёт в
++    // отдельном процессе. "first" собирает только основную разрядность.
++    compile_multilib: "first",
+     multilib: {
+         lib32: {
+             suffix: "-32",
+diff --git a/service/android.hardware.media.c2@1.2-service-v4l2.xml b/service/android.hardware.media.c2@1.2-service-v4l2.xml
+index 7976a59..dc52f27 100644
+--- a/service/android.hardware.media.c2@1.2-service-v4l2.xml
++++ b/service/android.hardware.media.c2@1.2-service-v4l2.xml
+@@ -1,11 +1,10 @@
+ <manifest version="1.0" type="device">
+-    <hal format="hidl">
+-      <name>android.hardware.media.c2</name>
+-      <transport>hwbinder</transport>
+-      <version>1.2</version>
+-      <interface>
+-          <name>IComponentStore</name>
+-          <instance>default</instance>
+-      </interface>
++    <!-- ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 24.08.2026): было format="hidl".
++         Служба переведена на AIDL, см. service.cpp. Клиент перечисляет
++         ОБЪЯВЛЕННЫЕ экземпляры (AServiceManager_forEachDeclaredInstance),
++         поэтому без этой записи служба останется невидимой, даже работая. -->
++    <hal format="aidl">
++        <name>android.hardware.media.c2</name>
++        <fqname>IComponentStore/default</fqname>
+     </hal>
+ </manifest>
+diff --git a/service/service.cpp b/service/service.cpp
+index 03865ef..8ca4a80 100644
+--- a/service/service.cpp
++++ b/service/service.cpp
+@@ -11,11 +11,32 @@
+ 
+ #include <C2Component.h>
+ #include <base/logging.h>
+-#include <codec2/hidl/1.2/ComponentStore.h>
+-#include <hidl/HidlTransportSupport.h>
+ #include <log/log.h>
+ #include <minijail.h>
+ 
++// ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 24.08.2026): служба переведена с HIDL на AIDL.
++//
++// Причина. Платформа здесь целиком на AIDL: программное хранилище кодеков
++// регистрируется как android.hardware.media.c2.IComponentStore/software (без
++// номера версии — это AIDL). HIDL же на этой сборке МЁРТВ: hwservicemanager не
++// собирался в продукт, а libhidl без него подставляет NoHwServiceManager, у
++// которого add() всегда отказывает. Попытка доставить hwservicemanager СОРВАЛА
++// ЗАГРУЗКУ дважды: с настоящим диспетчером обращения к отсутствующим HIDL-HAL
++// (keymaster, ISystemSuspend, configstore, camera.provider, netd) перестают
++// проваливаться мгновенно и начинают ждать вечно.
++//
++// Обёртки HIDL и AIDL принимают ОДИН И ТОТ ЖЕ std::shared_ptr<C2ComponentStore>
++// (ComponentStore.h:62), поэтому подмена прямая. Образец — сам AOSP,
++// frameworks/av/media/codec2/hal/services/vendor.cpp, функция runAidlService().
++//
++// Имя экземпляра "default" выбрано не произвольно: клиент перечисляет
++// объявленные экземпляры через AServiceManager_forEachDeclaredInstance и
++// сортирует их по префиксу default → vendor → прочие
++// (codec2/hal/client/client.cpp:2356).
++#include <android/binder_manager.h>
++#include <android/binder_process.h>
++#include <codec2/aidl/ComponentStore.h>
++
+ #ifdef V4L2_CODEC2_SERVICE_V4L2_STORE
+ #include <v4l2_codec2/v4l2/V4L2ComponentStore.h>
+ #endif
+@@ -38,35 +59,42 @@ int main(int /* argc */, char** /* argv */) {
+     signal(SIGPIPE, SIG_IGN);
+     android::SetUpMinijail(kBaseSeccompPolicyPath, kExtSeccompPolicyPath);
+ 
+-    // Extra threads may be needed to handle a stacked IPC sequence that
+-    // contains alternating binder and hwbinder calls. (See b/35283480.)
+-    android::hardware::configureRpcThreadpool(16, true /* callerWillJoin */);
++    ABinderProcess_setThreadPoolMaxThreadCount(16);
++    ABinderProcess_startThreadPool();
+ 
+ #if LOG_NDEBUG == 0
+     ALOGD("Enable all verbose logging of libchrome");
+     logging::SetMinLogLevel(-5);
+ #endif
+ 
+-    // Create IComponentStore service.
++    // Create IComponentStore service (AIDL).
+     {
+-        using namespace ::android::hardware::media::c2::V1_2;
+-        android::sp<IComponentStore> store = nullptr;
++        using namespace ::aidl::android::hardware::media::c2;
++        std::shared_ptr<IComponentStore> store;
+ 
+ #ifdef V4L2_CODEC2_SERVICE_V4L2_STORE
+-        ALOGD("Instantiating Codec2's V4L2 IComponentStore service...");
+-        store = new utils::ComponentStore(android::V4L2ComponentStore::Create());
++        ALOGD("Instantiating Codec2's V4L2 IComponentStore service (AIDL)...");
++        store = ::ndk::SharedRefBase::make<utils::ComponentStore>(
++                android::V4L2ComponentStore::Create());
+ #endif
+ 
+         if (store == nullptr) {
+             ALOGE("Cannot create Codec2's IComponentStore service.");
+-        } else if (store->registerAsService("default") != android::OK) {
+-            ALOGE("Cannot register Codec2's IComponentStore service.");
+         } else {
+-            ALOGI("Codec2's IComponentStore service created.");
++            const std::string instanceName =
++                    std::string(IComponentStore::descriptor) + "/default";
++            binder_exception_t ex = AServiceManager_addService(
++                    store->asBinder().get(), instanceName.c_str());
++            if (ex != EX_NONE) {
++                ALOGE("Cannot register Codec2's IComponentStore service \"%s\" (ex=%d).",
++                      instanceName.c_str(), ex);
++            } else {
++                ALOGI("Codec2's IComponentStore service registered: %s", instanceName.c_str());
++            }
+         }
+     }
+ 
+-    android::hardware::joinRpcThreadpool();
++    ABinderProcess_joinThreadPool();
+     ALOGD("Service shutdown.");
+     return 0;
+ }
+diff --git a/v4l2/V4L2Decoder.cpp b/v4l2/V4L2Decoder.cpp
+index d0d862d..1c1c13c 100644
+--- a/v4l2/V4L2Decoder.cpp
++++ b/v4l2/V4L2Decoder.cpp
+@@ -2,13 +2,14 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+-//#define LOG_NDEBUG 0
++#define LOG_NDEBUG 0
+ #define ATRACE_TAG ATRACE_TAG_VIDEO
+ #define LOG_TAG "V4L2Decoder"
+ 
+ #include <v4l2_codec2/v4l2/V4L2Decoder.h>
+ 
+ #include <stdint.h>
++#include <string.h>
+ 
+ #include <algorithm>
+ #include <vector>
+@@ -19,6 +20,7 @@
+ #include <log/log.h>
+ #include <utils/Trace.h>
+ 
++#include <C2Buffer.h>
+ #include <v4l2_codec2/common/Common.h>
+ #include <v4l2_codec2/common/Fourcc.h>
+ #include <v4l2_codec2/common/H264NalParser.h>
+@@ -206,7 +208,15 @@ bool V4L2Decoder::setupInputFormat(const uint32_t inputPixelFormat, const size_t
+     }
+     ALOG_ASSERT(format->fmt.pix_mp.pixelformat == inputPixelFormat);
+ 
+-    if (mInputQueue->allocateBuffers(kNumInputBuffers, V4L2_MEMORY_DMABUF) == 0) {
++    /* h96: вход переведён с DMABUF на MMAP+копирование. Клиентские линейные
++     * блоки C2 приходят из system dma-heap (набор страниц), а meson-vdec
++     * (vb2-dma-contig + esparser) принимает только физически непрерывные
++     * буферы: импорт падал в ядре с «contiguous chunk is too small
++     * 1048576/2097152», VIDIOC_QBUF возвращал ошибку и декодер уходил в
++     * Error. MMAP-буферы выделяет сам драйвер из CMA (512 МиБ), а битстрим
++     * копируется CPU — для 2-5 МБ/с это незаметно. Ровно так же работал
++     * весь наш bring-up декодера (ffmpeg v4l2m2m использует MMAP). */
++    if (mInputQueue->allocateBuffers(kNumInputBuffers, V4L2_MEMORY_MMAP) == 0) {
+         ALOGE("Failed to allocate input buffer.");
+         return false;
+     }
+@@ -227,7 +237,7 @@ bool V4L2Decoder::setupInitialOutput() {
+         return false;
+     }
+ 
+-    if (!startOutputQueue(1, V4L2_MEMORY_DMABUF)) {
++    if (!startOutputQueue(1, V4L2_MEMORY_MMAP)) {
+         ALOGE("Failed to start initialy output queue");
+         return false;
+     }
+@@ -247,12 +257,9 @@ bool V4L2Decoder::setupInitialOutput() {
+         return false;
+     }
+ 
+-    std::vector<int> fds;
+-    for (size_t i = 0; i < mInitialEosBuffer->handle->numFds; i++) {
+-        fds.push_back(mInitialEosBuffer->handle->data[i]);
+-    }
+-
+-    if (!std::move(*eosBuffer).queueDMABuf(fds)) {
++    /* h96: очередь теперь MMAP — пробный EOS-буфер ставим как MMAP,
++     * GraphicBuffer нужен только чтобы объект жил (waitForDRC смотрит id). */
++    if (!std::move(*eosBuffer).queueMMap()) {
+         ALOGE("Failed to queue initial EOS buffer");
+         return false;
+     }
+@@ -341,6 +348,38 @@ bool V4L2Decoder::startOutputQueue(size_t minOutputBuffersCount, enum v4l2_memor
+         return false;
+     }
+ 
++    while (!mDecodedMmapFrames.empty())
++        mDecodedMmapFrames.pop();
++    while (!mReadyClientFrames.empty())
++        mReadyClientFrames.pop();
++    mQuarantineBlocks.clear();
++    mCaptureStride = adjustedFormat->fmt.pix_mp.plane_fmt[0].bytesperline;
++
++    mUseDmabufOutput = (memory == V4L2_MEMORY_DMABUF);
++    if (mUseDmabufOutput) {
++        /* h96 zero-copy: рабочая очередь — DMABUF, клиентские gralloc-блоки
++         * уходят декодеру напрямую, без CPU-копии. Привязка blockId->v4l2Id
++         * СТАТИЧНА на весь стрим: meson vdec защёлкивает канвасы по
++         * физадресам queued-буферов в момент start_streaming, поэтому чужой
++         * fd на уже привязанный индекс отдавать нельзя. vb2 отложит
++         * start_streaming до полного набора QBUF — фетчи блоков раскрутит
++         * changeResolution() после создания пула. */
++        return true;
++    }
++
++    /* h96: MMAP-выход стартовой фиктивной очереди (до SOURCE_CHANGE).
++     * Один буфер оставляем свободным — start() берёт его под пробный
++     * EOS (waitForDRC). */
++    size_t keepFree = (minOutputBuffersCount <= 1) ? 1 : 0;
++    while (mOutputQueue->freeBuffersCount() > keepFree) {
++        auto ob = mOutputQueue->getFreeBuffer();
++        if (!ob) break;
++        if (!std::move(*ob).queueMMap()) {
++            ALOGE("h96: initial MMAP QBUF failed");
++            return false;
++        }
++    }
++
+     return true;
+ }
+ 
+@@ -459,36 +498,9 @@ void V4L2Decoder::pumpDecodeRequest() {
+             return;
+         }
+ 
+-        auto dma_buf_id = getDmabufId(mDecodeRequests.front().buffer->dmabuf.handle()->data[0]);
+-        if (!dma_buf_id) {
+-            ALOGE("Failed to get dmabuf id");
+-            onError();
+-            return;
+-        }
+-
+-        std::optional<V4L2WritableBufferRef> inputBuffer;
+-        size_t targetIndex = 0;
+-
+-        // If there's an existing input buffer for this dma buffer, use it.
+-        for (; targetIndex < mNextInputBufferId; targetIndex++) {
+-            if (mLastDmaBufferId[targetIndex] == dma_buf_id) {
+-                break;
+-            }
+-        }
+-
+-        if (targetIndex < kNumInputBuffers) {
+-            // If we didn't find a buffer and there is an unused buffer, use that one.
+-            if (targetIndex == mNextInputBufferId) {
+-                mNextInputBufferId++;
+-            }
+-
+-            inputBuffer = mInputQueue->getFreeBuffer(targetIndex);
+-        }
+-
+-        // If we didn't find a reusable/unused input buffer, clobber a free one.
+-        if (!inputBuffer) {
+-            inputBuffer = mInputQueue->getFreeBuffer();
+-        }
++        // h96: для MMAP-входа переиспользование буфера по dmabuf-id не имеет
++        // смысла — данные каждый раз копируются в буфер драйвера.
++        std::optional<V4L2WritableBufferRef> inputBuffer = mInputQueue->getFreeBuffer();
+ 
+         // Pause if no free input buffer. We resume decoding after dequeueing input buffers.
+         if (!inputBuffer) {
+@@ -496,8 +508,6 @@ void V4L2Decoder::pumpDecodeRequest() {
+             return;
+         }
+ 
+-        mLastDmaBufferId[inputBuffer->bufferId()] = *dma_buf_id;
+-
+         auto request = std::move(mDecodeRequests.front());
+         mDecodeRequests.pop();
+ 
+@@ -512,13 +522,22 @@ void V4L2Decoder::pumpDecodeRequest() {
+             return;
+         }
+ 
+-        ALOGV("Set bytes_used=%zu, offset=%zu", request.buffer->offset + request.buffer->size,
+-              request.buffer->offset);
+-        inputBuffer->setPlaneDataOffset(0, request.buffer->offset);
+-        inputBuffer->setPlaneBytesUsed(0, request.buffer->offset + request.buffer->size);
+-        std::vector<int> fds;
+-        fds.push_back(std::move(request.buffer->dmabuf.handle()->data[0]));
+-        if (!std::move(*inputBuffer).queueDMABuf(fds)) {
++        C2ReadView view = request.buffer->dmabuf.map().get();
++        if (view.error() != C2_OK) {
++            ALOGE("Failed to map input block, error: %d", view.error());
++            onError();
++            return;
++        }
++        void* dst = inputBuffer->getPlaneMapping(0);
++        if (dst == nullptr) {
++            ALOGE("Failed to map V4L2 MMAP input buffer.");
++            onError();
++            return;
++        }
++        memcpy(dst, view.data(), request.buffer->size);
++        inputBuffer->setPlaneDataOffset(0, 0);
++        inputBuffer->setPlaneBytesUsed(0, request.buffer->size);
++        if (!std::move(*inputBuffer).queueMMap()) {
+             ALOGE("%s(): Failed to QBUF to input queue, bitstreamId=%d", __func__, bitstreamId);
+             onError();
+             return;
+@@ -550,6 +569,15 @@ void V4L2Decoder::flush() {
+     if (mDrainCb) {
+         std::move(mDrainCb).Run(VideoDecoder::DecodeStatus::kAborted);
+     }
++    /* h96 03.09: flush не чистил mDecodeRequests - после seek pumpDecodeRequest
++     * кормил драйвер СТАРЫМИ AU, а их decodeCb приходил в DecodeComponent уже
++     * после reportAbandonedWorks (разыменование end() -> падение c2-сервиса
++     * на втором seek). Все ещё не скормленные запросы - kAborted. */
++    while (!mDecodeRequests.empty()) {
++        DecodeRequest req = std::move(mDecodeRequests.front());
++        mDecodeRequests.pop();
++        if (req.decodeCb) std::move(req.decodeCb).Run(VideoDecoder::DecodeStatus::kAborted);
++    }
+ 
+     // Streamoff both V4L2 queues to drop input and output buffers.
+     const bool isOutputStreaming = mOutputQueue->isStreaming();
+@@ -577,6 +605,23 @@ void V4L2Decoder::flush() {
+     mInputQueue->streamon();
+     if (isOutputStreaming) {
+         mOutputQueue->streamon();
++        if (mUseDmabufOutput) {
++            /* h96 zero-copy: кадры, снятые с драйвера, лежат в
++             * mReuseFrameQueue — tryFetchVideoFrame() вернёт их в свои
++             * слоты (карта статична, физадреса совпадут с канвасами). */
++            tryFetchVideoFrame();
++        } else {
++            /* h96: MMAP — после streamoff все буферы свободны,
++             * возвращаем полный список драйверу. */
++            while (!mDecodedMmapFrames.empty())
++                mDecodedMmapFrames.pop();
++            while (auto ob = mOutputQueue->getFreeBuffer()) {
++                if (!std::move(*ob).queueMMap()) {
++                    ALOGE("h96: flush MMAP re-queue failed");
++                    break;
++                }
++            }
++        }
+     }
+ 
+     // If there is no free buffer at mOutputQueue, tryFetchVideoFrame() should be triggerred after
+@@ -659,32 +704,45 @@ void V4L2Decoder::serviceDeviceTask(bool event) {
+         ALOGV("DQBUF from output queue, bufferId=%zu, bitstreamId=%d, bytesused=%zu, isLast=%d",
+               bufferId, bitstreamId, bytesUsed, isLast);
+ 
+-        // Get the corresponding VideoFrame of the dequeued buffer.
+-        auto it = mFrameAtDevice.find(bufferId);
+-        ALOG_ASSERT(it != mFrameAtDevice.end(), "buffer %zu is not found at mFrameAtDevice",
+-                    bufferId);
+-        auto frame = std::move(it->second);
+-        mFrameAtDevice.erase(it);
+-
+-        if (bytesUsed > 0) {
+-            ALOGV("Send output frame(bitstreamId=%d) to client", bitstreamId);
+-            frame->setBitstreamId(bitstreamId);
+-            frame->setVisibleRect(mVisibleRect);
+-            mOutputCb.Run(std::move(frame));
+-        } else {
+-            // Workaround(b/168750131): If the buffer is not enqueued before the next drain is done,
+-            // then the driver will fail to notify EOS. So we recycle the buffer immediately.
+-            ALOGV("Recycle empty buffer %zu back to V4L2 output queue.", bufferId);
++        if (mUseDmabufOutput) {
++            /* h96 zero-copy: кадр уже в клиентском блоке — отдаём без копии. */
++            auto fIt = mFrameAtDevice.find(bufferId);
++            if (fIt == mFrameAtDevice.end()) {
++                ALOGE("h96: DQBUF for unknown v4l2 slot %zu", bufferId);
++                onError();
++                return;
++            }
++            std::unique_ptr<VideoFrame> frame = std::move(fIt->second);
++            mFrameAtDevice.erase(fIt);
+             dequeuedBuffer.reset();
+-            auto outputBuffer = mOutputQueue->getFreeBuffer(bufferId);
+-            ALOG_ASSERT(outputBuffer, "V4L2 output queue slot %zu is not freed.", bufferId);
+-
+-            if (!std::move(*outputBuffer).queueDMABuf(frame->getFDs())) {
+-                ALOGE("%s(): Failed to recycle empty buffer to output queue.", __func__);
++            if (bytesUsed == 0) {
++                auto ob = mOutputQueue->getFreeBuffer(bufferId);
++                if (!ob || !std::move(*ob).queueDMABuf(frame->getFDs())) {
++                    ALOGE("h96: re-queue empty DMABUF failed");
++                    onError();
++                    return;
++                }
++                mFrameAtDevice.insert_or_assign(bufferId, std::move(frame));
++            } else {
++                frame->setBitstreamId(bitstreamId);
++                frame->setVisibleRect(mVisibleRect);
++                mOutputCb.Run(std::move(frame));
++                tryFetchVideoFrame();
++            }
++        } else if (bytesUsed == 0) {
++            /* h96: MMAP — пустышка (EOS) сразу назад в очередь. */
++            const size_t emptyId = bufferId;
++            dequeuedBuffer.reset();
++            auto ob = mOutputQueue->getFreeBuffer(emptyId);
++            if (ob && !std::move(*ob).queueMMap()) {
++                ALOGE("h96: re-queue empty MMAP buffer failed");
+                 onError();
+                 return;
+             }
+-            mFrameAtDevice.insert(std::make_pair(bufferId, std::move(frame)));
++        } else {
++            mDecodedMmapFrames.push(dequeuedBuffer);
++            tryOutputDecodedFrame();
++            if (mReadyClientFrames.empty()) tryFetchVideoFrame();
+         }
+ 
+         if (mDrainCb && isLast) {
+@@ -786,6 +844,81 @@ bool V4L2Decoder::setupOutputFormat(const ui::Size& size) {
+     return false;
+ }
+ 
++void V4L2Decoder::tryOutputDecodedFrame() {
++    ALOG_ASSERT(mTaskRunner->RunsTasksInCurrentSequence());
++
++    while (!mDecodedMmapFrames.empty() && !mReadyClientFrames.empty()) {
++        V4L2ReadableBufferRef src = mDecodedMmapFrames.front();
++        mDecodedMmapFrames.pop();
++        std::unique_ptr<VideoFrame> frame = std::move(mReadyClientFrames.front());
++        mReadyClientFrames.pop();
++
++        const int32_t bitstreamId = static_cast<int32_t>(src->getTimeStamp().tv_sec);
++        const size_t srcBufferId = src->bufferId();
++
++        C2GraphicBlock* block = frame->getMutableBlock();
++        C2GraphicView view = block->map().get();
++        if (view.error() != C2_OK) {
++            ALOGE("h96: map client block failed: %d", view.error());
++            onError();
++            return;
++        }
++        const C2PlanarLayout& layout = view.layout();
++        uint8_t* dstY = view.data()[C2PlanarLayout::PLANE_Y];
++        uint8_t* dstUV = view.data()[C2PlanarLayout::PLANE_U];
++        const uint32_t dstStrideY = layout.planes[C2PlanarLayout::PLANE_Y].rowInc;
++        const uint32_t dstStrideUV = layout.planes[C2PlanarLayout::PLANE_U].rowInc;
++
++        const uint8_t* srcY = static_cast<const uint8_t*>(src->getPlaneMapping(0));
++        const uint8_t* srcUV = static_cast<const uint8_t*>(src->getPlaneMapping(1));
++        if (!srcY || !srcUV || !dstY || !dstUV) {
++            ALOGE("h96: plane mapping missing (srcY=%p srcUV=%p dstY=%p dstUV=%p)",
++                  srcY, srcUV, dstY, dstUV);
++            onError();
++            return;
++        }
++
++        const uint32_t width = static_cast<uint32_t>(mVisibleRect.width());
++        const uint32_t height = static_cast<uint32_t>(mVisibleRect.height());
++        const uint32_t srcStride = mCaptureStride ? mCaptureStride : width;
++        /* h96: при совпадающих страйдах — одна длинная копия на плоскость. */
++        if (srcStride == dstStrideY && srcStride == width) {
++            memcpy(dstY, srcY, (size_t)srcStride * height);
++        } else {
++            for (uint32_t row = 0; row < height; ++row)
++                memcpy(dstY + row * dstStrideY, srcY + row * srcStride, width);
++        }
++        if (srcStride == dstStrideUV && srcStride == width) {
++            memcpy(dstUV, srcUV, (size_t)srcStride * (height / 2));
++        } else {
++            for (uint32_t row = 0; row < height / 2; ++row)
++                memcpy(dstUV + row * dstStrideUV, srcUV + row * srcStride, width);
++        }
++
++        const bool isLast = src->isLast();
++        src.reset();  /* вернуть MMAP-буфер драйверу */
++        auto ob = mOutputQueue->getFreeBuffer(srcBufferId);
++        if (ob && !std::move(*ob).queueMMap()) {
++            ALOGE("h96: re-queue MMAP buffer failed");
++            onError();
++            return;
++        }
++
++        ALOGV("h96: copied frame bitstreamId=%d to client block", bitstreamId);
++        frame->setBitstreamId(bitstreamId);
++        frame->setVisibleRect(mVisibleRect);
++        mOutputCb.Run(std::move(frame));
++
++        if (mDrainCb && isLast) {
++            std::move(mDrainCb).Run(VideoDecoder::DecodeStatus::kOk);
++            setState(State::Idle);
++        }
++    }
++
++    /* держим небольшой запас клиентских блоков наготове */
++    if (mReadyClientFrames.size() < 8 && mVideoFramePool) tryFetchVideoFrame();
++}
++
+ void V4L2Decoder::tryFetchVideoFrame() {
+     ATRACE_CALL();
+     ALOGV("%s()", __func__);
+@@ -797,8 +930,17 @@ void V4L2Decoder::tryFetchVideoFrame() {
+         return;
+     }
+ 
+-    if (mOutputQueue->freeBuffersCount() == 0) {
+-        ALOGV("No free V4L2 output buffers, ignore.");
++    /* h96: MMAP-выход — клиентские блоки не связаны с V4L2-буферами,
++     * свободных V4L2-буферов по замыслу нет (все у драйвера). Гейт по
++     * freeBuffersCount навечно блокировал фетч. Вместо него — предел
++     * очереди готовых блоков. */
++    if (mUseDmabufOutput) {
++        if (mOutputQueue->freeBuffersCount() == 0) {
++            ALOGV("No free V4L2 output slot, wait for DQBUF.");
++            return;
++        }
++    } else if (mReadyClientFrames.size() >= 10) {
++        ALOGV("Enough client frames queued, ignore.");
+         return;
+     }
+ 
+@@ -840,58 +982,48 @@ void V4L2Decoder::onVideoFrameReady(
+     uint32_t blockId;
+     std::tie(frame, blockId) = std::move(*frameWithBlockId);
+ 
+-    std::optional<V4L2WritableBufferRef> outputBuffer;
+-    // Find the V4L2 buffer that is associated with this block.
+-    auto iter = mBlockIdToV4L2Id.find(blockId);
+-    if (iter != mBlockIdToV4L2Id.end()) {
+-        // If we have met this block in the past, reuse the same V4L2 buffer.
+-        outputBuffer = mOutputQueue->getFreeBuffer(iter->second);
+-        if (!outputBuffer) {
+-            // NOTE(b/281477122): There is a bug in C2BufferQueueBlock. Its buffer queue slots
+-            // cache is inconsistent when MediaSync is used and a buffer with the same dmabuf id
+-            // can be returned twice despite being already in use by V4L2Decoder. We drop the
+-            // buffer here in order to prevent unwanted errors. It is safe, bacause its allocation
+-            // will be kept alive by the C2GraphicBlock instance.
+-            ALOGW("%s(): The frame have been supplied again, despite being already enqueued",
+-                  __func__);
+-            tryFetchVideoFrame();
+-            return;
+-        }
+-    } else if (mBlockIdToV4L2Id.size() < mOutputQueue->allocatedBuffersCount()) {
+-        // If this is the first time we see this block, give it the next
+-        // available V4L2 buffer.
+-        const size_t v4l2BufferId = mBlockIdToV4L2Id.size();
+-        mBlockIdToV4L2Id.emplace(blockId, v4l2BufferId);
+-        outputBuffer = mOutputQueue->getFreeBuffer(v4l2BufferId);
+-        ALOG_ASSERT(v4l2BufferId == outputBuffer->bufferId());
+-    } else {
+-        // If this happens, this is a bug in VideoFramePool. It should never
+-        // provide more blocks than we have V4L2 buffers.
+-        ALOGE("Got more different blocks than we have V4L2 buffers for.");
++    if (!mUseDmabufOutput) {
++        /* h96: MMAP — блок ждёт готовый декодированный кадр для копии. */
++        mReadyClientFrames.push(std::move(frame));
++        tryOutputDecodedFrame();
++        tryFetchVideoFrame();
++        return;
+     }
+ 
+-    if (!outputBuffer) {
+-        ALOGE("V4L2 buffer not available. blockId=%u", blockId);
+-        onError();
++    /* h96 zero-copy: блок отправляется декодеру в свой (навсегда
++     * закреплённый) v4l2-слот. */
++    size_t v4l2Id;
++    auto idIt = mBlockIdToV4L2Id.find(blockId);
++    if (idIt != mBlockIdToV4L2Id.end()) {
++        v4l2Id = idIt->second;
++    } else if (mBlockIdToV4L2Id.size() < mOutputQueue->allocatedBuffersCount()) {
++        v4l2Id = mBlockIdToV4L2Id.size();
++        mBlockIdToV4L2Id.emplace(blockId, v4l2Id);
++        ALOGV("h96: bind block %u -> v4l2 slot %zu", blockId, v4l2Id);
++    } else {
++        /* Незнакомый блок при полной карте: канвасы защёлкнуты, чужой
++         * физадрес декодеру отдавать нельзя. Карантиним, чтобы пул не
++         * гонял его нам по кругу. */
++        ALOGV("h96: quarantine unknown block %u", blockId);
++        mQuarantineBlocks.push_back(std::move(frame));
++        if (mQuarantineBlocks.size() > 4)
++            mQuarantineBlocks.erase(mQuarantineBlocks.begin());
++        tryFetchVideoFrame();
+         return;
+     }
+ 
+-    uint32_t v4l2Id = outputBuffer->bufferId();
+-    ALOGV("QBUF to output queue, blockId=%u, V4L2Id=%u", blockId, v4l2Id);
+-
+-    if (!std::move(*outputBuffer).queueDMABuf(frame->getFDs())) {
+-        ALOGE("%s(): Failed to QBUF to output queue, blockId=%u, V4L2Id=%u", __func__, blockId,
+-              v4l2Id);
++    auto ob = mOutputQueue->getFreeBuffer(v4l2Id);
++    if (!ob) {
++        ALOGE("h96: v4l2 slot %zu busy for block %u", v4l2Id, blockId);
+         onError();
+         return;
+     }
+-    if (mFrameAtDevice.find(v4l2Id) != mFrameAtDevice.end()) {
+-        ALOGE("%s(): V4L2 buffer %d already enqueued.", __func__, v4l2Id);
++    if (!std::move(*ob).queueDMABuf(frame->getFDs())) {
++        ALOGE("h96: queueDMABuf failed (block %u, slot %zu)", blockId, v4l2Id);
+         onError();
+         return;
+     }
+-    mFrameAtDevice.insert(std::make_pair(v4l2Id, std::move(frame)));
+-
++    mFrameAtDevice.insert_or_assign(v4l2Id, std::move(frame));
+     tryFetchVideoFrame();
+ }
+ 
+diff --git a/v4l2/V4L2Device.cpp b/v4l2/V4L2Device.cpp
+index 0190deb..c235830 100644
+--- a/v4l2/V4L2Device.cpp
++++ b/v4l2/V4L2Device.cpp
+@@ -154,8 +154,10 @@ V4L2Buffer::V4L2Buffer(scoped_refptr<V4L2Device> device, enum v4l2_buf_type type
+             std::min(static_cast<size_t>(format.fmt.pix_mp.num_planes), base::size(mV4l2Planes));
+     mV4l2Buffer.index = bufferId;
+     mV4l2Buffer.type = type;
++    /* h96: ChromeOS-форк жёстко перебивал memory на DMABUF, из-за чего
++     * MMAP-очереди были невозможны (getPlaneMapping отказывал: «non-MMAP
++     * buffer»). Уважаем параметр вызывающего. */
+     mV4l2Buffer.memory = memory;
+-    mV4l2Buffer.memory = V4L2_MEMORY_DMABUF;
+     mPlaneMappings.resize(mV4l2Buffer.length);
+ }
+ 
+@@ -806,6 +808,12 @@ size_t V4L2Queue::allocateBuffers(size_t count, enum v4l2_memory memory) {
+     reqbufs.count = count;
+     reqbufs.type = mType;
+     reqbufs.memory = memory;
++    /* h96: для MMAP-выхода просим НЕкогерентные (кэшируемые) буферы —
++     * CPU-копия кадра из некэшируемой памяти шла ~4 fps. vb2 сам
++     * инвалидирует кэш на DQBUF; на драйверах без поддержки флаг
++     * молча игнорируется (тогда останется медленный путь). */
++    if (memory == V4L2_MEMORY_MMAP && V4L2_TYPE_IS_CAPTURE(mType))
++        reqbufs.flags |= V4L2_MEMORY_FLAG_NON_COHERENT;
+     ALOGVQ("Requesting %zu buffers.", count);
+ 
+     ret = mDevice->ioctl(VIDIOC_REQBUFS, &reqbufs);
+@@ -814,6 +822,10 @@ size_t V4L2Queue::allocateBuffers(size_t count, enum v4l2_memory memory) {
+         return 0;
+     }
+     ALOGVQ("Queue %u: got %u buffers.", mType, reqbufs.count);
++    if (memory == V4L2_MEMORY_MMAP && V4L2_TYPE_IS_CAPTURE(mType))
++        ALOGI("h96 reqbufs: flags after=0x%x caps=0x%x (non-coherent %s)",
++              reqbufs.flags, reqbufs.capabilities,
++              (reqbufs.flags & V4L2_MEMORY_FLAG_NON_COHERENT) ? "KEPT" : "DROPPED");
+ 
+     mMemory = memory;
+ 
+diff --git a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+index e569c1c..c955e5a 100644
+--- a/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
++++ b/v4l2/include/v4l2_codec2/v4l2/V4L2Decoder.h
+@@ -152,6 +152,14 @@ private:
+     // V4L2 buffer index.
+     std::map<size_t, size_t> mBlockIdToV4L2Id;
+ 
++    // h96: MMAP-выход с копированием (см. комментарий в startOutputQueue).
++    std::queue<std::unique_ptr<VideoFrame>> mReadyClientFrames;
++    std::queue<V4L2ReadableBufferRef> mDecodedMmapFrames;
++    uint32_t mCaptureStride = 0;
++    bool mUseDmabufOutput = false;
++    std::vector<std::unique_ptr<VideoFrame>> mQuarantineBlocks;
++    void tryOutputDecodedFrame();
++
+     State mState = State::Idle;
+ 
+     scoped_refptr<::base::SequencedTaskRunner> mTaskRunner;

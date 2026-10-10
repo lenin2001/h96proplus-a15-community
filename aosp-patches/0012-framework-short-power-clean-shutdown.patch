@@ -1,0 +1,48 @@
+H96: route short POWER through Android's normal shutdown sequence.
+
+Requires the matching device overlay (value 100) and RAW meson-ir input.
+No bootloader modifications; IR cold-start capability must be tested separately.
+
+--- a/services/core/java/com/android/server/policy/PhoneWindowManager.java
++++ b/services/core/java/com/android/server/policy/PhoneWindowManager.java
+@@ -284,6 +284,8 @@
+     // must match: config_shortPressOnPowerBehavior in config.xml
+     // The config value can be overridden using Settings.Global.POWER_BUTTON_SHORT_PRESS
+-    static final int SHORT_PRESS_POWER_NOTHING = 0;
++    // H96 device overlay: explicit full shutdown, not a sleep/wake shortcut.
++    static final int SHORT_PRESS_POWER_SHUTDOWN_NO_CONFIRM = 100;
++    static final int SHORT_PRESS_POWER_NOTHING = 0;
+     static final int SHORT_PRESS_POWER_GO_TO_SLEEP = 1;
+     static final int SHORT_PRESS_POWER_REALLY_GO_TO_SLEEP = 2;
+     static final int SHORT_PRESS_POWER_REALLY_GO_TO_SLEEP_AND_GO_HOME = 3;
+@@ -1137,6 +1139,12 @@
+             Slog.d(TAG, "No behavior defined for power press count " + count);
+         } else if (count == 1 && shouldHandleShortPressPowerAction(interactive, eventTime)) {
+-            switch (mShortPressOnPowerBehavior) {
++            switch (mShortPressOnPowerBehavior) {
++                case SHORT_PRESS_POWER_SHUTDOWN_NO_CONFIRM:
++                    if (!ActivityManager.isUserAMonkey()) {
++                        sendCloseSystemWindows(SYSTEM_DIALOG_REASON_GLOBAL_ACTIONS);
++                        mWindowManagerFuncs.shutdown(false);
++                    }
++                    break;
+                 case SHORT_PRESS_POWER_NOTHING:
+                     break;
+                 case SHORT_PRESS_POWER_GO_TO_SLEEP:
+@@ -2932,9 +2940,12 @@
+             }
+ 
+-            mShortPressOnPowerBehavior = Settings.Global.getInt(resolver,
+-                    Settings.Global.POWER_BUTTON_SHORT_PRESS,
+-                    mContext.getResources().getInteger(
+-                            com.android.internal.R.integer.config_shortPressOnPowerBehavior));
++            final int shortPressDefault = mContext.getResources().getInteger(
++                    com.android.internal.R.integer.config_shortPressOnPowerBehavior);
++            // An old sleep preference in /data must not override the box's
++            // explicit poweroff policy. Other devices keep stock behavior.
++            mShortPressOnPowerBehavior = shortPressDefault == SHORT_PRESS_POWER_SHUTDOWN_NO_CONFIRM
++                    ? shortPressDefault : Settings.Global.getInt(resolver,
++                            Settings.Global.POWER_BUTTON_SHORT_PRESS, shortPressDefault);
+             mDoublePressOnPowerBehavior = Settings.Global.getInt(resolver,
+                     Settings.Global.POWER_BUTTON_DOUBLE_PRESS,
+                     mContext.getResources().getInteger(

@@ -1,0 +1,103 @@
+HEVC/VP9: единый dmabuf от gralloc — цветность писалась поверх люмы
+
+Симптом: HEVC и VP9 играют ЗЕЛЁНЫМ (яркость местами есть, цвета нет),
+AVC при этом в порядке.
+
+Доказательство картой буфера на живой приставке (flat red, ядро #49):
+  AVC : [0..2088960) люма 0x51, дальше цветность 5a f0      — эталон
+  HEVC: [0..1036800) цветность 5a f0 (затёрла люму!),
+        [1036800..2073600) люма 0x51, дальше нетронутые нули
+  VP9 : байт в байт как HEVC
+
+Механизм: Android gralloc отдаёт NV12 одним dmabuf на обе плоскости, а
+vb2-dma-contig игнорирует смещение плоскости при импорте — адрес
+плоскости 1 равен адресу плоскости 0. Ядро HEVC/VP9 писало цветность с
+нулевого смещения (поверх люмы), потребитель ищет её по
+stride*ALIGN(h,32) и находит нули: U=V=0 => RGB(0,135,0), тот самый
+зелёный.
+
+Ровно этот баг был закрыт 26.08 для первого декодерного ядра
+(set_canvas_nv12m в vdec_helpers.c), но у HEVC-ядра свой путь адресов,
+и он поправки не получал.
+
+Правка: помощник codec_hevc_chroma_paddr() в codec_hevc_common.h и
+замена в 4 местах: таблица ANC2AXI (опорные чтения предсказания, оба
+пути gxbb/gxl) и HEVC_SAO_C_START_ADDR/WPTR (запись кадра) в vp9 и
+hevc. Адреса записи и опорных чтений обязаны совпадать, иначе поедет
+межкадровое предсказание цветности.
+
+Для буферов с настоящими двумя плоскостями (paddr не совпадают)
+поведение не меняется.
+
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc.c b/drivers/staging/media/meson/vdec/codec_hevc.c
+index 3c32f0d2a..317bbf38e 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc.c
+@@ -855,8 +855,7 @@ codec_hevc_set_sao(struct amvdec_session *sess, struct hevc_frame *frame)
+ 	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M) {
+ 		buf_y_paddr =
+ 		       vb2_dma_contig_plane_dma_addr(vb, 0);
+-		buf_u_v_paddr =
+-		       vb2_dma_contig_plane_dma_addr(vb, 1);
++		buf_u_v_paddr = codec_hevc_chroma_paddr(sess, vb);
+ 		amvdec_write_dos(core, HEVC_SAO_Y_START_ADDR, buf_y_paddr);
+ 		amvdec_write_dos(core, HEVC_SAO_C_START_ADDR, buf_u_v_paddr);
+ 		amvdec_write_dos(core, HEVC_SAO_Y_WPTR, buf_y_paddr);
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc_common.c b/drivers/staging/media/meson/vdec/codec_hevc_common.c
+index 1c74b4837..b28c5d0ad 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.c
+@@ -94,7 +94,7 @@ static void codec_hevc_setup_buffers_gxbb(struct amvdec_session *sess,
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR,
+ 					 val);
+ 		} else {
+-			buf_uv_paddr = vb2_dma_contig_plane_dma_addr(vb, 1);
++			buf_uv_paddr = codec_hevc_chroma_paddr(sess, vb);
+ 			val = buf_y_paddr | ((idx * 2) << 8) | 1;
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR,
+ 					 val);
+@@ -151,7 +151,7 @@ static void codec_hevc_setup_buffers_gxl(struct amvdec_session *sess,
+ 				 buf_y_paddr >> 5);
+ 
+ 		if (!codec_hevc_use_fbc(pixfmt_cap, is_10bit)) {
+-			buf_uv_paddr = vb2_dma_contig_plane_dma_addr(vb, 1);
++			buf_uv_paddr = codec_hevc_chroma_paddr(sess, vb);
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_DATA,
+ 					 buf_uv_paddr >> 5);
+ 		}
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc_common.h b/drivers/staging/media/meson/vdec/codec_hevc_common.h
+index 13f9f1d90..0cb525456 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.h
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.h
+@@ -9,6 +9,31 @@
+ 
+ #include "vdec.h"
+ 
++#include <media/videobuf2-dma-contig.h>
++
++/* h96 (01.09.2026): Android gralloc отдаёт NV12 одним dmabuf, а
++ * vb2-dma-contig игнорирует смещение плоскости при импорте — адрес
++ * плоскости 1 совпадает с плоскостью 0. Без поправки цветность пишется
++ * поверх люмы с нулевого смещения, а потребитель ищет её по
++ * stride*ALIGN(h,32) и находит нули (зелёный кадр). Та же поправка, что
++ * в set_canvas_nv12m (vdec_helpers.c) от 26.08. Раскладка minigbm:
++ * stride = ALIGN(width, 64), цветность после ALIGN(height, 32) строк
++ * люмы. Для ширин, не кратных 64, внутренний страйд HEVC-ядра может
++ * разойтись с gralloc — на типовых 1280/1920/3840 совпадает. */
++static inline dma_addr_t
++codec_hevc_chroma_paddr(struct amvdec_session *sess, struct vb2_buffer *vb)
++{
++	dma_addr_t buf_y = vb2_dma_contig_plane_dma_addr(vb, 0);
++	dma_addr_t buf_uv = vb2_dma_contig_plane_dma_addr(vb, 1);
++
++	if (buf_uv == buf_y)
++		buf_uv = buf_y +
++			 (dma_addr_t)ALIGN(sess->width, 64) *
++			 ALIGN(sess->height, 32);
++
++	return buf_uv;
++}
++
+ #define PARSER_CMD_SKIP_CFG_0 0x0000090b
+ #define PARSER_CMD_SKIP_CFG_1 0x1b14140f
+ #define PARSER_CMD_SKIP_CFG_2 0x001b1910

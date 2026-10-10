@@ -1,0 +1,63 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0037] meson-vdec: VP9/HEVC ISR must not start a picture once teardown began
+
+vdec_stop_streaming() sets sess->stopping before vdec_poweroff() drains the codec.
+A picture interrupt that the threaded ISR handles after drain() has returned the
+DPB (flush_output) and reset the reference map started a new picture anyway: it
+took a CAPTURE buffer that nothing returned any more (vb2 WARN in
+__vb2_queue_cancel: "stop_streaming operation is leaving buffer N in active
+state") and decoded an inter frame with no references ("codec_vp9_sync_ref:
+couldn't find VP9 ref -1", seen on #90 with a slowed client). The threaded ISR
+now leaves the picture alone when stopping is set. flush_output()/stop() take
+the same codec lock, so the ISR either finishes before the flush (and its buffer
+is returned by it) or sees stopping. stopping is only cleared when streaming
+resumes, and a STREAMOFF of either queue in RUNNING always runs the full teardown,
+so the flag cannot stay set on a running session.
+
+Validated on #98: 20 VP9 seeks at full speed and 15 with the client slowed to
+~14 fps (capture hook computing a CRC of every destination frame): no 'ref -1',
+no 'active state', no WARN; 10 VP9<->HEVC session switches with a seek in each.
+
+---
+diff -ruN s95/drivers/staging/media/meson/vdec/codec_hevc.c s37/drivers/staging/media/meson/vdec/codec_hevc.c
+--- a/drivers/staging/media/meson/vdec/codec_hevc.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc.c
+@@ -1491,6 +1491,17 @@
+ 		return IRQ_HANDLED;
+ 
+ 	mutex_lock(&hevc->lock);
++	/*
++	 * h96 0037 (24.09.2026): teardown already started. vdec_poweroff() has
++	 * (or is about to have) flushed the frame list and reset the reference
++	 * map; starting this picture now takes a CAPTURE buffer that nothing
++	 * returns (vb2: "leaving buffer N in active state") and decodes an
++	 * inter frame with no references ("couldn't find VP9 ref -1").
++	 * stopping is set first thing in vdec_stop_streaming() and only cleared
++	 * when streaming resumes; the codec lock orders it against drain().
++	 */
++	if (READ_ONCE(sess->stopping))
++		goto unlock;
+ 	if (dec_status != HEVC_SLICE_SEGMENT_DONE) {
+ 		dev_err(core->dev_dec, "Unrecognized dec_status: %08X\n",
+ 			dec_status);
+diff -ruN s95/drivers/staging/media/meson/vdec/codec_vp9.c s37/drivers/staging/media/meson/vdec/codec_vp9.c
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -2554,6 +2554,17 @@
+ 		return IRQ_HANDLED;
+ 
+ 	mutex_lock(&vp9->lock);
++	/*
++	 * h96 0037 (24.09.2026): teardown already started. vdec_poweroff() has
++	 * (or is about to have) flushed the frame list and reset the reference
++	 * map; starting this picture now takes a CAPTURE buffer that nothing
++	 * returns (vb2: "leaving buffer N in active state") and decodes an
++	 * inter frame with no references ("couldn't find VP9 ref -1").
++	 * stopping is set first thing in vdec_stop_streaming() and only cleared
++	 * when streaming resumes; the codec lock orders it against drain().
++	 */
++	if (READ_ONCE(sess->stopping))
++		goto unlock;
+ 	if (dec_status != VP9_HEAD_PARSER_DONE) {
+ 		dev_err(core->dev_dec, "Unrecognized dec_status: %08X\n",
+ 			dec_status);

@@ -1,0 +1,163 @@
+diff --git a/service/Android.bp b/service/Android.bp
+index 7a0bc41..46641b1 100644
+--- a/service/Android.bp
++++ b/service/Android.bp
+@@ -13,6 +13,8 @@ cc_defaults {
+     defaults: [
+         "hidl_defaults",
+         "libcodec2-hidl-defaults",
++        // ЛОКАЛЬНАЯ ПРАВКА: служба регистрируется через AIDL, см. service.cpp
++        "libcodec2-aidl-defaults",
+     ],
+     vendor: true,
+     relative_install_path: "hw",
+@@ -27,6 +29,7 @@ cc_defaults {
+         "libavservices_minijail",
+         "libchrome",
+         "libcutils",
++        "libbinder_ndk",
+         "libhidlbase",
+         "liblog",
+         "libutils",
+@@ -50,7 +53,23 @@ cc_binary {
+         "-DV4L2_CODEC2_SERVICE_V4L2_STORE",
+     ],
+ 
+-    compile_multilib: "both",
++    // ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 24.08.2026): было "both".
++    //
++    // Оба .rc объявляют службу с ОДНИМ И ТЕМ ЖЕ именем
++    // `android-hardware-media-c2-v4l2-hal-1-2`, но разными бинарниками.
++    // Init оставляет то определение, что разобрал последним, — и это
++    // оказалась 32-битная служба. Она немедленно умирает:
++    //     libminijail: nonexistent syscall 'mmap' / 'getrlimit' / 'newfstatat'
++    //     libminijail: blocked syscall: mmap2
++    // потому что единственный установленный файл ограничений системных
++    // вызовов написан под 64 бита: на 32-битном ARM эти вызовы называются
++    // mmap2, ugetrlimit, fstatat64, строки отбрасываются, mmap2 в разрешённые
++    // не попадает. Итог — бесконечный перезапуск, а 64-битная служба не
++    // стартует ни разу (проверено на приставке 24.08).
++    //
++    // Нам 32-битный вариант не нужен: приставка 64-битная, кодек живёт в
++    // отдельном процессе. "first" собирает только основную разрядность.
++    compile_multilib: "first",
+     multilib: {
+         lib32: {
+             suffix: "-32",
+diff --git a/service/android.hardware.media.c2@1.2-service-v4l2.xml b/service/android.hardware.media.c2@1.2-service-v4l2.xml
+index 7976a59..dc52f27 100644
+--- a/service/android.hardware.media.c2@1.2-service-v4l2.xml
++++ b/service/android.hardware.media.c2@1.2-service-v4l2.xml
+@@ -1,11 +1,10 @@
+ <manifest version="1.0" type="device">
+-    <hal format="hidl">
+-      <name>android.hardware.media.c2</name>
+-      <transport>hwbinder</transport>
+-      <version>1.2</version>
+-      <interface>
+-          <name>IComponentStore</name>
+-          <instance>default</instance>
+-      </interface>
++    <!-- ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 24.08.2026): было format="hidl".
++         Служба переведена на AIDL, см. service.cpp. Клиент перечисляет
++         ОБЪЯВЛЕННЫЕ экземпляры (AServiceManager_forEachDeclaredInstance),
++         поэтому без этой записи служба останется невидимой, даже работая. -->
++    <hal format="aidl">
++        <name>android.hardware.media.c2</name>
++        <fqname>IComponentStore/default</fqname>
+     </hal>
+ </manifest>
+diff --git a/service/service.cpp b/service/service.cpp
+index 03865ef..8ca4a80 100644
+--- a/service/service.cpp
++++ b/service/service.cpp
+@@ -11,11 +11,32 @@
+ 
+ #include <C2Component.h>
+ #include <base/logging.h>
+-#include <codec2/hidl/1.2/ComponentStore.h>
+-#include <hidl/HidlTransportSupport.h>
+ #include <log/log.h>
+ #include <minijail.h>
+ 
++// ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 24.08.2026): служба переведена с HIDL на AIDL.
++//
++// Причина. Платформа здесь целиком на AIDL: программное хранилище кодеков
++// регистрируется как android.hardware.media.c2.IComponentStore/software (без
++// номера версии — это AIDL). HIDL же на этой сборке МЁРТВ: hwservicemanager не
++// собирался в продукт, а libhidl без него подставляет NoHwServiceManager, у
++// которого add() всегда отказывает. Попытка доставить hwservicemanager СОРВАЛА
++// ЗАГРУЗКУ дважды: с настоящим диспетчером обращения к отсутствующим HIDL-HAL
++// (keymaster, ISystemSuspend, configstore, camera.provider, netd) перестают
++// проваливаться мгновенно и начинают ждать вечно.
++//
++// Обёртки HIDL и AIDL принимают ОДИН И ТОТ ЖЕ std::shared_ptr<C2ComponentStore>
++// (ComponentStore.h:62), поэтому подмена прямая. Образец — сам AOSP,
++// frameworks/av/media/codec2/hal/services/vendor.cpp, функция runAidlService().
++//
++// Имя экземпляра "default" выбрано не произвольно: клиент перечисляет
++// объявленные экземпляры через AServiceManager_forEachDeclaredInstance и
++// сортирует их по префиксу default → vendor → прочие
++// (codec2/hal/client/client.cpp:2356).
++#include <android/binder_manager.h>
++#include <android/binder_process.h>
++#include <codec2/aidl/ComponentStore.h>
++
+ #ifdef V4L2_CODEC2_SERVICE_V4L2_STORE
+ #include <v4l2_codec2/v4l2/V4L2ComponentStore.h>
+ #endif
+@@ -38,35 +59,42 @@ int main(int /* argc */, char** /* argv */) {
+     signal(SIGPIPE, SIG_IGN);
+     android::SetUpMinijail(kBaseSeccompPolicyPath, kExtSeccompPolicyPath);
+ 
+-    // Extra threads may be needed to handle a stacked IPC sequence that
+-    // contains alternating binder and hwbinder calls. (See b/35283480.)
+-    android::hardware::configureRpcThreadpool(16, true /* callerWillJoin */);
++    ABinderProcess_setThreadPoolMaxThreadCount(16);
++    ABinderProcess_startThreadPool();
+ 
+ #if LOG_NDEBUG == 0
+     ALOGD("Enable all verbose logging of libchrome");
+     logging::SetMinLogLevel(-5);
+ #endif
+ 
+-    // Create IComponentStore service.
++    // Create IComponentStore service (AIDL).
+     {
+-        using namespace ::android::hardware::media::c2::V1_2;
+-        android::sp<IComponentStore> store = nullptr;
++        using namespace ::aidl::android::hardware::media::c2;
++        std::shared_ptr<IComponentStore> store;
+ 
+ #ifdef V4L2_CODEC2_SERVICE_V4L2_STORE
+-        ALOGD("Instantiating Codec2's V4L2 IComponentStore service...");
+-        store = new utils::ComponentStore(android::V4L2ComponentStore::Create());
++        ALOGD("Instantiating Codec2's V4L2 IComponentStore service (AIDL)...");
++        store = ::ndk::SharedRefBase::make<utils::ComponentStore>(
++                android::V4L2ComponentStore::Create());
+ #endif
+ 
+         if (store == nullptr) {
+             ALOGE("Cannot create Codec2's IComponentStore service.");
+-        } else if (store->registerAsService("default") != android::OK) {
+-            ALOGE("Cannot register Codec2's IComponentStore service.");
+         } else {
+-            ALOGI("Codec2's IComponentStore service created.");
++            const std::string instanceName =
++                    std::string(IComponentStore::descriptor) + "/default";
++            binder_exception_t ex = AServiceManager_addService(
++                    store->asBinder().get(), instanceName.c_str());
++            if (ex != EX_NONE) {
++                ALOGE("Cannot register Codec2's IComponentStore service \"%s\" (ex=%d).",
++                      instanceName.c_str(), ex);
++            } else {
++                ALOGI("Codec2's IComponentStore service registered: %s", instanceName.c_str());
++            }
+         }
+     }
+ 
+-    android::hardware::joinRpcThreadpool();
++    ABinderProcess_joinThreadPool();
+     ALOGD("Service shutdown.");
+     return 0;
+ }

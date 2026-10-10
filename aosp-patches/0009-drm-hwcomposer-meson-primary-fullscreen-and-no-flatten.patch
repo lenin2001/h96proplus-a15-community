@@ -1,0 +1,75 @@
+diff --git a/backend/Backend.cpp b/backend/Backend.cpp
+index 91cb84d..d5978d5 100644
+--- a/backend/Backend.cpp
++++ b/backend/Backend.cpp
+@@ -94,7 +94,35 @@ bool Backend::IsClientLayer(HwcDisplay *display, HwcLayer *layer) {
+   return !HardwareSupportsLayerType(layer->GetSfType()) ||
+          !layer->IsLayerUsableAsDevice() || display->CtmByGpu() ||
+          (layer->GetLayerData().pi.RequireScalingOrPhasing() &&
+-          display->GetHwc()->GetResMan().ForcedScalingWithGpu());
++          display->GetHwc()->GetResMan().ForcedScalingWithGpu()) ||
++         ForceClientForMesonPrimary(layer);
++}
++
++/*
++ * h96 (04.09.2026): Amlogic meson-drm exposes exactly two planes with fixed
++ * roles - the PRIMARY (OSD) accepts only RGB and its atomic_check demands the
++ * plane cover the ENTIRE CRTC ("Plane must cover entire CRTC", -EINVAL), while
++ * the OVERLAY (VD1) accepts only YUV and may be positioned/scaled freely.
++ *
++ * The generic backend does not know the primary must be full-screen, so during
++ * video playback with on-screen controls it happily assigns a PARTIAL RGB UI
++ * layer (e.g. a seek bar at x=1456) to the primary plane. meson then rejects
++ * the whole atomic commit and drm_hwcomposer falls back to full CLIENT
++ * composition - which drags the NV12 video into the GPU client target, where
++ * Mesa/Panfrost cannot import it and the video goes black under the controls.
++ *
++ * On this hardware an RGB layer can ONLY ever live on the primary plane (the
++ * overlay is YUV-only). Forcing every RGB layer to CLIENT means the primary
++ * always receives the single full-screen client target (never a partial device
++ * layer), satisfying the full-CRTC rule, while the YUV video keeps the overlay
++ * plane as an underlay. SF punches a transparent hole in the client target for
++ * the device video layer, so the controls draw over the still-visible video.
++ */
++bool Backend::ForceClientForMesonPrimary(HwcLayer *layer) {
++  const auto &bi = layer->GetLayerData().bi;
++  if (!bi)
++    return false;
++  return BufferInfoGetter::IsDrmFormatRgb(bi->format);
+ }
+ 
+ bool Backend::HardwareSupportsLayerType(HWC2::Composition comp_type) {
+diff --git a/backend/Backend.h b/backend/Backend.h
+index c24e818..0c7b2bf 100644
+--- a/backend/Backend.h
++++ b/backend/Backend.h
+@@ -30,6 +30,7 @@ class Backend {
+   virtual bool IsClientLayer(HwcDisplay *display, HwcLayer *layer);
+ 
+  protected:
++  static bool ForceClientForMesonPrimary(HwcLayer *layer);
+   static bool HardwareSupportsLayerType(HWC2::Composition comp_type);
+   static uint32_t CalcPixOps(const std::vector<HwcLayer *> &layers,
+                              size_t first_z, size_t size);
+diff --git a/hwc2_device/HwcDisplay.cpp b/hwc2_device/HwcDisplay.cpp
+index 0503f39..0ccd100 100644
+--- a/hwc2_device/HwcDisplay.cpp
++++ b/hwc2_device/HwcDisplay.cpp
+@@ -352,7 +352,16 @@ HWC2::Error HwcDisplay::Init() {
+     }
+     auto flatcbk = (struct FlatConCallbacks){
+         .trigger = [this]() { hwc_->SendRefreshEventToClient(handle_); }};
+-    flatcon_ = FlatteningController::CreateInstance(flatcbk);
++    /*
++     * h96 (04.09.2026): flattening OTKLYUCHEN. Na Amlogic meson video idet
++     * apparatnym underlay-planom VD1 (NV12), kotoryj Mesa/Panfrost ne mozhet
++     * importirovat' v GPU-kompoziciyu. FlatteningController cherez 1 s staticheskoj
++     * sceny (pauza, pokaz OSD bez dvizheniya) skleivaet VSE sloi v odin klientskij
++     * kadr - i video-plane gasnet, a NV12 v GPU-target ne popadaet: na pauze video
++     * chernelo. Dlya video-pristavki ekonomiya energii ot flattening ne stoit etogo.
++     */
++    (void)flatcbk;
++    flatcon_ = nullptr;
+   }
+ 
+   client_layer_.SetLayerBlendMode(HWC2_BLEND_MODE_PREMULTIPLIED);

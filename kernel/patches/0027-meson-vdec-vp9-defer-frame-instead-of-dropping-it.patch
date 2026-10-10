@@ -1,0 +1,544 @@
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc_common.c b/drivers/staging/media/meson/vdec/codec_hevc_common.c
+index 8c72fc3bf..aaa785d75 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.c
+@@ -334,6 +334,62 @@ int codec_hevc_setup_buffers(struct amvdec_session *sess,
+ }
+ EXPORT_SYMBOL_GPL(codec_hevc_setup_buffers);
+ 
++/*
++ * h96 0027 (12.09.2026): perezapis' TOL'KO tablicy referensov ANC2AXI, BEZ
++ * kakih-libo allokacij.
++ *
++ * ZACHEM. Tablica pishetsya avtoinkrementom celikom, po odnomu slotu na indeks
++ * DPB. Slot dlya indeksa, kotoryj na moment proshloj zapisi eshche ne byl
++ * zamaplen (vb2_plane_cookie() == NULL), poluchil carry-forward - adres CHUZHOGO
++ * bufera (vetka last_y/last_uv v codec_hevc_setup_buffers_gxl, kommentarij
++ * "Variant B" ot 05.09.2026). Kadr v takoj bufer zapishetsya verno
++ * (codec_vp9_set_sao daet nastoyashchij adres zapisi), a vot posleduyushchie
++ * kadry prochtut ego kak REFERENS po chuzhomu adresu - eto i est' kvadraty /
++ * vertikal'nye polosy musora. U H264 dyru zakryvaet .program_capture_buf
++ * (amvdec_reprogram_canvas_slot), u VP9 takogo puti do sih por ne bylo.
++ *
++ * POCHEMU NEL'ZYA prosto pozvat' codec_hevc_setup_buffers(): na 10-bit ona
++ * uhodit v codec_hevc_alloc_fbc_buffers(), a ta perezapisyvaet
++ * comm->fbc_buffer_vaddr[] ne osvobozhdaya staroe - tech' po celomu FBC-naboru
++ * na kazhdyj vyzov iz goryachego puti QBUF.
++ *
++ * OGRANICHENIE (soznatel'noe). Vyhodim srazu, esli ispol'zuyutsya MMU/FBC/
++ * downsample, t.e. na 10-bit. Tam adres beretsya iz comm->fbc_buffer_paddr[idx]
++ * / mmu_header_paddr[idx] PO INDEKSU i carry-forward nevozmozhen v printsipe,
++ * tak chto chinit' nechego; zato my garantirovanno ne chitaem hranilishche,
++ * kotoroe moglo byt' ne vydeleno. Na GXM (revision < G12A) use_mmu vsegda 0,
++ * a use_fbc/use_downsample == is_10bit, poetomu dlya 8-bit NV12M eto chistyj
++ * MMIO iz adresov vb2 - bez allokacij, bez chteniya comm->*.
++ *
++ * BEZOPASNOST' POVTORA: maping bufera v vb2 v predelah sessii monotonen, tak
++ * chto povtornyj prohod mozhet tol'ko zamenit' carry-forward na nastoyashchij
++ * adres, no nikogda naoborot.
++ *
++ * KOGDA ZVAT': tol'ko kogda proshivka NE dekodiruet. Posledovatel'nost' zdes'
++ * zavershaetsya obnuleniem 32 slotov ANC_CANVAS_DATA, poetomu posle nee
++ * obyazatelen povtornyj codec_vp9_set_refs()/set_mc(). Edinstvennaya tochka
++ * vyzova - nachalo codec_vp9_process_frame(), gde proshivka stoit na
++ * VP9_HEAD_PARSER_DONE i zhdet nashego otveta.
++ */
++void codec_hevc_refresh_buffers(struct amvdec_session *sess,
++				struct codec_hevc_common *comm,
++				int is_10bit)
++{
++	struct amvdec_core *core = sess->core;
++
++	if (codec_hevc_use_mmu(core->platform->revision, sess->pixfmt_cap,
++			       is_10bit) ||
++	    codec_hevc_use_downsample(sess->pixfmt_cap, is_10bit) ||
++	    codec_hevc_use_fbc(sess->pixfmt_cap, is_10bit))
++		return;
++
++	if (core->platform->revision == VDEC_REVISION_GXBB)
++		codec_hevc_setup_buffers_gxbb(sess, comm, is_10bit);
++	else
++		codec_hevc_setup_buffers_gxl(sess, comm, is_10bit);
++}
++EXPORT_SYMBOL_GPL(codec_hevc_refresh_buffers);
++
+ void codec_hevc_fill_mmu_map(struct amvdec_session *sess,
+ 			     struct codec_hevc_common *comm,
+ 			     struct vb2_buffer *vb,
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc_common.h b/drivers/staging/media/meson/vdec/codec_hevc_common.h
+index 0cb525456..2925dbca8 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.h
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.h
+@@ -87,6 +87,14 @@ int codec_hevc_setup_buffers(struct amvdec_session *sess,
+ 			     struct codec_hevc_common *comm,
+ 			     int is_10bit);
+ 
++/*
++ * h96 0027: perezapisat' tablicu referensov ANC2AXI BEZ allokacij. Podrobnosti,
++ * ogranicheniya i trebovaniya k momentu vyzova - v .c.
++ */
++void codec_hevc_refresh_buffers(struct amvdec_session *sess,
++				struct codec_hevc_common *comm,
++				int is_10bit);
++
+ void codec_hevc_fill_mmu_map(struct amvdec_session *sess,
+ 			     struct codec_hevc_common *comm,
+ 			     struct vb2_buffer *vb,
+diff --git a/drivers/staging/media/meson/vdec/codec_vp9.c b/drivers/staging/media/meson/vdec/codec_vp9.c
+index 257e21afb..fdb446ce4 100644
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -472,6 +472,49 @@ struct codec_vp9 {
+ 
+ 	struct vp9_frame *cur_frame;
+ 	struct vp9_frame *prev_frame;
++
++	/*
++	 * h96 0027 (12.09.2026). frame_pending == true znachit rovno odno: rpm
++	 * uzhe razobran, proshivka stoit na VP9_HEAD_PARSER_DONE i zhdet ot nas
++	 * VP9_10B_DECODE_SLICE, a my etot otvet eshche ne dali, potomu chto ne
++	 * nashli CAPTURE-bufer. Vse dannye, nuzhnye chtoby dodelat' kadr
++	 * (rpm_param, width/height/is_10bit, lf/lfi/seg_4lf, karty referensov),
++	 * uzhe lezhat v etoj strukture - teryalsya tol'ko sam fakt dolga.
++	 */
++	bool frame_pending;
++
++	/*
++	 * Bitovaya maska CAPTURE-slotov, ch'ya zapis' v tablice ANC2AXI mozhet
++	 * byt' carry-forward (chuzhoj adres): bufer prishel POSLE togo, kak
++	 * tablica byla napisana. Vystavlyaetsya v .program_capture_buf (tam
++	 * tol'ko bit, nikakogo MMIO), gasitsya v process_frame - v tot moment,
++	 * kogda proshivka garantirovanno ne dekodiruet.
++	 */
++	u32 anc_dirty;
++
++	/*
++	 * Nomer pokoleniya formata: +1 na kazhdyj src_change. Nuzhen, chtoby v
++	 * zhurnale bylo vidno, k kakoj imenno geometrii otnositsya parkovka.
++	 */
++	u32 format_gen;
++
++	/* Ogranichennye schetchiki dlya diagnostiki; tol'ko rastut. */
++	struct {
++		u32 park;		/* kadrov otlozheno */
++		u32 resume;		/* dolgov pogasheno iz QBUF */
++		u32 cancel;		/* parkovok snyato flush/src_change */
++		u32 impossible;		/* golodanie, kotoroe nekomu razreshit' */
++		u32 nomem;		/* ne hvatilo pamyati na vp9_frame */
++		u32 anc_refresh;	/* perezapisej tablicy ANC2AXI */
++	} stats;
++};
++
++/* Prichina, po kotoroj codec_vp9_get_new_frame() vernul NULL. */
++enum vp9_nf_reason {
++	VP9_NF_OK = 0,
++	VP9_NF_NOMEM,		/* kzalloc - eto NE golodanie po buferam */
++	VP9_NF_STARVED,		/* bufera net seichas, no on mozhet vernut'sya */
++	VP9_NF_IMPOSSIBLE,	/* vse bufery u kodeka: QBUF prijti neotkuda */
+ };
+ 
+ static int div_r32(s64 m, int n)
+@@ -712,6 +755,17 @@ static void codec_vp9_flush_output(struct amvdec_session *sess)
+ 	memset(vp9->frame_refs, 0, sizeof(vp9->frame_refs));
+ 	vp9->frames_num = 0;
+ 
++	/*
++	 * h96 0027: parkovka NE dolzhna perezhit' drain/flush. Kadr, radi
++	 * kotorogo my derzhali dolg, posle sbrosa spiskov bol'she ne imeet ni
++	 * referensov, ni smysla; proshivku posle drain v lyubom sluchae
++	 * pereinicializiruyut (start/resume).
++	 */
++	if (vp9->frame_pending) {
++		vp9->frame_pending = false;
++		vp9->stats.cancel++;
++	}
++
+ 	mutex_unlock(&vp9->lock);
+ }
+ 
+@@ -1332,7 +1386,40 @@ static void codec_vp9_set_mc(struct amvdec_session *sess,
+ 	amvdec_write_dos(core, VP9D_MPP_REF_SCALE_ENBL, scale);
+ }
+ 
+-static struct vp9_frame *codec_vp9_get_new_frame(struct amvdec_session *sess)
++/*
++ * h96 0027: skol'ko CAPTURE-buferov kodek derzhit u sebya i eshche NE otdal
++ * naruzhu. Kadr s done == 1 uzhe ushel cherez amvdec_dst_buf_done(), t.e. on u
++ * userspace i mozhet vernut'sya cherez QBUF; takoj kadr ostaetsya v spiske
++ * tol'ko kak zapis' o referense.
++ */
++static unsigned int codec_vp9_held_bufs(struct codec_vp9 *vp9)
++{
++	struct vp9_frame *f;
++	unsigned int held = 0;
++
++	list_for_each_entry(f, &vp9->ref_frames_list, list)
++		if (!f->done)
++			held++;
++
++	return held;
++}
++
++/*
++ * Otlichaem vremennoe golodanie ot situacii, kotoruyu nikto ne razreshit.
++ *
++ * Zhdat' QBUF imeet smysl tol'ko esli hot' odin bufer sejchas u userspace.
++ * Esli VSE num_dst_bufs sidyat u nas i ni odin ne vydan - QBUF prijti
++ * neotkuda, i parkovka prevratilas' by v tihoe zavisanie vmesto gromkoj
++ * oshibki. Prohod ogranichen dlinoj spiska (<= MAX_REF_PIC_NUM).
++ */
++static bool codec_vp9_starvation_is_final(struct amvdec_session *sess,
++					  struct codec_vp9 *vp9)
++{
++	return codec_vp9_held_bufs(vp9) >= sess->num_dst_bufs;
++}
++
++static struct vp9_frame *codec_vp9_get_new_frame(struct amvdec_session *sess,
++						 enum vp9_nf_reason *why)
+ {
+ 	struct codec_vp9 *vp9 = sess->priv;
+ 	union rpm_param *param = &vp9->rpm_param;
+@@ -1341,14 +1428,20 @@ static struct vp9_frame *codec_vp9_get_new_frame(struct amvdec_session *sess)
+ 
+ 	int tries;
+ 
++	*why = VP9_NF_OK;
++
+ 	new_frame = kzalloc_obj(*new_frame);
+-	if (!new_frame)
++	if (!new_frame) {
++		*why = VP9_NF_NOMEM;
+ 		return NULL;
++	}
+ 
+ 	vbuf = v4l2_m2m_dst_buf_remove(sess->m2m_ctx);
+ 	if (!vbuf) {
+-		dev_err(sess->core->dev, "No dst buffer available\n");
++		dev_err_ratelimited(sess->core->dev, "No dst buffer available\n");
+ 		kfree(new_frame);
++		*why = codec_vp9_starvation_is_final(sess, vp9) ?
++			VP9_NF_IMPOSSIBLE : VP9_NF_STARVED;
+ 		return NULL;
+ 	}
+ 
+@@ -1368,18 +1461,31 @@ static struct vp9_frame *codec_vp9_get_new_frame(struct amvdec_session *sess)
+ 		struct vb2_v4l2_buffer *old_vbuf = vbuf;
+ 
+ 		if (--tries <= 0) {
+-			dev_err(sess->core->dev,
++			dev_err_ratelimited(sess->core->dev,
+ 				"Vse dst-bufery uderzhany kak referensy VP9\n");
+ 			v4l2_m2m_buf_queue(sess->m2m_ctx, old_vbuf);
+ 			kfree(new_frame);
++			/*
++			 * h96 0027: eto VTOROJ i, v ustanovivshemsya rezhime,
++			 * BOLEE CHASTYJ vyhod. Ochered' ne pusta, no kazhdyj
++			 * bufer v nej kodek vse eshche otslezhivaet (cikl
++			 * vrashchaet ochered', ne ukorachivaya ee). Zhdat' tut
++			 * tak zhe osmyslenno, kak i pri pustoj ocheredi - pri
++			 * uslovii, chto hot' odin bufer u userspace.
++			 */
++			*why = codec_vp9_starvation_is_final(sess, vp9) ?
++				VP9_NF_IMPOSSIBLE : VP9_NF_STARVED;
+ 			return NULL;
+ 		}
+ 
+ 		vbuf = v4l2_m2m_dst_buf_remove(sess->m2m_ctx);
+ 		v4l2_m2m_buf_queue(sess->m2m_ctx, old_vbuf);
+ 		if (!vbuf) {
+-			dev_err(sess->core->dev, "No dst buffer available\n");
++			dev_err_ratelimited(sess->core->dev,
++					    "No dst buffer available\n");
+ 			kfree(new_frame);
++			*why = codec_vp9_starvation_is_final(sess, vp9) ?
++				VP9_NF_IMPOSSIBLE : VP9_NF_STARVED;
+ 			return NULL;
+ 		}
+ 	}
+@@ -1439,19 +1545,96 @@ static void codec_vp9_rm_noshow_frame(struct amvdec_session *sess)
+ 	}
+ }
+ 
++/*
++ * h96 0027: chto delat', kogda destination-bufera net.
++ *
++ * Do etogo patcha lyuboj NULL privodil k odnomu i tomu zhe - tihomu vyhodu iz
++ * process_frame, posle kotorogo VP9_10B_DECODE_SLICE ne pisalsya nikogda i
++ * proshivka ostavalas' na rendez-vous navsegda. Zdes' tri raznyh sluchaya
++ * razvedeny yavno.
++ */
++static void codec_vp9_defer_or_fail(struct amvdec_session *sess,
++				    struct codec_vp9 *vp9,
++				    enum vp9_nf_reason why)
++{
++	switch (why) {
++	case VP9_NF_STARVED:
++		if (!vp9->frame_pending) {
++			vp9->frame_pending = true;
++			vp9->stats.park++;
++			dev_info_ratelimited(sess->core->dev,
++				"h96 vp9 park: gen=%u %ux%u held=%u ready=%u dst=%u park=%u resume=%u\n",
++				vp9->format_gen, vp9->width, vp9->height,
++				codec_vp9_held_bufs(vp9),
++				v4l2_m2m_num_dst_bufs_ready(sess->m2m_ctx),
++				sess->num_dst_bufs,
++				vp9->stats.park, vp9->stats.resume);
++		}
++		return;
++
++	case VP9_NF_IMPOSSIBLE:
++		/*
++		 * Zhdat' nechego: vse bufery u nas. Eto NE parkovka - eto
++		 * gromkij otkaz, chtoby klient mog perestroit' ochered'.
++		 */
++		vp9->frame_pending = false;
++		vp9->stats.impossible++;
++		dev_err(sess->core->dev,
++			"h96 vp9: vse %u CAPTURE-buferov u dekodera, zhdat' QBUF neotkuda (gen=%u %ux%u)\n",
++			sess->num_dst_bufs, vp9->format_gen,
++			vp9->width, vp9->height);
++		amvdec_abort(sess);
++		return;
++
++	case VP9_NF_NOMEM:
++	default:
++		vp9->frame_pending = false;
++		vp9->stats.nomem++;
++		dev_err(sess->core->dev,
++			"h96 vp9: net pamyati pod deskriptor kadra\n");
++		amvdec_abort(sess);
++		return;
++	}
++}
++
+ static void codec_vp9_process_frame(struct amvdec_session *sess)
+ {
+ 	struct amvdec_core *core = sess->core;
+ 	struct codec_vp9 *vp9 = sess->priv;
+ 	union rpm_param *param = &vp9->rpm_param;
++	enum vp9_nf_reason why;
+ 	int intra_only;
+ 
+ 	if (!param->p.show_frame)
+ 		codec_vp9_rm_noshow_frame(sess);
+ 
+-	vp9->cur_frame = codec_vp9_get_new_frame(sess);
+-	if (!vp9->cur_frame)
++	vp9->cur_frame = codec_vp9_get_new_frame(sess, &why);
++	if (!vp9->cur_frame) {
++		codec_vp9_defer_or_fail(sess, vp9, why);
+ 		return;
++	}
++
++	/* dolg pered proshivkoj budet pogashen nizhe, v konce etoj funkcii */
++	vp9->frame_pending = false;
++
++	/*
++	 * h96 0027: pochinka tablicy ANC2AXI dlya pozdno prishedshih buferov.
++	 *
++	 * Delaem eto NE potomu, chto kto-to zhdal bufer, a potomu chto pojavilsya
++	 * slot, adres kotorogo v tablice mozhet byt' chuzhim (sm. anc_dirty).
++	 * Pozdnij bufer BEZ predshestvuyushchej parkovki lechitsya tem zhe putem.
++	 *
++	 * Tochka vyzova vybrana tak, chtoby: (1) proshivka stoyala na
++	 * VP9_HEAD_PARSER_DONE i garantirovanno nichego ne dekodirovala;
++	 * (2) eto bylo DO codec_vp9_set_mc()/set_refs() - perezapis' tablicy
++	 * zavershaetsya obnuleniem 32 slotov ANC_CANVAS_DATA, poetomu posle nee
++	 * referensy obyazatel'no propisyvayutsya zanovo, chto nizhe i proishodit.
++	 */
++	if (vp9->anc_dirty) {
++		codec_hevc_refresh_buffers(sess, &vp9->common, vp9->is_10bit);
++		vp9->anc_dirty = 0;
++		vp9->stats.anc_refresh++;
++	}
+ 
+ 	pr_debug("frame %d: type: %08X; show_exist: %u; show: %u, intra_only: %u\n",
+ 		 vp9->cur_frame->index,
+@@ -1532,6 +1715,13 @@ static void codec_vp9_resume(struct amvdec_session *sess)
+ 		return;
+ 	}
+ 
++	/*
++	 * h96 0027: tablica ANC2AXI tol'ko chto napisana celikom po tekushchemu
++	 * sostoyaniyu ocheredi - nakoplennye otmetki o "podozritel'nyh" slotah
++	 * bol'she ne aktual'ny.
++	 */
++	vp9->anc_dirty = 0;
++
+ 	codec_vp9_setup_workspace(sess, vp9);
+ 	codec_hevc_setup_decode_head(sess, vp9->is_10bit);
+ 	codec_vp9_process_lf(vp9);
+@@ -1612,6 +1802,81 @@ static void codec_vp9_show_frame(struct amvdec_session *sess)
+ 	}
+ }
+ 
++/*
++ * h96 0027: CAPTURE-bufer prishel ot userspace.
++ *
++ * Nikakogo MMIO zdes' net i byt' ne dolzhno - proshivka v etot moment mozhet
++ * dekodirovat'. Otmechaem slot kak podozritel'nyj; realnaya perezapis' tablicy
++ * proizojdet v process_frame(), kogda zhelezo zavedomo stoit.
++ */
++static void codec_vp9_program_capture_buf(struct amvdec_session *sess,
++					  struct vb2_buffer *vb)
++{
++	struct codec_vp9 *vp9 = sess->priv;
++
++	if (!vp9 || vb->index >= 32)
++		return;
++
++	vp9->anc_dirty |= BIT(vb->index);
++}
++
++/*
++ * h96 0027: pogashenie dolga pered proshivkoj.
++ *
++ * Vyzyvaetsya iz vdec_vb2_buf_queue() pod sess->lock. Poryadok
++ * sess->lock -> vp9->lock sovpadaet s vdec_start_streaming() -> resume().
++ * Obratnogo poryadka v drajvere net: tred preryvaniya beret tol'ko vp9->lock,
++ * a amvdec_dst_buf_done() rabotaet cherez sess->ts_spinlock.
++ *
++ * Pochemu zdes' ne mozhet byt' obrashcheniya k osvobozhdennoj pamyati:
++ * sess->priv osvobozhdaetsya v vdec_stop_streaming(), a ta vyzyvaetsya POD tem
++ * zhe sess->lock, chto i buf_queue.
++ *
++ * Pochemu otvet proshivke uhodit rovno odin raz na razobrannyj kadr:
++ * VP9_10B_DECODE_SLICE pishetsya tol'ko v konce process_frame() i tol'ko pri
++ * nenulevom cur_frame; uspeshnyj prohod gasit frame_pending, i vse
++ * posleduyushchie QBUF vyhodyat po pervoj proverke.
++ */
++static void codec_vp9_capture_available(struct amvdec_session *sess,
++					struct vb2_buffer *vb)
++{
++	struct codec_vp9 *vp9 = sess->priv;
++
++	if (!vp9)
++		return;
++
++	mutex_lock(&vp9->lock);
++
++	if (!vp9->frame_pending)
++		goto unlock;
++
++	/*
++	 * Deshevaya proverka do vhoda v get_new_frame(). Poka my zaparkovany,
++	 * dekodirovaniya net, znachit ref_frames_list zamorozhen. Esli imenno
++	 * etot bufer kodek vse eshche OTSLEZHIVAET (get_frame_by_idx - eto
++	 * "est' v spiske", a ne "zhivoj referens"), to razreshit' situaciyu on
++	 * ne mozhet, i vhod v get_new_frame tol'ko prokrutil by ochered' i dal
++	 * eshche odnu strochku v zhurnal.
++	 */
++	if (codec_vp9_get_frame_by_idx(vp9, vb->index))
++		goto unlock;
++
++	vp9->frame_pending = false;
++	vp9->stats.resume++;
++	dev_info_ratelimited(sess->core->dev,
++		"h96 vp9 resume: gen=%u idx=%u %ux%u ready=%u park=%u resume=%u anc=%u\n",
++		vp9->format_gen, vb->index, vp9->width, vp9->height,
++		v4l2_m2m_num_dst_bufs_ready(sess->m2m_ctx),
++		vp9->stats.park, vp9->stats.resume, vp9->stats.anc_refresh);
++
++	/* ta zhe para, chto vypolnyaet tred preryvaniya posle razbora rpm */
++	codec_vp9_process_frame(sess);
++	codec_vp9_show_frame(sess);
++
++unlock:
++	mutex_unlock(&vp9->lock);
++}
++
+ static void vp9_tree_merge_probs(unsigned int *prev_prob,
+ 				 unsigned int *cur_prob,
+ 				 int coef_node_start, int tree_left,
+@@ -2309,6 +2574,20 @@ static irqreturn_t codec_vp9_threaded_isr(struct amvdec_session *sess)
+ 		/* No frame is actually processed */
+ 		vp9->cur_frame = NULL;
+ 
++		/*
++		 * h96 0027: smena formata otmenyaet lyuboj otlozhennyj kadr -
++		 * nizhe my zaberem vse bufery i sotrem karty referensov, tak chto
++		 * dodelyvat' ego nechem i nezachem. Dal'she amvdec_src_change()
++		 * libo sinhronno zovet resume() (geometriya ta zhe), libo klient
++		 * perestroit ochered' - v oboih sluchayah proshivka poluchaet
++		 * svezhij kadr, a ne etot.
++		 */
++		if (vp9->frame_pending) {
++			vp9->frame_pending = false;
++			vp9->stats.cancel++;
++		}
++		vp9->format_gen++;
++
+ 		/*
+ 		 * h96 04.09.2026: pri smene razresheniya (seek na 4K VP9) nuzhno
+ 		 * ne prosto vydat' show-kadry, no I VERNUT' noshow (alt-ref)
+@@ -2394,4 +2673,7 @@ struct amvdec_codec_ops codec_vp9_ops = {
+ 	.eos_sequence = codec_vp9_eos_sequence,
+ 	.drain = codec_vp9_flush_output,
+ 	.resume = codec_vp9_resume,
++	/* h96 0027 */
++	.program_capture_buf = codec_vp9_program_capture_buf,
++	.capture_available = codec_vp9_capture_available,
+ };
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 27ef77986..9db3ea5c7 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -469,6 +469,22 @@ static void vdec_vb2_buf_queue(struct vb2_buffer *vb)
+ 	    vdec_codec_needs_recycle(sess))
+ 		vdec_queue_recycle(sess, vb);
+ 
++	/*
++	 * h96 0027 (12.09.2026): VP9 bol'she ne BROSAET kadr, kogda dst-ochered'
++	 * pusta - on ostavlyaet proshivku stoyat' na VP9_HEAD_PARSER_DONE i zhdet
++	 * vot etogo samogo QBUF. Dovodim otlozhennyj kadr do VP9_10B_DECODE_SLICE.
++	 *
++	 * Stavim POSLE v4l2_m2m_buf_queue() (vyshe), chtoby tol'ko chto
++	 * zakveshennyj bufer byl viden v v4l2_m2m_dst_buf_remove(), i POSLE
++	 * blokov program_capture_buf/recycle, chtoby kanvas-pravki uzhe proshli.
++	 */
++	if (sess->streamon_cap &&
++	    sess->status == STATUS_RUNNING &&
++	    !sess->stopping &&
++	    vb->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
++	    codec_ops->capture_available)
++		codec_ops->capture_available(sess, vb);
++
+ 	schedule_work(&sess->esparser_queue_work);
+ }
+ 
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index f261e0133..c9f0122bc 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -122,6 +122,8 @@ struct amvdec_ops {
+  *	     in pair with @can_recycle
+  * @drain: optional call if the codec has a custom way of draining
+  * @resume: optional call to resume after a resolution change
++ * @capture_available: optional call when userspace queues back a CAPTURE buffer
++ *		       and the codec may owe the firmware a deferred frame
+  * @eos_sequence: optional call to get an end sequence to send to esparser
+  *		  for flush. Mutually exclusive with @drain.
+  * @isr: mandatory call when the ISR triggers
+@@ -145,6 +147,22 @@ struct amvdec_codec_ops {
+ 	 */
+ 	void (*program_capture_buf)(struct amvdec_session *sess,
+ 				    struct vb2_buffer *vb);
++	/*
++	 * h96 0027 (12.09.2026): userspace vernul CAPTURE-bufer.
++	 *
++	 * Kodek, kotoryj ne smog poluchit' bufer dlya uzhe RAZOBRANNOGO kadra i
++	 * poetomu ostavil proshivku stoyat' na rendez-vous, dovodit etot kadr do
++	 * konca imenno zdes'. Vyzyvaetsya iz vdec_vb2_buf_queue(): process
++	 * context, POD sess->lock (on zhe vb2 queue lock obeih ocheredej - sm.
++	 * kommentarij v vdec_stop_streaming), poetomu sess->priv ne mozhet byt'
++	 * osvobozhden parallel'no s etim vyzovom. Poryadok lokov
++	 * sess->lock -> priv->lock tot zhe, chto u
++	 * vdec_start_streaming() -> codec_ops->resume().
++	 *
++	 * Opcionalno; realizovano tol'ko dlya VP9.
++	 */
++	void (*capture_available)(struct amvdec_session *sess,
++				  struct vb2_buffer *vb);
+ 	const u8 * (*eos_sequence)(u32 *len);
+ 	irqreturn_t (*isr)(struct amvdec_session *sess);
+ 	irqreturn_t (*threaded_isr)(struct amvdec_session *sess);

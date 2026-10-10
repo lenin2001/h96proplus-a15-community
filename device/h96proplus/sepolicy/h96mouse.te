@@ -1,0 +1,27 @@
+# Native IR input translator. No shell, network, properties or power privileges.
+type h96mouse, domain;
+type h96mouse_exec, vendor_file_type, exec_type, file_type;
+init_daemon_domain(h96mouse)
+
+# Read the physical IR receiver node (event0) and grab it exclusively (EVIOCGRAB
+# is an ioctl on the chr_file, so rw_file_perms, not just r_file_perms).
+allow h96mouse input_device:dir r_dir_perms;
+allow h96mouse input_device:chr_file rw_file_perms;
+
+# Create the virtual keyboard/mouse. On board CZ-S32-V3 /dev/uinput carries the
+# label uhid_device (verified with ls -Z on the device), NOT uinput_device -
+# the stock rule allowing uinput_device never matched and produced denials.
+allow h96mouse uhid_device:chr_file rw_file_perms;
+
+# No dac_override here. system/sepolicy/private/domain.te neverallows it for this
+# typeattribute, and secilc refuses the whole policy over it -- which is why no system
+# image could be built while that rule was in the file.
+#
+# The permission it was reaching for is real: /dev/input/event0 is root:input 0660, which
+# a root daemon owns and can open anyway, but /dev/uinput is uhid:uhid 0660, where a root
+# process is neither owner nor group and falls through to "other" with no access at all.
+# The supported way to give it that is a supplementary group on the service --
+#     group uhid
+# in the init entry -- not a capability. Note also that the daemon currently runs as
+# u:r:h96_setup:s0 rather than in this domain at all, so nothing on the box depends on
+# these rules today.

@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Перекрытие framework-res для h96proplus.
+
+  Подключается через DEVICE_PACKAGE_OVERLAYS в device.mk. Статическое
+  перекрытие: значения вшиваются в framework-res.apk на сборке, поэтому
+  действуют С ПЕРВОЙ СЕКУНДЫ и не зависят от состояния /data.
+-->
+<resources>
+    <!-- POWER defaults that must hold on a FRESH /data (no device database edits).
+
+         Short press = 1 (SHORT_PRESS_POWER_GO_TO_SLEEP): deep sleep with remote
+         wake-up, the behaviour accepted on the maintainer's unit. The earlier
+         value 100 ("clean shutdown") existed only together with the historical
+         framework patch aosp-patches/0012, which is NOT part of the public series:
+         full SYSTEM_OFF made this board reset instead of powering off.
+
+         Long press = 0 (LONG_PRESS_POWER_NOTHING): with the TV default the
+         assistant swallowed presses longer than ~0.5 s, so POWER appeared dead.
+         On the maintainer's unit this was fixed by the device setting
+         Settings.Global.POWER_BUTTON_LONG_PRESS=0; PhoneWindowManager falls back
+         to this resource when that setting is absent, i.e. on new userdata.
+
+         Public-release change, not yet build- or hardware-tested (STATUS.md). -->
+    <integer name="config_shortPressOnPowerBehavior">1</integer>
+    <integer name="config_longPressOnPowerBehavior">0</integer>
+
+    <!-- ⛔ ЭКРАН БЛОКИРОВКИ ОТКЛЮЧЁН НАВСЕГДА.
+
+         Приставке экран блокировки не нужен в принципе: ввода PIN пультом
+         нет, а после каждого пробуждения он перехватывает фокус у лаунчера
+         (наблюдалось 22.08: поверх LeanbackLauncher вылезал русский экран
+         «Разблок. для доступа ко всем функциям и данным»).
+
+         Почему именно этот ключ, а не тот, что у Amlogic (yukawa).
+         Проверено по исходникам дерева:
+
+           LockPatternUtils.java:715 isLockScreenDisabled()
+               if (isSecure(userId)) return false;          // PIN не задан
+               disabledByDefault = config_disableLockscreenByDefault;
+               return getBoolean(DISABLE_LOCKSCREEN_KEY, …)
+                      || disabledByDefault || isDemoUser;
+
+         То есть true здесь отключает keyguard БЕЗУСЛОВНО, пока не задан
+         реальный PIN/графический ключ (isSecure) — а его задать некому.
+
+         ⚠️ yukawa вместо этого ставит def_lockscreen_disabled=true в
+         SettingsProvider. В Android 16 это наследие: настройка
+         Settings.System.LOCKSCREEN_DISABLED, которую он заполняет, в
+         services/core/java/com/android/server/locksettings/ НЕ ЧИТАЕТСЯ
+         вообще (grep по каталогу пуст). Настоящий ключ службы блокировки —
+         DISABLE_LOCKSCREEN_KEY = "lockscreen.disabled" (LockPatternUtils.java:194),
+         он живёт в хранилище LockSettingsService, а не в Settings.
+         Тот ключ мы всё равно тоже выставляем — но полагаться на него нельзя.
+    -->
+    <bool name="config_disableLockscreenByDefault">true</bool>
+
+    <!-- ============================ ТЕЛЕФОНИИ НЕТ ============================
+         Это приставка: ни модема, ни SIM, ни звонков, ни SMS, ни мобильных
+         данных. В AOSP все четыре ключа по умолчанию true
+         (frameworks/base/core/res/res/values/config.xml), потому что базовый
+         профиль — телефон. Android TV перекрывает их ровно так же
+         (device/google/atv/overlay/TvFrameworkOverlay/res/values/config.xml).
+
+         Что это даёт: система перестаёт считать себя телефоном — исчезают
+         пункты звонков и SMS в интерфейсе, не заводятся подсистемы голоса и
+         мобильных данных, приложения через TelephonyManager сразу видят,
+         что возможностей нет, вместо ожидания ответа от несуществующего радио.
+    -->
+    <bool name="config_voice_capable">false</bool>
+    <bool name="config_sms_capable">false</bool>
+    <bool name="config_mobile_data_capable">false</bool>
+    <bool name="config_enable_emergency_call_while_sim_locked">false</bool>
+
+</resources>

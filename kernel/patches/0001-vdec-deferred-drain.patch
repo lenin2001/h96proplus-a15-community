@@ -1,0 +1,319 @@
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc.c b/drivers/staging/media/meson/vdec/codec_hevc.c
+index b0d8623c3..3c32f0d2a 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc.c
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2015 Amlogic, Inc. All rights reserved.
+  */
+ 
++#include <linux/moduleparam.h>
+ #include <media/v4l2-mem2mem.h>
+ #include <media/videobuf2-dma-contig.h>
+ 
+@@ -661,7 +662,53 @@ static int codec_hevc_start(struct amvdec_session *sess)
+ 	return ret;
+ }
+ 
+-static void codec_hevc_flush_output(struct amvdec_session *sess)
++/*
++ * Konec potoka dlya HEVC: shtatnye EOS_NUT (36) i EOB_NUT (37) NAL.
++ * Bez nikh firmware ne dekodiruet poslednij AU - on zhdet sleduyushchego
++ * start-koda, chtoby zakryt predydushchij (u h264 tu zhe rol igraet
++ * drain-kartinka v ego eos_sequence, otsyuda ego 120/120 v testakh).
++ * Khvost nulej - legalnye leading_zero_8bits, prosto prodavlivayut FIFO.
++ */
++/*
++ * EOS-khvost dlya hevc: POBEDITEL matritsy progona 22 - SZ_4K chistykh
++ * nulej BEZ NAL (120/120 bit-v-bit). Lyuboj variant s EOS_NUT daval
++ * odin bityj kadr (fw Amlogic EOS tolko meshaet), dlinnyj khvost s NAL
++ * (2-3K) - voobshche stall. fw nuzhen prosto padding dlya dobora FIFO,
++ * kak i u vp9. Parametry ostavleny dlya budushchikh ekspermentov.
++ */
++static uint hevc_eos_len = SZ_4K;
++module_param(hevc_eos_len, uint, 0644);
++MODULE_PARM_DESC(hevc_eos_len, "dlina EOS-khvosta hevc, bajt");
++static bool hevc_eos_nal;
++module_param(hevc_eos_nal, bool, 0644);
++MODULE_PARM_DESC(hevc_eos_nal, "stavit li EOS_NUT v nachalo khvosta");
++static bool hevc_eos_eob;
++module_param(hevc_eos_eob, bool, 0644);
++MODULE_PARM_DESC(hevc_eos_eob, "stavit li EOB_NUT posle EOS_NUT");
++
++static u8 hevc_eos_buf[SZ_8K];
++
++static const u8 *codec_hevc_eos_sequence(u32 *len)
++{
++	static const u8 eos_nut[6] = { 0x00, 0x00, 0x00, 0x01, 0x48, 0x01 };
++	static const u8 eob_nut[6] = { 0x00, 0x00, 0x00, 0x01, 0x4A, 0x01 };
++	u32 off = 0;
++
++	memset(hevc_eos_buf, 0, sizeof(hevc_eos_buf));
++	if (hevc_eos_nal) {
++		memcpy(hevc_eos_buf, eos_nut, sizeof(eos_nut));
++		off += sizeof(eos_nut);
++		if (hevc_eos_eob) {
++			memcpy(hevc_eos_buf + off, eob_nut, sizeof(eob_nut));
++			off += sizeof(eob_nut);
++		}
++	}
++	*len = clamp_t(u32, hevc_eos_len, off ? off : 16, sizeof(hevc_eos_buf));
++	return hevc_eos_buf;
++}
++
++/* Vyzyvat tolko pod hevc->lock. */
++static void __codec_hevc_flush_output(struct amvdec_session *sess)
+ {
+ 	struct codec_hevc *hevc = sess->priv;
+ 	struct hevc_frame *tmp, *n;
+@@ -678,13 +725,27 @@ static void codec_hevc_flush_output(struct amvdec_session *sess)
+ 	}
+ }
+ 
++/*
++ * Tochka vkhoda dlya .drain (otlozhennaya rabota): threaded ISR derzhit
++ * hevc->lock, bez nego flush gonyaetsya s razborom ocherednogo kadra -
++ * progon 16 daval odin bityj kadr v khvoste.
++ */
++static void codec_hevc_flush_output(struct amvdec_session *sess)
++{
++	struct codec_hevc *hevc = sess->priv;
++
++	mutex_lock(&hevc->lock);
++	__codec_hevc_flush_output(sess);
++	mutex_unlock(&hevc->lock);
++}
++
+ static int codec_hevc_stop(struct amvdec_session *sess)
+ {
+ 	struct codec_hevc *hevc = sess->priv;
+ 	struct amvdec_core *core = sess->core;
+ 
+ 	mutex_lock(&hevc->lock);
+-	codec_hevc_flush_output(sess);
++	__codec_hevc_flush_output(sess);
+ 
+ 	if (hevc->workspace_vaddr)
+ 		dma_free_coherent(core->dev, SIZE_WORKSPACE,
+@@ -1459,5 +1520,6 @@ struct amvdec_codec_ops codec_hevc_ops = {
+ 	.threaded_isr = codec_hevc_threaded_isr,
+ 	.num_pending_bufs = codec_hevc_num_pending_bufs,
+ 	.drain = codec_hevc_flush_output,
++	.eos_sequence = codec_hevc_eos_sequence,
+ 	.resume = codec_hevc_resume,
+ };
+diff --git a/drivers/staging/media/meson/vdec/codec_vp9.c b/drivers/staging/media/meson/vdec/codec_vp9.c
+index 2a164ffd0..12c3bcd86 100644
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -655,6 +655,20 @@ vp9_loop_filter_frame_init(struct amvdec_core *core, struct segmentation *seg,
+ 	}
+ }
+ 
++/*
++ * Nuli posle poslednego kadra: fw chitaet bitstream burst-ami, bez
++ * paddinga khvost poslednego kadra ostaetsya v FIFO nedochitannym
++ * (bitaya nizhnyaya tret kadra v progone 18/19). Kadry VP9 oformleny
++ * 16-bajtnymi amlogic-zagolovkami, nuli parser ne sobyut.
++ */
++static const u8 vp9_eos_sequence[SZ_4K];
++
++static const u8 *codec_vp9_eos_sequence(u32 *len)
++{
++	*len = ARRAY_SIZE(vp9_eos_sequence);
++	return vp9_eos_sequence;
++}
++
+ static void codec_vp9_flush_output(struct amvdec_session *sess)
+ {
+ 	struct codec_vp9 *vp9 = sess->priv;
+@@ -2168,6 +2182,7 @@ struct amvdec_codec_ops codec_vp9_ops = {
+ 	.isr = codec_vp9_isr,
+ 	.threaded_isr = codec_vp9_threaded_isr,
+ 	.num_pending_bufs = codec_vp9_num_pending_bufs,
++	.eos_sequence = codec_vp9_eos_sequence,
+ 	.drain = codec_vp9_flush_output,
+ 	.resume = codec_vp9_resume,
+ };
+diff --git a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+index 4f0cbf5f1..809eca9d8 100644
+--- a/drivers/staging/media/meson/vdec/esparser.c
++++ b/drivers/staging/media/meson/vdec/esparser.c
+@@ -378,13 +378,33 @@ void esparser_queue_all_src(struct work_struct *work)
+ 		container_of(work, struct amvdec_session, esparser_queue_work);
+ 
+ 	mutex_lock(&sess->lock);
++	/*
++	 * Po specifikatsii V4L2_DEC_CMD_STOP obyazan snachala obrabotat
++	 * VSE prinyatye OUTPUT-bufery. Staryj break po should_stop
++	 * BROSAL nedokormlennye AU, i EOS uezzhal v firmware ranshe
++	 * poslednikh kadrov (progon 15: h264 poteryal 4 khvostovykh).
++	 */
+ 	v4l2_m2m_for_each_src_buf_safe(sess->m2m_ctx, buf, n) {
+-		if (sess->should_stop)
+-			break;
+-
+ 		if (esparser_queue(sess, &buf->vb) < 0)
+ 			break;
+ 	}
++
++	/*
++	 * Vse realnye dannye v vififo - teper mozhno stavit
++	 * EOS-posledovatelnost, kotoraya dozhmet poslednij AU.
++	 */
++	if (sess->should_stop && !sess->eos_queued &&
++	    !v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx)) {
++		struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
++
++		if (codec_ops->eos_sequence) {
++			u32 len;
++			const u8 *data = codec_ops->eos_sequence(&len);
++
++			sess->eos_queued = 1;
++			esparser_queue_eos(sess->core, data, len);
++		}
++	}
+ 	mutex_unlock(&sess->lock);
+ }
+ 
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 4b77ec1af..928e0287e 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -112,8 +112,54 @@ static void vdec_wait_inactive(struct amvdec_session *sess)
+ 		msleep(25);
+ }
+ 
++/*
++ * Otlozhennyj drain po V4L2_DEC_CMD_STOP.
++ *
++ * Nemedlennyj drain lomal khvost potoka: flush vychishchal DPB, poka
++ * esparser eshche derzhal ne dekodirovannye AU, i poslednie kadry
++ * dekodirovalis bez opornykh ("Couldn t find ref. frame").
++ * vdec_wait_inactive zdes ne spasaet: 50 ms tishiny IRQ neotlichimy
++ * ot golodaniya po CAPTURE-buferam u medlennogo klienta.
++ *
++ * Zhdem, poka konvejer dojedet: chislo buferov v esparser perestalo
++ * ubyvat ~1 s podryad. Potolok 10 s, dalshe dreniruem kak est.
++ */
++static void vdec_drain_work(struct work_struct *work)
++{
++	struct amvdec_session *sess =
++		container_of(to_delayed_work(work), struct amvdec_session,
++			     drain_work);
++	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
++	int queued = atomic_read(&sess->esparser_queued_bufs);
++
++	if (!sess->should_stop)
++		return;
++
++	if (queued == sess->drain_prev_queued)
++		sess->drain_stable_ticks++;
++	else
++		sess->drain_stable_ticks = 0;
++	sess->drain_prev_queued = queued;
++	sess->drain_total_ticks++;
++
++	if (queued == 0 || sess->drain_stable_ticks >= 10 ||
++	    sess->drain_total_ticks >= 100) {
++		dev_dbg(sess->core->dev,
++			"deferred drain: queued %d, stable %u, total %u\n",
++			queued, sess->drain_stable_ticks,
++			sess->drain_total_ticks);
++		vdec_wait_inactive(sess);
++		if (codec_ops->drain)
++			codec_ops->drain(sess);
++		return;
++	}
++
++	schedule_delayed_work(&sess->drain_work, msecs_to_jiffies(100));
++}
++
+ static void vdec_poweroff(struct amvdec_session *sess)
+ {
++	cancel_delayed_work_sync(&sess->drain_work);
+ 	struct amvdec_ops *vdec_ops = sess->fmt_out->vdec_ops;
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 
+@@ -323,6 +369,7 @@ static int vdec_start_streaming(struct vb2_queue *q, unsigned int count)
+ 	}
+ 
+ 	sess->should_stop = 0;
++	sess->eos_queued = 0;
+ 	sess->keyframe_found = 0;
+ 	sess->last_offset = 0;
+ 	sess->wrap_count = 0;
+@@ -398,6 +445,8 @@ static void vdec_stop_streaming(struct vb2_queue *q)
+ 	struct amvdec_session *sess = vb2_get_drv_priv(q);
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+ 	struct amvdec_core *core = sess->core;
++
++	cancel_delayed_work_sync(&sess->drain_work);
+ 	struct vb2_v4l2_buffer *buf;
+ 
+ 	if (sess->status == STATUS_RUNNING ||
+@@ -721,8 +770,10 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ 		return 0;
+ 
+ 	if (cmd->cmd == V4L2_DEC_CMD_START) {
++		cancel_delayed_work_sync(&sess->drain_work);
+ 		v4l2_m2m_clear_state(sess->m2m_ctx);
+ 		sess->should_stop = 0;
++		sess->eos_queued = 0;
+ 		return 0;
+ 	}
+ 
+@@ -736,14 +787,20 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ 
+ 	v4l2_m2m_mark_stopped(sess->m2m_ctx);
+ 
++	/*
++	 * EOS stavit kormilka (esparser_queue_all_src) POSLE poslednego
++	 * realnogo bufera - zdes lish pinaem ee na sluchaj, esli novye
++	 * bufery uzhe ne pridut.
++	 */
++	schedule_work(&sess->esparser_queue_work);
++
+ 	if (codec_ops->drain) {
+-		vdec_wait_inactive(sess);
+-		codec_ops->drain(sess);
++		sess->drain_prev_queued = -1;
++		sess->drain_stable_ticks = 0;
++		sess->drain_total_ticks = 0;
++		schedule_delayed_work(&sess->drain_work,
++				      msecs_to_jiffies(50));
+ 	} else if (codec_ops->eos_sequence) {
+-		u32 len;
+-		const u8 *data = codec_ops->eos_sequence(&len);
+-
+-		esparser_queue_eos(sess->core, data, len);
+ 		vdec_wait_inactive(sess);
+ 	}
+ 
+@@ -902,6 +959,7 @@ static int vdec_open(struct file *file)
+ 	INIT_LIST_HEAD(&sess->timestamps);
+ 	INIT_LIST_HEAD(&sess->bufs_recycle);
+ 	INIT_WORK(&sess->esparser_queue_work, esparser_queue_all_src);
++	INIT_DELAYED_WORK(&sess->drain_work, vdec_drain_work);
+ 	mutex_init(&sess->lock);
+ 	mutex_init(&sess->bufs_recycle_lock);
+ 	spin_lock_init(&sess->ts_spinlock);
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index ca8a872bc..bd761e61c 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -252,10 +252,15 @@ struct amvdec_session {
+ 
+ 	atomic_t esparser_queued_bufs;
+ 	struct work_struct esparser_queue_work;
++	struct delayed_work drain_work;
++	int drain_prev_queued;
++	unsigned int drain_stable_ticks;
++	unsigned int drain_total_ticks;
+ 
+ 	unsigned int streamon_cap, streamon_out;
+ 	unsigned int sequence_cap, sequence_out;
+ 	unsigned int should_stop;
++	unsigned int eos_queued;
+ 	unsigned int keyframe_found;
+ 	unsigned int num_dst_bufs;
+ 	unsigned int changed_format;

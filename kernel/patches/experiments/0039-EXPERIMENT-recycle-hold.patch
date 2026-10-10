@@ -1,0 +1,110 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH 0039] EXPERIMENT meson-vdec: recycle_hold - hold returned CAPTURE buffers back from the firmware
+
+Not part of the installed kernel. recycle_hold=K keeps the K most recently queued
+CAPTURE buffers away from the H.264/MPEG firmware free list. Result: it makes the
+intermittent AVC corruption MORE frequent (5/13 real-time runs vs 5/50 at K=0),
+so it serves as an amplifier for testing fixes; it disproved 'early recycle of a
+still-referenced picture' as the cause.
+
+---
+diff -ruN s98/drivers/staging/media/meson/vdec/vdec.c s39/drivers/staging/media/meson/vdec/vdec.c
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -34,6 +34,14 @@
+ module_param(drain_fail_once, bool, 0644);
+ MODULE_PARM_DESC(drain_fail_once, "fail the next drain with LAST+ERROR (one-shot, testing)");
+ 
++/*
++ * h96 0039: hold back the K most recently returned CAPTURE buffers from the
++ * firmware's free list (codecs with .recycle, i.e. H.264/MPEG). 0 = off.
++ */
++static unsigned int recycle_hold;
++module_param(recycle_hold, uint, 0644);
++MODULE_PARM_DESC(recycle_hold, "CAPTURE buffers held back from the firmware after QBUF");
++
+ struct dummy_buf {
+ 	struct vb2_v4l2_buffer vb;
+ 	struct list_head list;
+@@ -490,7 +498,20 @@
+ 	new_buf->vb = vb;
+ 
+ 	mutex_lock(&sess->bufs_recycle_lock);
+-	list_add_tail(&new_buf->list, &sess->bufs_recycle);
++	{
++		u32 hold = READ_ONCE(recycle_hold);
++
++		list_add_tail(&new_buf->list, &sess->bufs_recycle_hold);
++		sess->recycle_hold_n++;
++		while (sess->recycle_hold_n > hold) {
++			struct amvdec_buffer *old =
++				list_first_entry(&sess->bufs_recycle_hold,
++						 struct amvdec_buffer, list);
++
++			list_move_tail(&old->list, &sess->bufs_recycle);
++			sess->recycle_hold_n--;
++		}
++	}
+ 	mutex_unlock(&sess->bufs_recycle_lock);
+ }
+ 
+@@ -830,6 +851,11 @@
+ 		list_del(&tmp->list);
+ 		kfree(tmp);
+ 	}
++	list_for_each_entry_safe(tmp, n, &sess->bufs_recycle_hold, list) {
++		list_del(&tmp->list);
++		kfree(tmp);
++	}
++	sess->recycle_hold_n = 0;
+ }
+ 
+ static void vdec_stop_streaming(struct vb2_queue *q)
+@@ -1442,6 +1468,7 @@
+ 
+ 	INIT_LIST_HEAD(&sess->timestamps);
+ 	INIT_LIST_HEAD(&sess->bufs_recycle);
++	INIT_LIST_HEAD(&sess->bufs_recycle_hold);
+ 	INIT_WORK(&sess->esparser_queue_work, esparser_queue_all_src);
+ 	INIT_DELAYED_WORK(&sess->drain_work, vdec_drain_work);
+ 	INIT_DELAYED_WORK(&sess->eos_work, vdec_eos_work);
+diff -ruN s98/drivers/staging/media/meson/vdec/vdec.h s39/drivers/staging/media/meson/vdec/vdec.h
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -339,6 +339,9 @@
+ 	u32 vififo_size;
+ 
+ 	struct list_head bufs_recycle;
++	/* h96 0039: returned buffers held back from the firmware (recycle_hold) */
++	struct list_head bufs_recycle_hold;
++	u32 recycle_hold_n;
+ 	struct mutex bufs_recycle_lock; /* bufs_recycle list lock */
+ 	struct task_struct *recycle_thread;
+ 
+diff -ruN s98/drivers/staging/media/meson/vdec/vdec_helpers.c s39/drivers/staging/media/meson/vdec/vdec_helpers.c
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -277,6 +277,23 @@
+ 	 * Сначала освобождаем ранее выданные canvas ID: повторные seek иначе
+ 	 * исчерпают пул MAX_CANVAS (предсуществующая утечка).
+ 	 */
++	/*
++	 * h96 0039: buffers held back by recycle_hold were output in the previous
++	 * buffer epoch; the firmware is re-initialised with every slot free, so
++	 * recycling them later would free a slot twice.
++	 */
++	mutex_lock(&sess->bufs_recycle_lock);
++	{
++		struct amvdec_buffer *h, *hn;
++
++		list_for_each_entry_safe(h, hn, &sess->bufs_recycle_hold, list) {
++			list_del(&h->list);
++			kfree(h);
++		}
++		sess->recycle_hold_n = 0;
++	}
++	mutex_unlock(&sess->bufs_recycle_lock);
++
+ 	while (sess->canvas_num)
+ 		meson_canvas_free(sess->core->canvas,
+ 				  sess->canvas_alloc[--sess->canvas_num]);

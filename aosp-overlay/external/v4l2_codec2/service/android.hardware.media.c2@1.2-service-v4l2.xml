@@ -1,0 +1,10 @@
+<manifest version="1.0" type="device">
+    <!-- ЛОКАЛЬНАЯ ПРАВКА (H96 Pro Plus, 24.08.2026): было format="hidl".
+         Служба переведена на AIDL, см. service.cpp. Клиент перечисляет
+         ОБЪЯВЛЕННЫЕ экземпляры (AServiceManager_forEachDeclaredInstance),
+         поэтому без этой записи служба останется невидимой, даже работая. -->
+    <hal format="aidl">
+        <name>android.hardware.media.c2</name>
+        <fqname>IComponentStore/default</fqname>
+    </hal>
+</manifest>

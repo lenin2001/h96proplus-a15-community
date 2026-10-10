@@ -1,0 +1,56 @@
+From: Christian Hewitt <christianshewitt@gmail.com>
+Date: 2023-03-14T11:43:16
+Subject: [v3,0/2] media: meson: vdec: add HEVC decode codec
+Message-Id: <20230314114318.4057353-1-christianshewitt@gmail.com>
+State: None
+
+This mini-series adds support for HEVC decoding. It combines the original codec
+work done by Maxime Jourdan in 2019 [0] and improvements by Benjamin Roszak in
+2021 [1]. Only GXBB/GXL/GXM are enabled as decoding currently crashes on G12A
+and later SoCs when trying to decode a 10-bit HEVC stream.
+
+The goal of upstreaming the driver in its current state is to encourage greater
+community contribution towards adding missing features, and fixing the bugs and
+conformance issues necessary to get out of staging.
+
+The HEVC codec presented here is generally partnered with FFMpeg sources that
+are being maintained by the Raspberry Pi Foundation [2] and [3] that contain
+numerous improvements to v4l2_m2m (and v4l2_request) support. There is active
+work in progress to refine the FFMpeg changeset and send it upstream.
+
+Christian
+
+Changes from v2:
+- fix memory leak reported by smatch [4]
+
+Changes from v1:
+- Fix unused val warning reported by kernel test robot <lkp@intel.com>
+
+[0] https://github.com/Elyotna/linux/commits/4.20/v4l2-m2m-pr
+[1] https://gitlab.com/benjamin545/linux-amlogic/-/commits/aml-hevc
+[2] https://github.com/jc-kynesim/rpi-ffmpeg/commits/release/4.4/rpi_import_1
+[3] https://github.com/jc-kynesim/rpi-ffmpeg/tree/dev/5.1.2/rpi_import_1
+[4] https://lore.kernel.org/r/202303120441.YFGHDOya-lkp@intel.com/
+
+Benjamin Roszak (1):
+  media: meson: vdec: implement 10bit bitstream handling
+
+Maxime Jourdan (1):
+  media: meson: vdec: add HEVC decode codec
+
+ drivers/staging/media/meson/vdec/Makefile     |    2 +-
+ drivers/staging/media/meson/vdec/codec_h264.c |    3 +-
+ drivers/staging/media/meson/vdec/codec_hevc.c | 1463 +++++++++++++++++
+ drivers/staging/media/meson/vdec/codec_hevc.h |   13 +
+ .../media/meson/vdec/codec_hevc_common.c      |  161 +-
+ .../media/meson/vdec/codec_hevc_common.h      |    3 +-
+ drivers/staging/media/meson/vdec/codec_vp9.c  |   35 +-
+ drivers/staging/media/meson/vdec/esparser.c   |    4 +-
+ drivers/staging/media/meson/vdec/hevc_regs.h  |    1 +
+ drivers/staging/media/meson/vdec/vdec.h       |    1 +
+ .../staging/media/meson/vdec/vdec_helpers.c   |   44 +-
+ .../staging/media/meson/vdec/vdec_helpers.h   |   10 +-
+ .../staging/media/meson/vdec/vdec_platform.c  |   37 +
+ 13 files changed, 1678 insertions(+), 99 deletions(-)
+ create mode 100644 drivers/staging/media/meson/vdec/codec_hevc.c
+ create mode 100644 drivers/staging/media/meson/vdec/codec_hevc.h
