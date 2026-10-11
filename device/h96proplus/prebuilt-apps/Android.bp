@@ -14,12 +14,15 @@
 // Neither presigned nor preprocessed: the AOSP build zip-aligns it and signs
 // it with the build's default key, like the rest of the image (test-keys in a
 // developer build). Importing an unsigned APK as presigned would install a
-// package that the device rejects.
+// package that the device rejects. Soong requires exactly one of certificate,
+// presigned and default_dev_cert; default_dev_cert is the one that means
+// "sign with the build's default key".
 // overrides: Launcher3QuickStep from the base AOSP profile crash-loops on
 // this TV build (no widget service), so it must not be installed.
 android_app_import {
     name: "MovieLauncher",
     apk: "MovieLauncher.apk",
+    default_dev_cert: true,
     overrides: [
         "Launcher3QuickStep",
         "Launcher3",
