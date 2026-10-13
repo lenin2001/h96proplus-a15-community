@@ -381,6 +381,21 @@ PRODUCT_VENDOR_PROPERTIES += \
     ro.hardware.vulkan=pastel \
     debug.hwui.renderer=skiagl
 
+# Сами библиотеки Mesa (mesa/Android.bp, собирает build/build-mesa.sh).
+# Модули там только объявлены — без этого списка сборка их не ставит, и
+# vendor остаётся без драйвера, хотя ro.hardware.egl=mesa ищет libEGL_mesa.
+# У сопровождающего пропуск не был виден: библиотеки попадали в vendor
+# пересадкой файлов в готовый образ. Нашла его полная сборка по
+# DEVELOPMENT.md (13.10.2026). Образец — device/linaro/dragonboard/shared/
+# graphics/mesa/device.mk.
+PRODUCT_PACKAGES += \
+    libEGL_mesa \
+    libGLESv1_CM_mesa \
+    libGLESv2_mesa \
+    libgallium_dri \
+    libglapi \
+    libc++_shared_mesa
+
 # ⛔ ЦВЕТОВАЯ МАТРИЦА — НЕ ЧЕРЕЗ ПРОЦЕССОР (30.08.2026).
 #
 # По умолчанию drm_hwcomposer работает в режиме DRM_OR_GPU: если драйвер
