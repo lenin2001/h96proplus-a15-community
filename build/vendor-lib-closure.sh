@@ -15,10 +15,25 @@ RD=${3:-$(command -v llvm-readelf || command -v readelf || true)}
 [ -f "$D/$BIN" ] || { echo "no such binary: $D/$BIN"; exit 2; }
 echo "  (using $RD)"
 
-# Libraries a vendor process may legally take from /system (LLNDK / always present).
-LLNDK="libc.so liblog.so libdl.so libm.so libc++.so libbinder_ndk.so libvndksupport.so
-       libnativewindow.so libcgrouprc.so ld-android.so libdl_android.so libutils.so
-       libcutils.so libbase.so"
+# Libraries a vendor process may take from /system: the LLNDK. The authoritative list is the one
+# the build installs (system/etc/llndk.libraries.txt beside the vendor dir of a product out tree);
+# the built-in copy is that file of android-15.0.0_r36, for extracted images without it.
+# libc++, libutils, libcutils and libbase are NOT LLNDK: vendor carries its own copies, so they
+# are checked and walked like every other vendor library.
+LLNDK_FILE="$D/../system/etc/llndk.libraries.txt"
+if [ -f "$LLNDK_FILE" ]; then
+    LLNDK=$(tr '\n' ' ' < "$LLNDK_FILE")
+    echo "  (LLNDK list from $LLNDK_FILE)"
+else
+    LLNDK="libEGL.so libGLESv1_CM.so libGLESv2.so libGLESv3.so libRS.so libandroid_net.so
+           libapexsupport.so libavf.so libbinder_ndk.so libc.so libcgrouprc.so
+           libclang_rt.asan-aarch64-android.so libclang_rt.asan-arm-android.so
+           libclang_rt.hwasan-aarch64-android.so libcom.android.tethering.connectivity_native.so
+           libdl.so libft2.so liblog.so libm.so libmediandk.so libnativewindow.so
+           libneuralnetworks.so libselinux.so libsync.so libvendorsupport.so libvndksupport.so
+           libvulkan.so"
+    echo "  (built-in LLNDK list of android-15.0.0_r36)"
+fi
 
 needed_of() { "$RD" -d "$1" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\].*/\1/p'; }
 is_llndk()  { for l in $LLNDK; do [ "$l" = "$1" ] && return 0; done; return 1; }
