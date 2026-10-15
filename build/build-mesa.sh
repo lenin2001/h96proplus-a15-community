@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build the Mesa/Panfrost userspace (EGL + GLES + gallium driver) that device/h96proplus/mesa
-# imports as prebuilts (vendor/lib64, vendor/lib64/egl, vendor/lib64/dri on the device).
+# imports as prebuilts (vendor/lib64/egl for the EGL/GLES entry points, vendor/lib64 for the
+# driver and its helpers -- the EGL loader's linker namespace does not search a dri/ subdir).
 #
 # Sources: external/libdrm and external/mesa3d of the pinned AOSP checkout (android-15.0.0_r36,
 # libdrm 2.4.124, Mesa 24.3.0-devel), unmodified. Toolchain: Android NDK r27c (27.2.12479018).

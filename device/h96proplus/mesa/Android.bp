@@ -62,10 +62,15 @@ cc_prebuilt_library_shared {
 }
 
 // Собственно драйвер: весь panfrost и общий код Gallium.
+// Ставится прямо в /vendor/lib64, а не в подкаталог dri: libEGL_mesa
+// подключает его как обычную зависимость (DT_NEEDED, без RUNPATH), а
+// загрузчик ищет зависимости EGL только в /vendor/lib64, …/egl и …/hw
+// (system/linkerconfig, пространство sphal). На рабочей приставке
+// сопровождающего драйвер грузился именно из /vendor/lib64/libgallium_dri.so
+// (журнал 09.09.2026); из …/dri он не нашёлся бы, и EGL не поднялся бы.
 cc_prebuilt_library_shared {
     name: "libgallium_dri",
     proprietary: true,
-    relative_install_path: "dri",
     compile_multilib: "64",
     strip: { none: true },
     check_elf_files: false,

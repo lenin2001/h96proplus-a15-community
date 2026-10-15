@@ -35,8 +35,14 @@
 /vendor/bin/irkeymap                                                     u:object_r:h96_setup_exec:s0
 /vendor/bin/h96mouse                                                     u:object_r:h96mouse_exec:s0
 
-# Драйвер графики Mesa/panfrost лежит в /vendor/lib64/dri. Каталог egl рядом
-# платформа метит сама, а dri — нет: без этой строки библиотека драйвера
-# получит метку vendor_file, и загрузчик EGL внутри процессов приложений не
-# сможет её открыть, когда SELinux работает в строгом режиме.
-/vendor/lib(64)?/dri(/.*)?    u:object_r:same_process_hal_file:s0
+# Библиотеки Mesa/panfrost, которые грузятся в процессы приложений вместе с
+# EGL. Каталог egl платформа метит сама, а драйвер, libglapi и libc++_shared
+# лежат прямо в /vendor/lib64 (mesa/Android.bp): без этих строк они получат
+# метку vendor_file, и в строгом режиме SELinux загрузчик EGL их не откроет
+# (на приставке сопровождающего в permissive так и было: «denied { execute }
+# ... /vendor/lib64/libgallium_dri.so ... vendor_file»). Для строгого режима
+# этого мало: так же придётся пометить и их зависимости из vendor (libdrm,
+# libz, libhardware, libcutils) — enforcing-политика не проверялась.
+/vendor/lib(64)?/libgallium_dri\.so    u:object_r:same_process_hal_file:s0
+/vendor/lib(64)?/libglapi\.so          u:object_r:same_process_hal_file:s0
+/vendor/lib(64)?/libc\+\+_shared\.so   u:object_r:same_process_hal_file:s0
