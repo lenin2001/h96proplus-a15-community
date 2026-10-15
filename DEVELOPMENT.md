@@ -8,9 +8,9 @@
 | Firmware | `build/fetch-firmware.sh` с закреплённого тега linux-firmware, все SHA-256 совпали | — |
 | Rescue и автоскрипт | busybox 1.36.1 собран рецептом со сверкой апплетов; `rescue.img` собирается и при повторной сборке побайтно тот же; файлы карты собираются | публичная версия rescue на железе не запускалась |
 | Установщик | 31 тест на имитации eMMC | на железе не запускался |
-| AOSP | база — тег `android-15.0.0_r36`; оверлей и активные патчи побайтно дают все локальные изменения дерева сопровождающего, кроме исключённого 0012 ([`aosp-patches/series.json`](aosp-patches/series.json)) | полная сборка AOSP из этих входов не выполнялась |
-| Mesa/Panfrost | [`build/build-mesa.sh`](build/build-mesa.sh): NDK r27c, исходники `external/mesa3d` и `external/libdrm` того же тега | библиотеки из рецепта на приставке не проверялись |
-| Образы system/vendor | — | у сопровождающего они частично собирались «пересадкой» файлов в готовые образы; чистая сборка из этих исходников не выполнялась |
+| AOSP | база — тег `android-15.0.0_r36`; оверлей и активные патчи побайтно дают все локальные изменения дерева сопровождающего, кроме исключённого 0012 ([`aosp-patches/series.json`](aosp-patches/series.json)); полная сборка по этому описанию из свежего клона прошла 15.10.2026 ([подробности](#проверенная-сборка-15102026)) | образы из неё на приставке не загружались |
+| Mesa/Panfrost | [`build/build-mesa.sh`](build/build-mesa.sh): NDK r27c, исходники `external/mesa3d` и `external/libdrm` того же тега; в чистой сборке все шесть библиотек попадают в vendor побайтно такими, какими их выдал рецепт | библиотеки из рецепта на приставке не проверялись |
+| Образы boot/system/vendor | чистая сборка без пересадки файлов: образы помещаются в разделы, состав и замыкание библиотек vendor проверены | на приставке не загружались; у сопровождающего system/vendor частично собирались «пересадкой» файлов в готовые образы, так что чистая сборка — новая для железа конфигурация |
 
 Перед изменениями прочитайте [STATUS.md](STATUS.md) и [HISTORY.md](HISTORY.md).
 Версию Android/API, ревизию AOSP и ядра берите из `series.json` и паспорта
@@ -67,6 +67,7 @@ build/build-kernel.sh linux kout       # kout — новый, ещё не сущ
 ## Firmware, лаунчер, boot.img
 
 ```bash
+sudo apt install abootimg                    # упаковщик boot.img (mkbootimg.sh, rescue/mkrescue.sh)
 build/fetch-firmware.sh                      # микрокод meson-vdec и Wi-Fi QCA9377, сверка SHA-256
 (cd launcher && ./gradlew assembleRelease)   # затем APK — в device/h96proplus/prebuilt-apps/
 build/mkbootimg.sh --kernel kout/arch/arm64/boot/Image.gz \
@@ -74,10 +75,14 @@ build/mkbootimg.sh --kernel kout/arch/arm64/boot/Image.gz \
     --board installer/boards/h96proplus-czs32v3.json --out boot.img
 ```
 
+Лаунчеру нужны JDK (не JRE) и Android SDK с платформой 35; окружение и
+копирование `app-release-unsigned.apk` под именем `MovieLauncher.apk` — в
+[launcher/README.md](launcher/README.md#сборка). Собирайте на ext4, не на `/mnt/c`.
+
 `mkbootimg.sh` берёт разметку для `blkdevparts` из описания платы установщика,
 чтобы ядро и установщик видели одни и те же разделы.
 
-## AOSP (исходники сверены, полная сборка не проверена)
+## AOSP (полная сборка проверена 15.10.2026)
 
 База: `https://android.googlesource.com/platform/manifest`, тег
 `android-15.0.0_r36` (коммит манифеста `a0601d2912a6cedcaf97e1372173f8704a2715b0`,
@@ -94,13 +99,63 @@ repo sync -c -j8
    (для `external/v4l2_codec2` — модуль целиком).
 2. Патчи со статусом `active` из `aosp-patches/series.json`, каждый в своём
    каталоге `apply_in`, сначала `git apply --check`. Патч 0012 не применять.
-3. Mesa/Panfrost: `AOSP_ROOT=… NDK=…/android-ndk-r27c OUT=… build/build-mesa.sh`,
-   затем `$OUT/lib64/*.so` → `device/h96proplus/mesa/lib64/`.
+3. Mesa/Panfrost: `sudo apt install meson ninja-build pkg-config bison flex python3-mako python3-yaml`,
+   NDK r27c (`android-ndk-r27c-linux.zip` с dl.google.com), затем
+   `AOSP_ROOT=… NDK=…/android-ndk-r27c OUT=… build/build-mesa.sh`
+   и `$OUT/lib64/*.so` → `device/h96proplus/mesa/lib64/`.
 4. `source build/envsetup.sh` (не под `set -u`), `lunch h96proplus-trunk_staging-userdebug`
    (не через конвейер), `m`. На машинах с небольшой памятью — `SOONG_GOMEMLIMIT`
    вместе с патчем 0003.
+5. `boot.img` — `build/mkbootimg.sh` из ядра `build-kernel.sh` и `ramdisk.img`
+   этой сборки (раздел «Firmware, лаунчер, boot.img»). DTB в boot.img не входит —
+   см. [dt/README.md](dt/README.md).
+
+Если образы будут кому-то передаваться, ещё до первой сборки задайте
+нейтральные `export BUILD_HOSTNAME=builder BUILD_USERNAME=h96` (или свои): иначе
+имя вашей машины и пользователя попадут в `ro.build.host`/`ro.build.user`
+системного `build.prop`. Смена `BUILD_USERNAME` между сборками заново
+запускает анализ soong.
 
 Сборка с публичными test-keys AOSP — сборка разработчика, а не защищённый выпуск.
+
+### Проверенная сборка (15.10.2026)
+
+Описание выше прогнано целиком из свежего клона этого репозитория на новом
+дереве r36 (`repo init --depth=1`), на отдельном диске и без доступа к дереву
+сопровождающего. Хост: WSL2 с Ubuntu 24.04, 4 ядра без SMT, 18 ГБ памяти и
+32 ГБ подкачки, `m -j3`, `SOONG_GOMEMLIMIT=14GiB`.
+
+- **Время.** Чистая сборка — около 20 часов (172 822 задачи ninja), из них
+  анализ soong — около часа. Пересборка после правки `device.mk` — 51 минута:
+  анализ повторяется, потому что список пакетов продукта входит в переменные soong.
+- **Память.** Анализ soong держал около 17 ГБ и ещё несколько ГБ подкачки.
+- **Диск.** 205 ГБ: исходники около 92 ГБ, `.repo` 29 ГБ, `out/` 84 ГБ; без
+  `--depth=1` каталог `.repo` заметно больше.
+- **Образы.** `system.img` 830 МБ и `vendor.img` 82 МБ (sparse), `ramdisk.img`
+  1,8 МБ, `boot.img` 21,6 МБ — все помещаются в свои разделы. Побайтной
+  воспроизводимости не ждите: в образах метки времени и номер сборки.
+- **Состав.** Шесть библиотек Mesa в `vendor/lib64/egl` и `vendor/lib64`,
+  побайтно равные выходу `build-mesa.sh`; микрокод meson-vdec и Wi-Fi QCA9377
+  со сверенными хэшами; `MovieLauncher` в `system/app`, Launcher3 и пакетов
+  Google нет; Codec2 (`android.hardware.media.c2@1.2-service-v4l2-64`), gralloc
+  minigbm, APEX drm_hwcomposer, `h96mouse`; `ro.adb.secure=1`, ADB на TCP 5555,
+  SELinux permissive (из командной строки ядра).
+- **Библиотеки.** `build/vendor-lib-closure.sh` находит полное замыкание у всех
+  28 ELF-файлов в `vendor/bin`, `vendor/lib64/egl` и `vendor/lib64/hw`.
+
+Прогон нашёл и исправил в этом репозитории пять ошибок: скрипты без бита
+исполнения; импорт MovieLauncher без способа подписи (soong останавливался);
+библиотеки Mesa, объявленные, но не устанавливаемые в продукт; драйвер
+`libgallium_dri.so` в подкаталоге `dri`, где загрузчик EGL его не ищет;
+неверный список LLNDK в `vendor-lib-closure.sh`. Обе ошибки с Mesa у
+сопровождающего скрывала пересадка файлов в готовые образы.
+
+**На приставке образы этой сборки не загружались** — сборка подтверждает
+рецепт, но не работу системы.
+
+В WSL2 учтите: когда закрывается последний сеанс `wsl.exe`, WSL выключает весь
+дистрибутив — вместе со службами systemd и фоновыми процессами. На время
+сборки держите открытым хотя бы один сеанс.
 
 ## Что должен содержать полностью воспроизводимый рецепт
 

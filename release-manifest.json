@@ -70,7 +70,31 @@
     "rescue_environment": "unauthenticated root telnet while running - use a direct cable or an isolated network"
   },
   "verification": {
-    "clean_build": "kernel: prepared from v7.1 and built in a fresh directory (kernel/README.md); Mesa: recipe run on the build host; AOSP: full build not run (blocker)",
+    "clean_build": "kernel: prepared from v7.1 and built in a fresh directory (kernel/README.md); Mesa: recipe run on the build host; AOSP: full build of this tree completed 2026-10-15 from a fresh clone (see aosp_build_check); none of its images booted on hardware yet",
+    "aosp_build_check": {
+      "date": "2026-10-15",
+      "method": "DEVELOPMENT.md run end to end from a fresh clone of this repository on a new android-15.0.0_r36 checkout (repo init --depth=1), on a separate disk, without access to the maintainer's tree",
+      "host": "WSL2, Ubuntu 24.04, 4 cores without SMT, 18 GiB RAM + 32 GiB swap; m -j3, SOONG_GOMEMLIMIT=14GiB, BUILD_HOSTNAME=builder BUILD_USERNAME=h96",
+      "duration": "about 20 h for the clean build (172822 ninja tasks, soong analysis about 1 h); 51 min for the rebuild after a device.mk change",
+      "disk": "205 GB: sources about 92 GB, .repo 29 GB, out 84 GB",
+      "images_bytes": {
+        "boot.img": 21614592,
+        "system.img (sparse)": 830181560,
+        "vendor.img (sparse)": 82227252,
+        "ramdisk.img": 1823045
+      },
+      "images_published": false,
+      "bit_reproducible": "not expected: the images carry timestamps and a build number",
+      "content_checks": "all images fit their partitions; six Mesa libraries in vendor/lib64/egl and vendor/lib64, byte-identical to the build-mesa.sh output; meson-vdec and QCA9377 firmware with verified hashes; MovieLauncher in system/app, no Launcher3, no Google packages; Codec2 v4l2 service, minigbm allocator, drm_hwcomposer APEX, h96mouse; ro.adb.secure=1, ADB on TCP 5555, SELinux permissive via the kernel command line; build/vendor-lib-closure.sh: complete closure for all 28 ELF files under vendor/bin, vendor/lib64/egl and vendor/lib64/hw; no build-machine name in the images",
+      "recipe_fixes_found_by_this_run": [
+        "4e4aef1 Mark the recipe scripts executable",
+        "ce942db device: let the build sign the imported MovieLauncher",
+        "c1d7d85 device: install the Mesa libraries in the product",
+        "02dbccf device: install the Mesa driver where the EGL loader finds it",
+        "b8ab309 vendor-lib-closure: use the real LLNDK list"
+      ],
+      "hardware": "not booted"
+    },
     "clean_install": "not run (no images); installer exercised against a simulation only",
     "privacy_review": "automated denylist and pattern scan plus manual review of every hit; repeated on the published clone (PRIVACY.md)",
     "hardware_tests_file": null
@@ -90,6 +114,6 @@
     "sources": "external/mesa3d (Mesa 24.3.0-devel) and external/libdrm (2.4.124) of android-15.0.0_r36, unmodified",
     "toolchain": "Android NDK r27c (27.2.12479018), API 34",
     "binaries_included": false,
-    "verification": "2026-10-10 on the build host, final recipe: all six libraries built; every one exports exactly the same dynamic symbols as the maintainer's copy, none carries a RUNPATH, libc++_shared is byte-identical. The other libraries differ in bytes because the maintainer's copies were taken from the build tree (build-host RUNPATH) and had SONAMEs set by hand. Not yet run on the device."
+    "verification": "2026-10-10 on the build host, final recipe: all six libraries built; every one exports exactly the same dynamic symbols as the maintainer's copy, none carries a RUNPATH, libc++_shared is byte-identical. The other libraries differ in bytes because the maintainer's copies were taken from the build tree (build-host RUNPATH) and had SONAMEs set by hand. 2026-10-15: installed by the full AOSP build (vendor/lib64/egl, vendor/lib64). Not yet run on the device."
   }
 }
